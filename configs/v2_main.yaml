@@ -1,0 +1,40 @@
+experiment_name: v2_main
+seed: 20260729
+insurance_sample_size: 80
+mmlu_sample_size: 200
+include_mmlu: true
+evidence_condition: pooled
+fixed_source_model: o3
+max_context_chars: 64000
+systems:
+  - direct
+  - checklist
+  - self_critique
+  - external_verify
+  - best_of_2
+  - best_of_4
+  - adaptive
+generator_model: ${GATEWAY_MODEL_GENERATOR:-gpt-5.4-mini}
+verifier_model: ${GATEWAY_MODEL_VERIFIER:-gpt-5.4}
+judge_models:
+  - ${GATEWAY_MODEL_JUDGE_A:-gpt-5.4}
+  - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4-6}
+adjudicator_model: ${GATEWAY_MODEL_ADJUDICATOR:-claude-opus-4-6}
+generator_max_tokens: 512
+critique_max_tokens: 384
+verifier_max_tokens: 512
+direct_temperature: 0.0
+sampling_temperature: 0.7
+adaptive_accept_threshold: 0.85
+global_case_concurrency: 8
+request_timeout_seconds: 180
+generation_runtime_hours: 4.5
+judging_runtime_hours: 1.5
+bootstrap_replicates: 5000
+pilot_min_schema_validity: 0.98
+pilot_min_direct_accuracy: 0.25
+pilot_max_direct_accuracy: 0.90
+pilot_min_system_disagreement: 0.10
+# Populate only with internal, approved prices. Token and latency Pareto curves
+# remain primary when prices are unavailable.
+model_prices_per_million: {}

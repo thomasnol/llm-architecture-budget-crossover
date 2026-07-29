@@ -1,14 +1,14 @@
 # LLM Architecture × Budget Crossover
 
-This repository tests a practical question: under a fixed generation-token
-ceiling, when does a multi-call inference architecture begin to outperform a
-single direct call?
+This repository studies a practical question: when does additional inference
+orchestration improve an LLM decision enough to justify its realized cost?
 
-The experiment uses Snorkel AI's 380-row Multi-Turn Insurance Underwriting
-dataset. It reconstructs one leakage-controlled evidence packet per unique
-company/task, evaluates direct, self-critique, and two-agent debate
-architectures at multiple case-level generation budgets, and records quality,
-total tokens, estimated cost, and wall-clock latency.
+Version 1 tested maximum completion-token ceilings and is retained as a
+transparent failed manipulation/measurement audit. Version 2 uses structured
+decisions, unbiased evidence selection, all 80 unique underwriting tasks, a
+200-item MMLU-Pro stress test, stronger baselines, external verification, and
+adaptive escalation. It records the gateway's per-call prompt, completion, and
+total tokens, along with calls, latency, and optional approved internal cost.
 
 The study is designed to finish within eight hours on two gateway credentials
 that each allow four concurrent requests. Every response is checkpointed to
@@ -30,24 +30,33 @@ uv run budget-crossover analyze --config configs/main.yaml
 uv run python paper/build_paper.py
 ```
 
+Version 2:
+
+```bash
+uv run budget-crossover prepare-v2 --config configs/v2_pilot.yaml
+uv run budget-crossover pilot-v2 --config configs/v2_pilot.yaml
+uv run budget-crossover analyze-v2 --config configs/v2_pilot.yaml
+# Proceed only if the preregistered pilot gates pass.
+uv run budget-crossover run-v2 --config configs/v2_main.yaml
+uv run budget-crossover judge-v2 --config configs/v2_main.yaml
+uv run budget-crossover analyze-v2 --config configs/v2_main.yaml
+```
+
 The generated white paper is written to `paper/architecture_budget_crossover.docx`
 and `paper/architecture_budget_crossover.pdf`. Detailed experiment outputs are
 kept in `experiments/runs/`.
 
 ## Experimental contract
 
-- **Controlled resource:** per-case completion-token ceiling, allocated across
-  all calls in an architecture.
+- **Primary resource:** realized per-case total tokens, calls, and wall time.
 - **Measured resources:** actual prompt tokens, completion tokens, total tokens,
   elapsed wall time, and optional price-normalized cost.
-- **Architectures:** one-call direct answer; draft–critique–revision; two
-  independent specialists followed by a critic and synthesizer.
-- **Primary outcome:** correctness against the expert-verified reference,
-  decided by two blinded pointwise judges and an independent adjudicator on
-  disagreements.
-- **Inference:** paired case bootstrap confidence intervals and a
-  case/task-adjusted crossover model. Claims are conditional on the tested
-  model, dataset, prompts, and gateway.
+- **Systems:** direct; single-call checklist; same-model self-critique; strong
+  external critique; best-of-2/4 selection; adaptive verify/escalate.
+- **Primary outcome:** deterministic task-specific structured operational
+  correctness. Cross-family LLM judges are secondary.
+- **Inference:** paired case bootstrap intervals, exact McNemar tests, mechanism
+  metrics, minimum detectable effects, and accuracy-cost Pareto frontiers.
 
 ## Security
 
@@ -55,4 +64,3 @@ Credentials are read only from environment variables or `.env`, which is
 ignored by Git. Raw prompts, responses, and traces may contain synthetic company
 information from the public dataset; keep run directories internal unless
 reviewed.
-
