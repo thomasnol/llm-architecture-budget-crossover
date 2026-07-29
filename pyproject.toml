@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-architecture-budget-crossover"
+version = "0.1.0"
+description = "Reproducible study of LLM inference architecture performance under fixed generation budgets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28,<1",
+  "matplotlib>=3.9,<4",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "pyarrow>=18,<23",
+  "pydantic>=2.10,<3",
+  "python-docx>=1.1,<2",
+  "python-dotenv>=1.0,<2",
+  "pyyaml>=6.0,<7",
+  "scipy>=1.14,<2",
+  "seaborn>=0.13,<1",
+  "statsmodels>=0.14,<1",
+  "tenacity>=9,<10",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+budget-crossover = "budget_crossover.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/budget_crossover"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

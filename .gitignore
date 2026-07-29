@@ -1,0 +1,23 @@
+.env
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Downloaded source data can be recreated with scripts/download_data.sh.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Runs contain model responses and may be large.
+experiments/runs/
+work/
+
+# Render QA intermediates.
+paper/rendered/
+paper/*.aux
+paper/*.log

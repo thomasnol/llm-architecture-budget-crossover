@@ -1,0 +1,24 @@
+experiment_name: pilot
+seed: 20260728
+sample_size: 6
+task_quotas:
+  Appetite Check: 1
+  Business Classification: 1
+  Deductibles: 1
+  Policy Limits: 1
+  Product Recommendations: 1
+  Small Business Elibility Check: 1
+budgets: [256, 1024]
+architectures: [direct, self_critique, debate]
+generator_model: ${GATEWAY_MODEL_GENERATOR:-gpt-5.4-mini}
+temperature: 0.0
+max_context_chars: 72000
+request_timeout_seconds: 180
+global_case_concurrency: 8
+generation_runtime_hours: 0.5
+judging_runtime_hours: 0.25
+judge_models:
+  - ${GATEWAY_MODEL_JUDGE_A:-gpt-5.4}
+  - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4.6}
+adjudicator_model: ${GATEWAY_MODEL_ADJUDICATOR:-claude-opus-4.6}
+bootstrap_replicates: 1000
