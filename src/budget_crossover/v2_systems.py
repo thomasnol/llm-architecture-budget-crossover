@@ -11,6 +11,8 @@ from .v2_config import V2Config
 from .v2_models import V2Case, V2Generation
 from .v2_schema import canonical_decision, parse_response
 
+PROMPT_VERSION = "v2.1.0"
+
 SYSTEM_PROMPT = """You are a careful decision analyst. Use only the supplied case
 and evidence. Do not infer missing organization-specific rules. Return the exact
 JSON schema requested. The rationale is explanatory only; keep the operational
@@ -177,7 +179,9 @@ def _finish(
         dataset=case.dataset,
         task=case.task,
         system=system,
-        generator_model=config.generator_model,
+        generator_model=(
+            config.verifier_model if system == "strong_direct" else config.generator_model
+        ),
         verifier_model=(
             config.verifier_model
             if system in {"external_verify", "best_of_2", "best_of_4", "adaptive"}
@@ -206,11 +210,19 @@ async def run_v2_system(
     calls: list[CallRecord] = []
     diagnostics: dict[str, Any] = {"escalated": False}
 
-    if system in {"direct", "checklist"}:
+    if system in {"direct", "checklist", "strong_direct"}:
         call = await _call(
             client,
-            model=config.generator_model,
-            user=_direct_prompt(case) if system == "direct" else _checklist_prompt(case),
+            model=(
+                config.verifier_model
+                if system == "strong_direct"
+                else config.generator_model
+            ),
+            user=(
+                _direct_prompt(case)
+                if system in {"direct", "strong_direct"}
+                else _checklist_prompt(case)
+            ),
             max_tokens=config.generator_max_tokens,
             temperature=config.direct_temperature,
             stage=system,

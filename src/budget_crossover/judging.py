@@ -87,7 +87,9 @@ async def execute_judging_run(
     if not client.configured:
         await client.close()
         raise RuntimeError("gateway is not configured")
-    semaphore = asyncio.Semaphore(config.global_case_concurrency)
+    semaphore = asyncio.Semaphore(
+        max(config.global_case_concurrency, client.maximum_total_concurrency)
+    )
     started = time.monotonic()
     deadline = started + config.judging_runtime_hours * 3600
     counters = {"completed": 0, "failed": 0, "skipped": len(complete), "adjudicated": 0}

@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from budget_crossover.v2_dataset import build_insurance_v2_cases
+from budget_crossover.v2_config import load_v2_config
+from budget_crossover.v2_dataset import build_insurance_v2_cases, build_v2_case_set
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -39,3 +40,17 @@ def test_fixed_and_pooled_conditions_keep_identical_gold():
         pooled_case.evidence_chars > fixed_case.evidence_chars
         for pooled_case, fixed_case in zip(pooled, fixed, strict=True)
     )
+
+
+def test_pilot_and_main_case_sets_are_disjoint():
+    pilot_config = load_v2_config(REPO / "configs" / "v2_pilot.yaml")
+    main_config = load_v2_config(REPO / "configs" / "v2_main.yaml")
+    pilot = build_v2_case_set(REPO, pilot_config)
+    main = build_v2_case_set(REPO, main_config)
+    assert len(pilot) == 30
+    assert len(main) == 268
+    assert {case.case_id for case in pilot}.isdisjoint(
+        {case.case_id for case in main}
+    )
+    assert sum(case.dataset == "insurance" for case in main) == 68
+    assert sum(case.dataset == "mmlu_pro" for case in main) == 200

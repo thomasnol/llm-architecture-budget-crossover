@@ -3,12 +3,16 @@ seed: 20260729
 insurance_sample_size: 12
 mmlu_sample_size: 18
 include_mmlu: true
+exclude_pilot_cases: false
+pilot_insurance_sample_size: 12
+pilot_mmlu_sample_size: 18
 evidence_condition: pooled
 fixed_source_model: o3
 max_context_chars: 64000
 systems:
   - direct
   - checklist
+  - strong_direct
   - self_critique
   - external_verify
   - best_of_2
@@ -19,7 +23,6 @@ verifier_model: ${GATEWAY_MODEL_VERIFIER:-gpt-5.4}
 judge_models:
   - ${GATEWAY_MODEL_JUDGE_A:-gpt-5.4}
   - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4-6}
-adjudicator_model: ${GATEWAY_MODEL_ADJUDICATOR:-claude-opus-4-6}
 generator_max_tokens: 512
 critique_max_tokens: 384
 verifier_max_tokens: 512
@@ -30,10 +33,15 @@ global_case_concurrency: 8
 request_timeout_seconds: 180
 generation_runtime_hours: 1.25
 judging_runtime_hours: 0.75
+judge_sample_per_system_dataset: 10
 bootstrap_replicates: 2000
 pilot_min_schema_validity: 0.98
 pilot_min_direct_accuracy: 0.25
 pilot_max_direct_accuracy: 0.90
 pilot_min_system_disagreement: 0.10
+pilot_experiment_name: v2_pilot
+minimum_schema_validity: 0.98
+maximum_truncation_rate: 0.02
+sesoi_accuracy_difference: 0.05
 # Populate only with internal, approved prices. Never substitute public prices.
 model_prices_per_million: {}

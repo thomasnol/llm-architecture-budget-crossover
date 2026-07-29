@@ -8,6 +8,7 @@ from pathlib import Path
 from .gateway import GatewayClient
 from .io import append_jsonl, read_jsonl
 from .v2_config import V2Config
+from .v2_manifest import ensure_run_manifest, record_phase
 from .v2_models import V2Case, V2Generation
 from .v2_systems import run_v2_system
 
@@ -22,6 +23,7 @@ async def execute_v2_generation(
     config: V2Config,
     cases: list[V2Case],
 ) -> dict[str, int | float]:
+    ensure_run_manifest(repo, config, cases)
     output = v2_generation_path(repo, config)
     previous = read_jsonl(output, V2Generation)
     completed = {
@@ -43,7 +45,9 @@ async def execute_v2_generation(
             "gateway is not configured; copy .env.example to .env and set the "
             "gateway endpoint plus credentials"
         )
-    semaphore = asyncio.Semaphore(config.global_case_concurrency)
+    semaphore = asyncio.Semaphore(
+        max(config.global_case_concurrency, client.maximum_total_concurrency)
+    )
     started = time.monotonic()
     deadline = started + config.generation_runtime_hours * 3600
     counters: dict[str, int | float] = {
@@ -103,4 +107,5 @@ async def execute_v2_generation(
     finally:
         await client.close()
     counters["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    record_phase(repo, config, phase="generation", counters=counters)
     return counters

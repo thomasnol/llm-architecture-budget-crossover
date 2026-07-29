@@ -65,6 +65,7 @@ async def test_direct_records_gateway_usage():
 
 async def test_system_call_counts_are_explicit():
     expected = {
+        "strong_direct": 1,
         "self_critique": 3,
         "external_verify": 3,
         "best_of_2": 3,
@@ -81,6 +82,21 @@ async def test_system_call_counts_are_explicit():
             run_id=system,
         )
         assert len(result.calls) == count
+
+
+async def test_strong_direct_uses_verifier_model_without_extra_calls():
+    client = FakeClient()
+    result = await run_v2_system(
+        client,
+        case=case(),
+        system="strong_direct",
+        config=config(),
+        run_id="strong-direct",
+    )
+    assert len(result.calls) == 1
+    assert result.generator_model == "gpt-5.4"
+    assert result.verifier_model is None
+    assert client.calls[0]["model"] == "gpt-5.4"
 
 
 async def test_adaptive_escalates_on_rejection():

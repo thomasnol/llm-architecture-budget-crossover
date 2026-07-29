@@ -33,6 +33,7 @@ class GatewayResponse(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     latency_seconds: float
     credential_slot: int
+    concurrency_window: float | None = None
     request_id: str | None = None
     raw_finish_reason: str | None = None
 

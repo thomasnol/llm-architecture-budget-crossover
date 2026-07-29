@@ -43,7 +43,9 @@ async def execute_generation_run(
         raise RuntimeError(
             "gateway is not configured; set LLM_GATEWAY_BASE_URL and credential variables"
         )
-    case_semaphore = asyncio.Semaphore(config.global_case_concurrency)
+    case_semaphore = asyncio.Semaphore(
+        max(config.global_case_concurrency, client.maximum_total_concurrency)
+    )
     started = time.monotonic()
     deadline = started + config.generation_runtime_hours * 3600
     counters = {"completed": 0, "failed": 0, "skipped": len(complete)}

@@ -13,7 +13,8 @@ from scipy.stats import binomtest
 
 from .io import read_jsonl
 from .v2_config import V2Config
-from .v2_judging import v2_judgment_path
+from .v2_judging import select_judging_generations, v2_judgment_path
+from .v2_manifest import ensure_run_manifest
 from .v2_models import V2Case, V2Generation, V2Judgment
 from .v2_runner import v2_generation_path
 from .v2_schema import decisions_equal
@@ -21,12 +22,25 @@ from .v2_schema import decisions_equal
 SYSTEM_LABELS = {
     "direct": "Direct",
     "checklist": "Single-call checklist",
+    "strong_direct": "Strong-model direct",
     "self_critique": "Same-model self-critique",
     "external_verify": "Strong external critique",
     "best_of_2": "Best-of-2 + verifier",
     "best_of_4": "Best-of-4 + verifier",
     "adaptive": "Adaptive verify/escalate",
 }
+
+
+def _json_native(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _bootstrap_mean(
@@ -159,6 +173,7 @@ def _system_summary(
     frame: pd.DataFrame,
     *,
     config: V2Config,
+    expected_judged_run_ids: set[str],
 ) -> pd.DataFrame:
     rng = np.random.default_rng(config.seed)
     rows: list[dict[str, Any]] = []
@@ -168,6 +183,10 @@ def _system_summary(
             values, rng=rng, replicates=config.bootstrap_replicates
         )
         task_means = group.groupby("task")["exact_correct"].mean()
+        expected_judgments = (
+            group["run_id"].isin(expected_judged_run_ids).sum()
+            * len(config.judge_models)
+        )
         row = {
             "dataset": dataset,
             "system": system,
@@ -188,10 +207,13 @@ def _system_summary(
                 "summed_api_latency_seconds"
             ].mean(),
             "mean_cost_usd": group["estimated_cost_usd"].mean(),
+            "judge_sampled_generations": group["run_id"]
+            .isin(expected_judged_run_ids)
+            .sum(),
             "judge_coverage": (
-                group["judge_count"].sum() / (len(group) * len(config.judge_models))
-                if len(group)
-                else 0.0
+                group["judge_count"].sum() / expected_judgments
+                if expected_judgments
+                else math.nan
             ),
             "judge_accuracy": group["judge_accuracy"].mean(),
         }
@@ -263,7 +285,26 @@ def _paired_comparisons(
                     "approx_mde_80pct": mde,
                 }
             )
-    return pd.DataFrame(rows)
+    output = pd.DataFrame(rows)
+    if output.empty:
+        return output
+    output["mcnemar_holm_p_value"] = math.nan
+    for indexes in output.groupby("system").groups.values():
+        ordered = sorted(
+            indexes,
+            key=lambda index: float(output.loc[index, "mcnemar_exact_p_value"]),
+        )
+        running = 0.0
+        count = len(ordered)
+        for rank, index in enumerate(ordered):
+            adjusted = min(
+                1.0,
+                (count - rank)
+                * float(output.loc[index, "mcnemar_exact_p_value"]),
+            )
+            running = max(running, adjusted)
+            output.loc[index, "mcnemar_holm_p_value"] = running
+    return output
 
 
 def _mechanisms(frame: pd.DataFrame) -> pd.DataFrame:
@@ -384,6 +425,41 @@ def _pareto(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _budget_policy(summary: pd.DataFrame) -> pd.DataFrame:
+    """Return the empirical system selected at each observed token budget.
+
+    These operating points are descriptive. They avoid interpolating a smooth
+    threshold through a small number of noisy architecture means.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for dataset, group in summary.groupby("dataset"):
+        group = group.dropna(subset=["mean_total_tokens", "accuracy"]).copy()
+        previous: str | None = None
+        for budget in sorted(group["mean_total_tokens"].unique()):
+            feasible = group[group["mean_total_tokens"] <= budget].sort_values(
+                ["accuracy", "mean_total_tokens", "system"],
+                ascending=[False, True, True],
+            )
+            if feasible.empty:
+                continue
+            best = feasible.iloc[0]
+            if best["system"] == previous:
+                continue
+            rows.append(
+                {
+                    "dataset": dataset,
+                    "minimum_observed_budget_tokens": float(budget),
+                    "selected_system": best["system"],
+                    "system_label": best["system_label"],
+                    "accuracy": float(best["accuracy"]),
+                    "mean_total_tokens": float(best["mean_total_tokens"]),
+                }
+            )
+            previous = str(best["system"])
+    return pd.DataFrame(rows)
+
+
 def _plots(summary: pd.DataFrame, output: Path) -> None:
     sns.set_theme(style="whitegrid", context="paper")
     for dataset, group in summary.groupby("dataset"):
@@ -419,6 +495,7 @@ def analyze_v2(
     config: V2Config,
     cases: list[V2Case],
 ) -> dict[str, Any]:
+    ensure_run_manifest(repo, config, cases)
     generations = read_jsonl(v2_generation_path(repo, config), V2Generation)
     judgments = read_jsonl(v2_judgment_path(repo, config), V2Judgment)
     frame = build_v2_frame(
@@ -429,15 +506,42 @@ def analyze_v2(
     )
     if frame.empty:
         raise RuntimeError("no successful Version 2 generations to analyze")
+    expected_generation_keys = {
+        (case.case_id, system, 0)
+        for case in cases
+        for system in config.systems
+    }
+    successful_generation_keys = [
+        (row.case_id, row.system, row.replicate)
+        for row in generations
+        if row.status == "ok"
+    ]
+    if (
+        len(successful_generation_keys) != len(set(successful_generation_keys))
+        or set(successful_generation_keys) != expected_generation_keys
+    ):
+        raise RuntimeError(
+            "generation grid must be complete and duplicate-free before analysis"
+        )
+    selected_for_judging = select_judging_generations(
+        [row for row in generations if row.status == "ok"],
+        config,
+    )
+    expected_judged_run_ids = {row.run_id for row in selected_for_judging}
     output = repo / "experiments" / "runs" / config.experiment_name / "analysis"
     tables = output / "tables"
     figures = output / "figures"
     tables.mkdir(parents=True, exist_ok=True)
     figures.mkdir(parents=True, exist_ok=True)
-    summary = _system_summary(frame, config=config)
+    summary = _system_summary(
+        frame,
+        config=config,
+        expected_judged_run_ids=expected_judged_run_ids,
+    )
     paired = _paired_comparisons(frame, config=config)
     mechanisms = _mechanisms(frame)
     pareto = _pareto(summary)
+    budget_policy = _budget_policy(summary)
     task_summary = (
         frame.groupby(["dataset", "task", "system"], as_index=False)
         .agg(n=("case_id", "size"), accuracy=("exact_correct", "mean"))
@@ -448,15 +552,78 @@ def analyze_v2(
     paired.to_csv(tables / "paired_comparisons.csv", index=False)
     mechanisms.to_csv(tables / "mechanisms.csv", index=False)
     pareto.to_csv(tables / "pareto.csv", index=False)
+    budget_policy.to_csv(tables / "budget_policy.csv", index=False)
     task_summary.to_csv(tables / "task_breakdown.csv", index=False)
     _plots(summary, figures)
     successful_expected = len(cases) * len(config.systems)
-    judge_successes = sum(judgment.status == "ok" for judgment in judgments)
-    judge_expected = len(frame) * len(config.judge_models)
+    expected_judgment_keys = {
+        (run_id, model)
+        for run_id in expected_judged_run_ids
+        for model in config.judge_models
+    }
+    successful_judgment_keys = {
+        (judgment.run_id, judgment.judge_model)
+        for judgment in judgments
+        if judgment.status == "ok"
+    }
+    judge_successes = len(expected_judgment_keys & successful_judgment_keys)
+    judge_expected = len(expected_judged_run_ids) * len(config.judge_models)
+    pilot_gate_path = (
+        repo
+        / "experiments"
+        / "runs"
+        / config.pilot_experiment_name
+        / "analysis"
+        / "analysis_summary.json"
+    )
+    if config.experiment_name == config.pilot_experiment_name:
+        eligible = set(frame["dataset"].unique())
+    elif pilot_gate_path.exists():
+        pilot_report = json.loads(pilot_gate_path.read_text())
+        eligible = {
+            gate["dataset"]
+            for gate in pilot_report.get("pilot_gates", [])
+            if gate.get("pass") is True
+        }
+    else:
+        eligible = set()
+    if paired.empty:
+        adaptive = pd.DataFrame(
+            columns=[
+                "dataset",
+                "system",
+                "difference_ci_low",
+                "mcnemar_holm_p_value",
+                "pareto_efficient",
+                "hypothesis_supported",
+            ]
+        )
+    else:
+        adaptive = paired[paired["system"] == "adaptive"].merge(
+            pareto[pareto["system"] == "adaptive"],
+            on=["dataset", "system"],
+            how="left",
+        )
+        adaptive["pilot_gate_pass"] = adaptive["dataset"].isin(eligible)
+        adaptive["practically_meaningful"] = (
+            adaptive["accuracy_difference_vs_direct"]
+            >= config.sesoi_accuracy_difference
+        )
+        adaptive["hypothesis_supported"] = (
+            adaptive["pilot_gate_pass"]
+            & adaptive["practically_meaningful"]
+            & (adaptive["difference_ci_low"] > 0)
+            & (adaptive["mcnemar_holm_p_value"] < 0.05)
+            & adaptive["pareto_efficient"].fillna(False)
+        )
+    supported_datasets = adaptive.loc[
+        adaptive["hypothesis_supported"], "dataset"
+    ].tolist()
     report = {
         "experiment": config.experiment_name,
         "successful_generations": len(frame),
         "expected_generations": successful_expected,
+        "generation_completion_rate": len(frame) / successful_expected,
         "unique_cases": frame["case_id"].nunique(),
         "datasets": sorted(frame["dataset"].unique().tolist()),
         "judge_successes": judge_successes,
@@ -473,12 +640,21 @@ def analyze_v2(
         "pilot_gates": _pilot_gates(frame, config),
         "primary_hypothesis": (
             "Adaptive verify/escalate improves structured-decision accuracy over "
-            "direct generation while remaining on the realized-token Pareto frontier."
+            "direct generation by at least the preregistered smallest effect of "
+            "practical interest while remaining on the realized-token Pareto frontier."
         ),
-        "primary_comparisons": paired[
-            paired["system"] == "adaptive"
-        ].where(pd.notna(paired), None).to_dict(orient="records"),
+        "sesoi_accuracy_difference": config.sesoi_accuracy_difference,
+        "confirmatory_eligible_datasets": sorted(eligible),
+        "primary_comparisons": adaptive.where(pd.notna(adaptive), None).to_dict(
+            orient="records"
+        ),
+        "primary_supported_datasets": supported_datasets,
+        "primary_replicated_across_datasets": (
+            len(supported_datasets) == frame["dataset"].nunique()
+        ),
+        "budget_policy_rows": len(budget_policy),
     }
+    report = _json_native(report)
     (output / "analysis_summary.json").write_text(
         json.dumps(report, indent=2, sort_keys=True)
     )

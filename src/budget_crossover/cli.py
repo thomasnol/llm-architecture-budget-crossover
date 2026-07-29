@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -18,14 +19,12 @@ from .runner import execute_generation_run
 from .v2_analysis import analyze_v2
 from .v2_config import V2Config, load_v2_config
 from .v2_dataset import (
-    build_insurance_v2_cases,
-    fetch_mmlu_pro,
-    sample_mmlu_pro,
-    stratified_sample_cases,
+    build_v2_case_set,
 )
 from .v2_judging import execute_v2_judging
 from .v2_models import V2Case
 from .v2_runner import execute_v2_generation
+from .v2_validation import assert_pilot_gate, validate_v2_run
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 REPO = Path(__file__).resolve().parents[2]
@@ -143,27 +142,7 @@ def gateway_check() -> None:
 
 def _v2_cases_for_config(config_path: Path) -> tuple[V2Config, list[V2Case]]:
     config = load_v2_config(config_path)
-    insurance = build_insurance_v2_cases(
-        REPO / "data" / "raw" / "train.parquet",
-        evidence_condition=config.evidence_condition,
-        fixed_source_model=config.fixed_source_model,
-        max_context_chars=config.max_context_chars,
-    )
-    insurance = stratified_sample_cases(
-        insurance,
-        sample_size=config.insurance_sample_size,
-        seed=config.seed,
-    )
-    cases = list(insurance)
-    if config.include_mmlu:
-        raw_mmlu = fetch_mmlu_pro(REPO / "data" / "raw" / "mmlu_pro_test.parquet")
-        cases.extend(
-            sample_mmlu_pro(
-                raw_mmlu,
-                sample_size=config.mmlu_sample_size,
-                seed=config.seed + 17,
-            )
-        )
+    cases = build_v2_case_set(REPO, config)
     selected_path = (
         REPO
         / "data"
@@ -171,7 +150,7 @@ def _v2_cases_for_config(config_path: Path) -> tuple[V2Config, list[V2Case]]:
         / f"cases_{config.experiment_name}.jsonl"
     )
     write_jsonl(selected_path, cases)
-    return config, sorted(cases, key=lambda case: case.case_id)
+    return config, cases
 
 
 @app.command("prepare-v2")
@@ -226,8 +205,45 @@ def run_v2(
     config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
         REPO / "configs" / "v2_main.yaml"
     ),
+    force: Annotated[
+        bool,
+        typer.Option(
+            help="Override the preregistered pilot gate after documenting the reason."
+        ),
+    ] = False,
+    force_reason: Annotated[
+        str | None,
+        typer.Option(
+            help="Required audit note when --force overrides the pilot gate."
+        ),
+    ] = None,
 ) -> None:
     """Run the gated Version 2 main sweep."""
+    loaded = load_v2_config(config)
+    if force:
+        if not force_reason or not force_reason.strip():
+            raise typer.BadParameter("--force requires --force-reason")
+        override = (
+            REPO
+            / "experiments"
+            / "runs"
+            / loaded.experiment_name
+            / "pilot_gate_override.json"
+        )
+        override.parent.mkdir(parents=True, exist_ok=True)
+        override.write_text(
+            json.dumps(
+                {
+                    "experiment": loaded.experiment_name,
+                    "reason": force_reason.strip(),
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        assert_pilot_gate(REPO, loaded)
     _run_v2(config)
 
 
@@ -255,3 +271,37 @@ def analyze_v2_command(
     loaded, cases = _v2_cases_for_config(config)
     result = analyze_v2(repo=REPO, config=loaded, cases=cases)
     typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("validate-v2")
+def validate_v2_command(
+    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
+        REPO / "configs" / "v2_main.yaml"
+    ),
+    require_judgments: Annotated[
+        bool,
+        typer.Option(
+            "--require-judgments/--no-require-judgments",
+            help="Require the frozen secondary-judge audit sample to be complete.",
+        ),
+    ] = True,
+    require_pilot_gate: Annotated[
+        bool,
+        typer.Option(
+            "--require-pilot-gate/--no-require-pilot-gate",
+            help="Require a complete pilot with at least one passing dataset.",
+        ),
+    ] = True,
+) -> None:
+    """Validate completeness, usage accounting, call contracts, and pilot gates."""
+    loaded, cases = _v2_cases_for_config(config)
+    report = validate_v2_run(
+        repo=REPO,
+        config=loaded,
+        cases=cases,
+        require_judgments=require_judgments,
+        require_pilot_gate=require_pilot_gate,
+    )
+    typer.echo(json.dumps(report, indent=2))
+    if not report["pass"]:
+        raise typer.Exit(code=1)

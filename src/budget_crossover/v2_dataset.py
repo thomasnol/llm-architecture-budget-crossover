@@ -10,11 +10,13 @@ import numpy as np
 import pandas as pd
 
 from .dataset import compact_tool_evidence
+from .v2_config import V2Config
 from .v2_models import V2Case
 from .v2_schema import gold_from_references, schema_for_task
 
+MMLU_COMMIT = "24ac2da5bb7c7b42ea1a984c6b535e35a73d30b3"
 MMLU_PARQUET_URL = (
-    "https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro/resolve/main/"
+    f"https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro/resolve/{MMLU_COMMIT}/"
     "data/test-00000-of-00001.parquet"
 )
 
@@ -136,12 +138,15 @@ def build_insurance_v2_cases(
 def fetch_mmlu_pro(destination: Path, *, timeout_seconds: int = 120) -> list[dict[str, Any]]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        return pd.read_parquet(destination).to_dict(orient="records")
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
-        response = client.get(MMLU_PARQUET_URL)
-        response.raise_for_status()
-        destination.write_bytes(response.content)
-    return pd.read_parquet(destination).to_dict(orient="records")
+        frame = pd.read_parquet(destination)
+    else:
+        with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+            response = client.get(MMLU_PARQUET_URL)
+            response.raise_for_status()
+            destination.write_bytes(response.content)
+        frame = pd.read_parquet(destination)
+    frame = frame.reset_index(names="_source_index")
+    return frame.to_dict(orient="records")
 
 
 def _answer_letter(answer: Any, options: list[str]) -> str:
@@ -192,7 +197,7 @@ def sample_mmlu_pro(
             f"{string.ascii_uppercase[index]}. {value}"
             for index, value in enumerate(options)
         )
-        source_id = row.get("question_id", row.name)
+        source_id = row.get("question_id", row.get("_source_index", row.name))
         answer = _answer_letter(row["answer"], options)
         cases.append(
             V2Case(
@@ -243,3 +248,62 @@ def stratified_sample_cases(
         indices = rng.choice(group["index"].to_numpy(), size=quotas[name], replace=False)
         selected.extend(cases[int(index)] for index in indices)
     return sorted(selected, key=lambda case: case.case_id)
+
+
+def build_v2_case_set(repo: Path, config: V2Config) -> list[V2Case]:
+    """Build the frozen case set, with an optional disjoint pilot split."""
+
+    all_insurance = build_insurance_v2_cases(
+        repo / "data" / "raw" / "train.parquet",
+        evidence_condition=config.evidence_condition,
+        fixed_source_model=config.fixed_source_model,
+        max_context_chars=config.max_context_chars,
+    )
+    if config.exclude_pilot_cases:
+        pilot = stratified_sample_cases(
+            all_insurance,
+            sample_size=config.pilot_insurance_sample_size,
+            seed=config.seed,
+        )
+        pilot_ids = {case.case_id for case in pilot}
+        all_insurance = [
+            case for case in all_insurance if case.case_id not in pilot_ids
+        ]
+    insurance = stratified_sample_cases(
+        all_insurance,
+        sample_size=config.insurance_sample_size,
+        seed=config.seed,
+    )
+    cases = list(insurance)
+    if config.include_mmlu:
+        raw_mmlu = fetch_mmlu_pro(
+            repo / "data" / "raw" / "mmlu_pro_test.parquet"
+        )
+        if config.exclude_pilot_cases:
+            pilot_mmlu = sample_mmlu_pro(
+                raw_mmlu,
+                sample_size=config.pilot_mmlu_sample_size,
+                seed=config.seed + 17,
+            )
+            pilot_ids = {
+                str(case.metadata["source_id"]) for case in pilot_mmlu
+            }
+            raw_mmlu = [
+                row
+                for row in raw_mmlu
+                if str(
+                    row.get(
+                        "question_id",
+                        row.get("_source_index"),
+                    )
+                )
+                not in pilot_ids
+            ]
+        cases.extend(
+            sample_mmlu_pro(
+                raw_mmlu,
+                sample_size=config.mmlu_sample_size,
+                seed=config.seed + 17,
+            )
+        )
+    return sorted(cases, key=lambda case: case.case_id)
