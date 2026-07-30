@@ -59,7 +59,7 @@ offline scripted smoke run establish software behavior only. They are not model
 evidence and do not answer the research question.
 \end{{statusbox}}
 
-The external run must execute all 15,360 cells in the
+The external run must execute all 7,680 cells in the
 case-by-system-by-budget-by-repetition grid, regenerate the analysis bundle, and
 pass \texttt{{validate}}. The final
 paper will then report all operating points, including failures, budget

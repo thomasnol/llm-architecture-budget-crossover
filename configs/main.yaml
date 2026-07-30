@@ -41,6 +41,6 @@ sesoi_accuracy_difference: 0.05
 # Populate only with approved internal prices. Token and latency metrics remain
 # primary when no price schedule is supplied.
 model_prices_per_million: {}
-repetitions: 2
+repetitions: 1
 require_preflight: true
 permanent_error_threshold: 3

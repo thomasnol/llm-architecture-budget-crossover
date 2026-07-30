@@ -33,10 +33,10 @@ The staged design is:
 1. gateway preflight on every model and eligible credential;
 2. high-budget calibration and four-budget recommendation;
 3. a 48-case pilot;
-4. a disjoint 384-case main architecture study with two repetitions.
+4. a disjoint 384-case main architecture study with one repetition.
 
-The main grid contains 15,360 cells: 384 cases × five architectures × four
-budgets × two repetitions.
+The main grid contains 7,680 cells: 384 cases × five architectures × four
+budgets × one repetition.
 
 ## Setup
 

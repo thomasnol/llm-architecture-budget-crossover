@@ -12,7 +12,7 @@ smoke run.
 - Run the pilot preflight, complete the pilot, analyze it, and pass its
   validation gate.
 - Run and validate every pilot cell before opening the main-study gate.
-- Run all 15,360 main architecture cells, then run `validate` and `analyze`.
+- Run all 7,680 main architecture cells, then run `validate` and `analyze`.
 - Run the separate weak-to-strong routing ablation.
 - Inspect case-level errors, paired comparisons, crossover intervals, and
   protected-attribute flip-rate slices.
