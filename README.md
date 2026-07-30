@@ -104,6 +104,8 @@ state.
 Failures are checkpointed separately from scored outcomes. The runner:
 
 - retries only transient transport, rate-limit, and selected server errors;
+- reports completed decisions, budget-exhausted abstentions, error attempts,
+  and unresolved failed cells separately;
 - records sanitized status, response detail, model, stage, credential slot, and
   request ID;
 - stops after three equivalent permanent failures;

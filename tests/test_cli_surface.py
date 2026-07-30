@@ -21,3 +21,7 @@ def test_help_exposes_only_canonical_experiment_commands():
 
     for legacy in ["-v", "judge"]:
         assert legacy not in result.stdout
+
+    removed = CliRunner().invoke(app, ["gateway-check"])
+    assert removed.exit_code != 0
+    assert "No such command" in removed.stderr

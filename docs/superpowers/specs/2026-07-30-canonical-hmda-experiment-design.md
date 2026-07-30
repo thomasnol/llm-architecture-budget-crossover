@@ -47,9 +47,9 @@ comparison.
 Official 2024 HMDA records seed a deterministic policy sandbox. Historical
 institutional action remains descriptive and is never the gold label.
 Counterfactual twins vary exactly one monitoring-only protected attribute.
-Sampling balances policy decisions, states, threshold/routine/exception
-complexity, and historical actions. The pilot and main application sets are
-disjoint.
+Sampling balances research-policy decisions and, for the main cohort, states.
+Complexity and historical action are profiled rather than forced into artificial
+quotas. The pilot and main application sets are disjoint.
 
 ## Budget protocol
 

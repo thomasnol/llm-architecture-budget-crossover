@@ -2,6 +2,9 @@ from pathlib import Path
 
 """Tests for canonical resumable execution."""
 
+import asyncio
+import json
+
 from budget_crossover.config import ExperimentConfig
 from budget_crossover.gateway import GatewayRequestError
 from budget_crossover.io import read_jsonl
@@ -22,6 +25,10 @@ class ConfiguredFakeClient:
 
     async def close(self) -> None:
         return None
+
+
+class TwoWorkerFakeClient(ConfiguredFakeClient):
+    maximum_total_concurrency = 2
 
 
 def _case() -> Case:
@@ -128,6 +135,35 @@ async def test_three_equivalent_permanent_errors_open_circuit_before_full_grid(
     assert {row.stage for row in errors} == {"compliance_audit"}
     assert {row.status_code for row in errors} == {400}
 
+    resumed = await execute_generation(
+        repo=tmp_path,
+        config=config,
+        cases=[_case()],
+    )
+    assert resumed["circuit_open"] is True
+    assert resumed["launched"] == 0
+    assert resumed["failed_attempts"] == 0
+    assert resumed["remaining_cells"] == 6
+    assert len(read_jsonl(error_path(tmp_path, config), FailureAttempt)) == 3
+
+    preflight = tmp_path / "experiments" / "runs" / config.experiment_name / "preflight.json"
+    preflight.write_text(
+        json.dumps(
+            {
+                "pass": True,
+                "created_at": "9999-01-01T00:00:00+00:00",
+                "checks": [],
+            }
+        )
+    )
+    after_corrective_preflight = await execute_generation(
+        repo=tmp_path,
+        config=config,
+        cases=[_case()],
+    )
+    assert after_corrective_preflight["launched"] == 3
+    assert after_corrective_preflight["circuit_open"] is True
+
 
 async def test_transient_failures_remain_resumable_without_opening_circuit(
     monkeypatch,
@@ -213,3 +249,57 @@ async def test_repetitions_are_distinct_resumable_grid_cells(
         ("adaptive", 2048, 0),
         ("adaptive", 2048, 1),
     }
+
+
+async def test_active_cells_never_exceed_gateway_concurrency_bound(
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = ExperimentConfig(
+        experiment_name="bounded-workers",
+        hmda_source_sha256="0" * 64,
+        token_budgets=[2048, 4096, 8192],
+        systems=["monolith", "adaptive"],
+        bootstrap_replicates=100,
+        require_preflight=False,
+    )
+    active = 0
+    peak = 0
+
+    async def succeed(
+        client,
+        *,
+        case,
+        system,
+        token_budget,
+        config,
+        run_id,
+        repetition,
+    ):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return Generation(
+            run_id=run_id,
+            case_id=case.case_id,
+            pair_id=case.pair_id,
+            counterfactual_variant=case.counterfactual_variant,
+            system=system,
+            token_budget=token_budget,
+            repetition=repetition,
+            model=config.generator_model,
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.GatewayClient", TwoWorkerFakeClient)
+    monkeypatch.setattr("budget_crossover.runner.run_system", succeed)
+
+    report = await execute_generation(
+        repo=tmp_path,
+        config=config,
+        cases=[_case()],
+    )
+
+    assert report["completed"] == 6
+    assert peak == 2

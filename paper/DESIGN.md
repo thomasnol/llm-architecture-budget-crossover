@@ -14,8 +14,9 @@
   limitations; conclusion with no new claims.
 - Tables: use only for architecture comparisons and empirical operating points.
 - Figures: the study pipeline and shared-budget architecture diagram are
-  protocol figures. Validated analysis produces PNG and PDF versions of accuracy,
-  invariance, and accuracy-token plots.
+  protocol figures. Validated analysis produces PNG and PDF versions of
+  accuracy, coverage, invariance, accuracy-token, and optional accuracy-cost
+  plots. Tables include protected-attribute flip slices.
 - Citation rule: every external factual or methodological claim uses a verified
   primary or official source. The generated results section never creates a
   citation.

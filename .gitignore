@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 
-# Downloaded source data can be recreated with scripts/download_data.sh.
+# Downloaded source data can be recreated with scripts/download_hmda.py.
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*

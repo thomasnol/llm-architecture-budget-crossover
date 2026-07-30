@@ -170,6 +170,11 @@ Secondary outcomes:
 - accuracy by routine, threshold, and exception complexity;
 - descriptive concordance with historical action, explicitly not correctness.
 
+The flip-rate denominator contains only pair-repetitions with two valid
+decisions. Pair-decision coverage is reported beside the flip rate; abstention,
+schema failure, and infrastructure failure are not relabeled as demographic
+decision changes.
+
 ## Confirmatory hypothesis
 
 Within each nominal budget, adaptive guarded routing will improve
@@ -224,8 +229,8 @@ the preregistered confirmatory claim valid.
 
 The first model call freezes a manifest containing expanded configuration, case
 hash, HMDA checksum, prompt revision, source hash, primary and supervisor model
-IDs, resolved deployments, non-secret gateway protocol settings, seed, Git
-commit, and dirty-worktree flag. Checkpointed JSONL makes runs
+IDs, resolved deployments, dependency-lock hash, non-secret gateway protocol
+settings, seed, Git commit, and dirty-worktree flag. Checkpointed JSONL makes runs
 resumable; immutable-input changes block resume. Scored generations and
 retryable execution errors are stored separately.
 

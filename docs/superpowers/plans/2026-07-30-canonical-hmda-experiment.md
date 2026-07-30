@@ -41,11 +41,11 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 - Produces: `ExperimentConfig`, `Case`, `Generation`,
   `run_system`, `execute_generation`, and unversioned CLI commands.
 
-- [ ] Write CLI and import tests that invoke only the canonical command surface.
-- [ ] Run the focused tests and confirm they fail against versioned commands.
-- [ ] Rename canonical modules/configurations and update imports.
-- [ ] Remove superseded pipelines and their tests/data products.
-- [ ] Run focused tests, then scan tracked text for repository version labels.
+- [x] Write CLI and import tests that invoke only the canonical command surface.
+- [x] Run the focused tests and confirm they fail against versioned commands.
+- [x] Rename canonical modules/configurations and update imports.
+- [x] Remove superseded pipelines and their tests/data products.
+- [x] Run focused tests, then scan tracked text for repository version labels.
 
 ### Task 2: Gateway diagnostics and preflight
 
@@ -55,17 +55,17 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 - Test: `tests/test_gateway.py`, `tests/test_preflight.py`
 
 **Interfaces:**
-- Produces: `GatewayRequestError`, `GatewayAttempt`, and
+- Produces: `GatewayRequestError`, persisted `FailureAttempt` records, and
   `run_preflight(config) -> PreflightReport`.
 
-- [ ] Add failing tests for sanitized 400 response capture, attempted model,
+- [x] Add failing tests for sanitized 400 response capture, attempted model,
   stage propagation, slot, request ID, and retry classification.
-- [ ] Confirm the tests fail for the current `HTTPStatusError`.
-- [ ] Implement structured gateway errors without logging secrets.
-- [ ] Add failing tests proving preflight executes each model on every eligible
+- [x] Confirm the tests fail for the current `HTTPStatusError`.
+- [x] Implement structured gateway errors without logging secrets.
+- [x] Add failing tests proving preflight executes each model on every eligible
   credential and validates all three usage counters.
-- [ ] Implement preflight and persist its non-secret report.
-- [ ] Run gateway and preflight tests.
+- [x] Implement preflight and persist its non-secret report.
+- [x] Run gateway and preflight tests.
 
 ### Task 3: Bounded execution and circuit breaking
 
@@ -79,13 +79,13 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 - Produces: bounded `execute_generation`, structured attempt ledger,
   permanent-error circuit breaker, and `summarize_run`.
 
-- [ ] Add failing tests for a maximum bounded number of active cells.
-- [ ] Add failing tests that three equivalent permanent errors stop unscheduled
+- [x] Add failing tests for a maximum bounded number of active cells.
+- [x] Add failing tests that three equivalent permanent errors stop unscheduled
   work while transient failures remain resumable.
-- [ ] Implement the worker queue and circuit breaker.
-- [ ] Add failing tests for status grouping by error/system/budget/model/stage.
-- [ ] Implement status reporting and canonical CLI command.
-- [ ] Run runner and status tests.
+- [x] Implement the worker queue and circuit breaker.
+- [x] Add failing tests for status grouping by error/system/budget/model/stage.
+- [x] Implement status reporting and canonical CLI command.
+- [x] Run runner and status tests.
 
 ### Task 4: Controlled architecture and routing factors
 
@@ -101,12 +101,12 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
   use for the architecture study, and explicit weak-to-strong systems for the
   routing study.
 
-- [ ] Add failing tests that architecture systems cannot silently use the
+- [x] Add failing tests that architecture systems cannot silently use the
   supervisor model.
-- [ ] Add failing tests for routing-system model assignments.
-- [ ] Implement study-kind validation and explicit model assignment.
-- [ ] Set deterministic primary temperatures and repetition count.
-- [ ] Run configuration and system tests.
+- [x] Add failing tests for routing-system model assignments.
+- [x] Implement study-kind validation and explicit model assignment.
+- [x] Set deterministic primary temperatures and repetition count.
+- [x] Run configuration and system tests.
 
 ### Task 5: Calibration and feasibility
 
@@ -117,15 +117,15 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 - Test: `tests/test_calibration.py`
 
 **Interfaces:**
-- Produces: `calibrate_budgets(trajectories, architectures)`,
+- Produces: `recommend_budgets(trajectories, architecture_minima)`,
   `calibration.json`, and a four-budget recommendation.
 
-- [ ] Add failing tests using hand-calculated trajectory costs and architecture
+- [x] Add failing tests using hand-calculated trajectory costs and architecture
   minima.
-- [ ] Implement pooled quantile recommendations constrained by the largest
+- [x] Implement pooled quantile recommendations constrained by the largest
   fixed-architecture minimum.
-- [ ] Add a calibration CLI that never mutates frozen pilot/main configs.
-- [ ] Run calibration tests.
+- [x] Add a calibration CLI that never mutates frozen pilot/main configs.
+- [x] Run calibration tests.
 
 ### Task 6: Complete-grid analysis and estimands
 
@@ -139,13 +139,13 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
   counterfactual flip tables, cluster bootstrap comparisons, and diagnostic
   watermarks.
 
-- [ ] Add failing tests that ordinary analysis rejects incomplete grids.
-- [ ] Add failing tests that diagnostic analysis labels outputs incomplete.
-- [ ] Add hand-derived tests for ITT accuracy and counterfactual flip rate.
-- [ ] Implement coverage-first analysis and revised estimands.
-- [ ] Add tests for clustered paired resampling and crossover outputs.
-- [ ] Implement revised figures and tables.
-- [ ] Run analysis and validation tests.
+- [x] Add failing tests that ordinary analysis rejects incomplete grids.
+- [x] Add failing tests that diagnostic analysis labels outputs incomplete.
+- [x] Add hand-derived tests for ITT accuracy and counterfactual flip rate.
+- [x] Implement coverage-first analysis and revised estimands.
+- [x] Add tests for clustered paired resampling and crossover outputs.
+- [x] Implement revised figures and tables.
+- [x] Run analysis and validation tests.
 
 ### Task 7: Manifest, environment isolation, and documentation
 
@@ -161,14 +161,14 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 - Produces: manifest with protocol/deployment metadata and tests isolated from
   `.env`.
 
-- [ ] Add failing tests that gateway protocol/model deployment changes alter
+- [x] Add failing tests that gateway protocol/model deployment changes alter
   the immutable manifest while secrets never appear.
-- [ ] Implement the expanded manifest.
-- [ ] Add an autouse test boundary preventing repository `.env` loading.
-- [ ] Rewrite runbook and preregistration around staged execution.
-- [ ] Update the approximately five-page LaTeX protocol without asserting
+- [x] Implement the expanded manifest.
+- [x] Add an autouse test boundary preventing repository `.env` loading.
+- [x] Rewrite runbook and preregistration around staged execution.
+- [x] Update the approximately five-page LaTeX protocol without asserting
   unavailable main results.
-- [ ] Run documentation command examples and paper build.
+- [x] Run documentation command examples and paper build.
 
 ### Task 8: End-to-end verification
 
@@ -178,12 +178,12 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 **Interfaces:**
 - Consumes all preceding tasks and produces a reproducible release candidate.
 
-- [ ] Run the full unit/integration suite.
-- [ ] Run Ruff format/lint checks.
-- [ ] Run the offline smoke experiment through prepare, execute, validate,
+- [x] Run the full unit/integration suite.
+- [x] Run Ruff format/lint checks.
+- [x] Run the offline smoke experiment through prepare, execute, validate,
   status, and analyze.
-- [ ] Confirm ordinary analysis rejects a deliberately incomplete fixture.
-- [ ] Build and inspect the LaTeX PDF page count.
-- [ ] Scan the tracked tree for superseded version labels and stale commands.
-- [ ] Audit every approved design requirement against current files and
+- [x] Confirm ordinary analysis rejects a deliberately incomplete fixture.
+- [x] Build and inspect the LaTeX PDF page count.
+- [x] Scan the tracked tree for superseded version labels and stale commands.
+- [x] Audit every approved design requirement against current files and
   command output.

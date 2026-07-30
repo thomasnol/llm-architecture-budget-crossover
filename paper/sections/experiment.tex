@@ -25,7 +25,7 @@ IDs. Each credential has its own CUBIC-inspired concurrency window. Successful
 requests grow the window; 429 and overload responses reduce it
 multiplicatively. The environment variable
 \texttt{LLM\_GATEWAY\_CONCURRENCY\_PER\_KEY} sets the ceiling, and the runner
-uses a bounded worker queue to reach both ceilings. Three equivalent permanent
+uses a bounded worker pool to reach both ceilings. Three equivalent permanent
 request failures open a circuit before the remaining grid is launched. This
 preserves throughput without treating the configured ceiling as a promise that
 the service can sustain it.
@@ -69,6 +69,8 @@ use, call count, wall time, summed API
 latency, escalation rate, and accuracy by routine, threshold, and exception
 cases. Approved internal prices may support a secondary dollar estimate, but
 token and latency measures do not depend on a confidential price schedule.
+Flip rate is conditional on pair-repetitions with two valid decisions and is
+reported with pair-decision coverage; abstentions are not called flips.
 
 The confirmatory comparison is adaptive routing against the base monolith within
 each budget. We report the paired difference in $S$, an application-cluster
@@ -86,5 +88,6 @@ passes, the unique pilot grid is complete, every high-budget system reaches
 95\% schema validity, no operating point exceeds 1\% overrun, and at least one
 budget shows accuracy disagreement. A run manifest freezes the expanded
 configuration, case hash, HMDA checksum, prompt revision, source hash, resolved
-model deployments, non-secret gateway protocol, seed, Git commit, and
-dirty-worktree state. Checkpointed JSONL makes network failures resumable.
+model deployments, dependency-lock hash, non-secret gateway protocol, seed, Git
+commit, and dirty-worktree state. Checkpointed JSONL makes network failures
+resumable.

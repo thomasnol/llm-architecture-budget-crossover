@@ -80,3 +80,22 @@ def test_manifest_freezes_gateway_protocol_and_deployments_without_secrets(
     monkeypatch.setenv("LLM_GATEWAY_MAX_TOKENS_FIELD", "max_completion_tokens")
     with pytest.raises(RuntimeError, match="gateway_protocol"):
         ensure_manifest(tmp_path, config, [_case()])
+
+
+def test_manifest_freezes_dependency_lock(monkeypatch, tmp_path: Path):
+    lock = tmp_path / "uv.lock"
+    lock.write_text("revision-one")
+    config = ExperimentConfig(
+        experiment_name="lock-test",
+        hmda_source_sha256="0" * 64,
+        require_preflight=False,
+    )
+
+    manifest = ensure_manifest(tmp_path, config, [_case()])
+
+    assert manifest["dependency_lock"]["path"] == "uv.lock"
+    assert len(manifest["dependency_lock"]["sha256"]) == 64
+
+    lock.write_text("revision-two")
+    with pytest.raises(RuntimeError, match="dependency_lock"):
+        ensure_manifest(tmp_path, config, [_case()])

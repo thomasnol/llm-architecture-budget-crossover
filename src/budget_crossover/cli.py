@@ -12,7 +12,6 @@ from .analysis import analyze_run
 from .calibration import calibrate_run
 from .config import ExperimentConfig, load_experiment_config
 from .dataset import build_case_set, case_set_profile
-from .gateway import GatewayClient
 from .io import write_jsonl
 from .preflight import run_preflight
 from .records import Case
@@ -205,17 +204,3 @@ def status(
             indent=2,
         )
     )
-
-
-@app.command("gateway-check", hidden=True)
-def gateway_check() -> None:
-    """Authenticate configured credential pairs and list deployments."""
-
-    async def check() -> dict:
-        client = GatewayClient()
-        try:
-            return await client.credential_report()
-        finally:
-            await client.close()
-
-    typer.echo(json.dumps(asyncio.run(check()), indent=2))

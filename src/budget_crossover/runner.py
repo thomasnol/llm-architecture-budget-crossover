@@ -7,6 +7,7 @@ import json
 import random
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,20 @@ def _preflight_passed(repo: Path, config: ExperimentConfig) -> bool:
         return bool(json.loads(path.read_text()).get("pass"))
     except (OSError, json.JSONDecodeError):
         return False
+
+
+def _preflight_created_at(
+    repo: Path,
+    config: ExperimentConfig,
+) -> datetime | None:
+    path = run_dir(repo, config) / "preflight.json"
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text()).get("created_at")
+        return datetime.fromisoformat(value) if value else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def _failure_attempt(
@@ -145,7 +160,18 @@ async def execute_generation(
     started = time.monotonic()
     deadline = started + config.runtime_hours * 3600
     circuit_open = asyncio.Event()
-    permanent_signatures: Counter[str] = Counter()
+    preflight_created_at = _preflight_created_at(repo, config)
+    permanent_signatures = Counter(
+        row.signature
+        for row in previous_attempts
+        if not row.retryable
+        and (
+            preflight_created_at is None
+            or datetime.fromisoformat(row.created_at) >= preflight_created_at
+        )
+    )
+    if any(count >= config.permanent_error_threshold for count in permanent_signatures.values()):
+        circuit_open.set()
     counters: dict[str, int | float | bool] = {
         "completed": 0,
         "budget_exhausted": 0,
@@ -153,7 +179,7 @@ async def execute_generation(
         "skipped": len(completed),
         "scheduled": len(jobs),
         "launched": 0,
-        "circuit_open": False,
+        "circuit_open": circuit_open.is_set(),
     }
 
     async def worker() -> None:

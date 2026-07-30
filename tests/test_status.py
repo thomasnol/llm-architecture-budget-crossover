@@ -2,8 +2,8 @@ from pathlib import Path
 
 from budget_crossover.config import ExperimentConfig
 from budget_crossover.io import write_jsonl
-from budget_crossover.records import FailureAttempt
-from budget_crossover.runner import error_path
+from budget_crossover.records import FailureAttempt, Generation
+from budget_crossover.runner import error_path, generation_path
 from budget_crossover.status import summarize_run
 
 
@@ -40,11 +40,39 @@ def test_status_groups_operational_failures_by_attributable_dimensions(
         for index in range(2)
     ]
     write_jsonl(error_path(tmp_path, config), attempts)
+    write_jsonl(
+        generation_path(tmp_path, config),
+        [
+            Generation(
+                run_id="completed",
+                case_id="completed-case",
+                pair_id="completed-pair",
+                counterfactual_variant="observed",
+                system="monolith",
+                token_budget=2048,
+                model=config.generator_model,
+                status="ok",
+            ),
+            Generation(
+                run_id="exhausted",
+                case_id="exhausted-case",
+                pair_id="exhausted-pair",
+                counterfactual_variant="observed",
+                system="adaptive",
+                token_budget=2048,
+                model=config.generator_model,
+                status="budget_exhausted",
+            ),
+        ],
+    )
 
     report = summarize_run(repo=tmp_path, config=config, expected_cells=4)
 
-    assert report["scored_cells"] == 0
-    assert report["remaining_cells"] == 4
+    assert report["scored_cells"] == 2
+    assert report["completed_cells"] == 1
+    assert report["budget_exhausted_cells"] == 1
+    assert report["invalid_generation_status_cells"] == 0
+    assert report["remaining_cells"] == 2
     assert report["error_attempts"] == 2
     assert report["unique_failed_cells"] == 2
     assert report["failures_by_model"] == {"claude-sonnet-4-6": 2}

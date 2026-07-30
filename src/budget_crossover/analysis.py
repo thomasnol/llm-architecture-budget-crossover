@@ -59,8 +59,9 @@ def _bootstrap_mean(
 
 
 def _estimated_cost(generation: Generation, config: ExperimentConfig) -> float | None:
+    if not generation.calls:
+        return None
     total = 0.0
-    priced = False
     for call in generation.calls:
         model = call.response.model
         price = config.model_prices_per_million.get(model)
@@ -74,10 +75,9 @@ def _estimated_cost(generation: Generation, config: ExperimentConfig) -> float |
         prompt = call.response.usage.prompt_tokens
         completion = call.response.usage.completion_tokens
         if price is None or prompt is None or completion is None:
-            continue
+            return None
         total += (prompt * float(price["input"]) + completion * float(price["output"])) / 1_000_000
-        priced = True
-    return total if priced else None
+    return total
 
 
 def build_frame(
@@ -179,6 +179,8 @@ def _pair_frame(frame: pd.DataFrame) -> pd.DataFrame:
         decisions = group["candidate_policy_json"].dropna().tolist()
         candidate_labels = group["candidate_decision"].dropna().tolist()
         complete_pair = len(group) == 2
+        decisions_available = complete_pair and len(candidate_labels) == 2
+        policies_available = complete_pair and len(decisions) == 2
         rows.append(
             {
                 "pair_id": pair_id,
@@ -195,11 +197,16 @@ def _pair_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 "both_policies_complete": (
                     int(complete_pair and group["policy_complete"].eq(1).all())
                 ),
-                "counterfactual_decision_consistent": int(
-                    complete_pair and len(candidate_labels) == 2 and len(set(candidate_labels)) == 1
+                "both_decisions_available": int(decisions_available),
+                "both_policies_available": int(policies_available),
+                "counterfactual_decision_consistent": (
+                    int(len(set(candidate_labels)) == 1) if decisions_available else math.nan
                 ),
-                "counterfactual_policy_consistent": int(
-                    complete_pair and len(decisions) == 2 and len(set(decisions)) == 1
+                "counterfactual_decision_flip": (
+                    int(len(set(candidate_labels)) > 1) if decisions_available else math.nan
+                ),
+                "counterfactual_policy_consistent": (
+                    int(len(set(decisions)) == 1) if policies_available else math.nan
                 ),
                 "historical_action": (
                     observed.iloc[0]["historical_action"]
@@ -209,9 +216,39 @@ def _pair_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 "policy_decision": group.iloc[0]["policy_decision"],
                 "complexity": group.iloc[0]["complexity"],
                 "state": group.iloc[0]["state"],
+                "changed_protected_attribute": group.iloc[0]["changed_protected_attribute"],
             }
         )
     return pd.DataFrame(rows)
+
+
+def _flip_by_attribute(pair_frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for (system, budget, attribute), group in pair_frame.groupby(
+        ["system", "token_budget", "changed_protected_attribute"]
+    ):
+        available = group.dropna(subset=["counterfactual_decision_flip"])
+        rows.append(
+            {
+                "system": system,
+                "system_label": SYSTEM_LABELS[system],
+                "token_budget": budget,
+                "changed_protected_attribute": attribute,
+                "source_applications": group["pair_id"].nunique(),
+                "pair_repetitions": len(group),
+                "available_source_applications": available["pair_id"].nunique(),
+                "available_pair_repetitions": len(available),
+                "counterfactual_decision_flips": int(
+                    available["counterfactual_decision_flip"].sum()
+                ),
+                "counterfactual_flip_rate": (
+                    float(available["counterfactual_decision_flip"].mean())
+                    if len(available)
+                    else math.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["token_budget", "system", "changed_protected_attribute"])
 
 
 def _summary(
@@ -250,6 +287,7 @@ def _summary(
             consistency = (
                 pairs["counterfactual_decision_consistent"].mean() if len(pairs) else math.nan
             )
+            flip_rate = pairs["counterfactual_decision_flip"].mean() if len(pairs) else math.nan
             rows.append(
                 {
                     "system": system,
@@ -260,7 +298,8 @@ def _summary(
                     "coverage_rate": len(group) / expected_cells,
                     "completed_decision_rate": len(completed) / expected_cells,
                     "infrastructure_missing_rate": (expected_cells - len(group)) / expected_cells,
-                    "pairs": len(pairs),
+                    "source_applications": pairs["pair_id"].nunique(),
+                    "pair_repetitions": len(pairs),
                     "decision_accuracy": itt_accuracy,
                     "intention_to_treat_accuracy": itt_accuracy,
                     "conditional_decision_accuracy": completed_accuracy,
@@ -269,10 +308,11 @@ def _summary(
                     "policy_complete_accuracy": (group["policy_complete"].sum() / expected_cells),
                     "historical_action_concordance": group["historical_action_concordant"].mean(),
                     "both_twins_decision_correct": pairs["both_decisions_correct"].mean(),
+                    "counterfactual_pair_decision_coverage": pairs[
+                        "both_decisions_available"
+                    ].mean(),
                     "counterfactual_decision_consistency": consistency,
-                    "counterfactual_flip_rate": (
-                        1 - consistency if not pd.isna(consistency) else math.nan
-                    ),
+                    "counterfactual_flip_rate": flip_rate,
                     "counterfactual_policy_consistency": pairs[
                         "counterfactual_policy_consistent"
                     ].mean(),
@@ -514,22 +554,34 @@ def _mechanisms(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _frontier(summary: pd.DataFrame) -> pd.DataFrame:
+    def efficient(
+        group: pd.DataFrame,
+        candidate: pd.Series,
+        resource: str,
+    ) -> bool | None:
+        if pd.isna(candidate[resource]):
+            return None
+        dominated = any(
+            other["decision_accuracy"] >= candidate["decision_accuracy"]
+            and other[resource] <= candidate[resource]
+            and (
+                other["decision_accuracy"] > candidate["decision_accuracy"]
+                or other[resource] < candidate[resource]
+            )
+            for _, other in group.drop(candidate.name).iterrows()
+            if not pd.isna(other[resource])
+        )
+        return not dominated
+
     rows: list[dict[str, Any]] = []
     for budget, group in summary.groupby("token_budget"):
         for _, candidate in group.iterrows():
-            if pd.isna(candidate["mean_total_tokens"]):
-                dominated = True
-            else:
-                dominated = any(
-                    other["decision_accuracy"] >= candidate["decision_accuracy"]
-                    and other["mean_total_tokens"] <= candidate["mean_total_tokens"]
-                    and (
-                        other["decision_accuracy"] > candidate["decision_accuracy"]
-                        or other["mean_total_tokens"] < candidate["mean_total_tokens"]
-                    )
-                    for _, other in group.drop(candidate.name).iterrows()
-                    if not pd.isna(other["mean_total_tokens"])
-                )
+            token_efficient = efficient(group, candidate, "mean_total_tokens")
+            cost_efficient = efficient(
+                group,
+                candidate,
+                "mean_estimated_cost_usd",
+            )
             rows.append(
                 {
                     "token_budget": budget,
@@ -537,7 +589,10 @@ def _frontier(summary: pd.DataFrame) -> pd.DataFrame:
                     "system_label": candidate["system_label"],
                     "decision_accuracy": candidate["decision_accuracy"],
                     "mean_total_tokens": candidate["mean_total_tokens"],
-                    "pareto_efficient_within_budget": not dominated,
+                    "mean_estimated_cost_usd": candidate["mean_estimated_cost_usd"],
+                    "pareto_efficient_within_budget": token_efficient,
+                    "pareto_efficient_token_within_budget": token_efficient,
+                    "pareto_efficient_cost_within_budget": cost_efficient,
                 }
             )
     return pd.DataFrame(rows)
@@ -663,6 +718,36 @@ def _write_figures(
     fig.savefig(output / "tokens_vs_accuracy.pdf")
     plt.close(fig)
 
+    priced = summary.dropna(subset=["mean_estimated_cost_usd"])
+    if not priced.empty:
+        fig, ax = plt.subplots(figsize=(7.2, 4.7))
+        for system, group in priced.groupby("system"):
+            ax.scatter(
+                group["mean_estimated_cost_usd"],
+                group["decision_accuracy"],
+                label=SYSTEM_LABELS[system],
+                color=colors[system],
+                marker=markers[system],
+                s=44,
+            )
+        ax.set(
+            xlabel="Mean estimated cost (USD)",
+            ylabel="Decision accuracy",
+            ylim=(-0.02, 1.02),
+        )
+        ax.legend(
+            frameon=False,
+            fontsize=8,
+            ncol=3,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.16),
+        )
+        fig.tight_layout()
+        mark(fig)
+        fig.savefig(output / "cost_vs_accuracy.png", dpi=220)
+        fig.savefig(output / "cost_vs_accuracy.pdf")
+        plt.close(fig)
+
     fig, ax = plt.subplots(figsize=(7.2, 4.7))
     for system, group in summary.groupby("system"):
         group = group.sort_values("token_budget")
@@ -726,6 +811,7 @@ def analyze_run(
         )
     frame = build_frame(cases=cases, generations=generations, config=config)
     pair_frame = _pair_frame(frame)
+    flip_by_attribute = _flip_by_attribute(pair_frame)
     summary = _summary(
         frame,
         pair_frame,
@@ -743,6 +829,10 @@ def analyze_run(
     tables.mkdir(parents=True, exist_ok=True)
     frame.to_csv(tables / "case_results.csv", index=False)
     pair_frame.to_csv(tables / "pair_results.csv", index=False)
+    flip_by_attribute.to_csv(
+        tables / "counterfactual_flip_by_attribute.csv",
+        index=False,
+    )
     summary.to_csv(tables / "system_summary.csv", index=False)
     summary[
         [

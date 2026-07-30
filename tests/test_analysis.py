@@ -7,6 +7,8 @@ import pytest
 
 from budget_crossover.analysis import (
     _crossover_estimates,
+    _estimated_cost,
+    _frontier,
     _paired_comparisons,
     analyze_run,
 )
@@ -18,13 +20,13 @@ from budget_crossover.records import Case, Generation
 from budget_crossover.runner import generation_path
 
 
-def _call() -> CallRecord:
+def _call(model: str = "gpt-5.4-mini") -> CallRecord:
     return CallRecord(
         stage="final",
         token_cap=256,
         response=GatewayResponse(
             text="",
-            model="gpt-5.4-mini",
+            model=model,
             usage=Usage(
                 prompt_tokens=100,
                 completion_tokens=20,
@@ -73,6 +75,9 @@ def test_analysis_clusters_counterfactual_twins(tmp_path: Path):
         systems=["monolith", "adaptive"],
         repetitions=2,
         bootstrap_replicates=100,
+        model_prices_per_million={
+            "gpt-5.4-mini": {"input": 1.0, "output": 2.0},
+        },
     )
     cases = [
         _case(pair, variant) for pair in range(4) for variant in ("observed", "counterfactual")
@@ -112,8 +117,12 @@ def test_analysis_clusters_counterfactual_twins(tmp_path: Path):
     summary = pd.read_csv(tables / "system_summary.csv")
     adaptive = summary[summary["system"] == "adaptive"].iloc[0]
     assert adaptive["decision_accuracy"] == 1
+    assert adaptive["source_applications"] == 4
+    assert adaptive["pair_repetitions"] == 8
     comparisons = pd.read_csv(tables / "paired_comparisons.csv")
     assert comparisons.iloc[0]["paired_applications"] == 4
+    figures = tmp_path / "experiments" / "runs" / "mock" / "analysis" / "figures"
+    assert (figures / "cost_vs_accuracy.pdf").exists()
 
 
 def test_analysis_rejects_incomplete_grid_unless_diagnostic_is_explicit(
@@ -213,6 +222,20 @@ def test_coverage_itt_accuracy_and_counterfactual_flip_rate_are_explicit(
     assert summary.loc["monolith", "counterfactual_flip_rate"] == 1
     assert summary.loc["adaptive", "intention_to_treat_accuracy"] == 1
     assert summary.loc["adaptive", "counterfactual_flip_rate"] == 0
+    flip_slice = pd.read_csv(
+        tmp_path
+        / "experiments"
+        / "runs"
+        / "estimands"
+        / "analysis"
+        / "tables"
+        / "counterfactual_flip_by_attribute.csv"
+    ).set_index("system")
+    assert flip_slice.loc["monolith", "changed_protected_attribute"] == "race"
+    assert flip_slice.loc["monolith", "source_applications"] == 1
+    assert flip_slice.loc["monolith", "pair_repetitions"] == 1
+    assert flip_slice.loc["monolith", "counterfactual_flip_rate"] == 1
+    assert flip_slice.loc["adaptive", "counterfactual_flip_rate"] == 0
 
 
 def test_crossover_estimate_bootstraps_at_source_application_level():
@@ -309,3 +332,125 @@ def test_mcnemar_requires_success_in_every_repetition():
     assert comparison.iloc[0]["accuracy_difference_vs_baseline"] == 0.5
     assert comparison.iloc[0]["improved_applications"] == 0
     assert comparison.iloc[0]["mcnemar_success_rule"] == "all_repetitions_both_twins_correct"
+
+
+def test_estimated_cost_requires_prices_for_every_call():
+    config = ExperimentConfig(
+        experiment_name="cost",
+        hmda_source_sha256="0" * 64,
+        model_prices_per_million={
+            "gpt-5.4-mini": {"input": 1.0, "output": 2.0},
+        },
+    )
+    generation = Generation(
+        run_id="mixed-model",
+        case_id="case",
+        pair_id="pair",
+        counterfactual_variant="observed",
+        system="selective_supervisor",
+        token_budget=4096,
+        model=config.generator_model,
+        calls=[
+            _call("gpt-5.4-mini"),
+            _call("claude-sonnet-4-6"),
+        ],
+    )
+
+    assert _estimated_cost(generation, config) is None
+
+    config.model_prices_per_million["claude-sonnet-4-6"] = {
+        "input": 3.0,
+        "output": 4.0,
+    }
+    assert _estimated_cost(generation, config) == pytest.approx(0.00052)
+
+
+def test_pareto_table_reports_token_and_optional_cost_frontiers():
+    summary = pd.DataFrame(
+        [
+            {
+                "token_budget": 4096,
+                "system": "monolith",
+                "system_label": "Monolith",
+                "decision_accuracy": 0.8,
+                "mean_total_tokens": 1000,
+                "mean_estimated_cost_usd": 0.01,
+            },
+            {
+                "token_budget": 4096,
+                "system": "adaptive",
+                "system_label": "Adaptive",
+                "decision_accuracy": 0.9,
+                "mean_total_tokens": 900,
+                "mean_estimated_cost_usd": 0.02,
+            },
+        ]
+    )
+
+    frontier = _frontier(summary).set_index("system")
+
+    assert not frontier.loc["monolith", "pareto_efficient_token_within_budget"]
+    assert frontier.loc["adaptive", "pareto_efficient_token_within_budget"]
+    assert frontier.loc["monolith", "pareto_efficient_cost_within_budget"]
+    assert frontier.loc["adaptive", "pareto_efficient_cost_within_budget"]
+
+
+def test_resource_abstention_is_not_misclassified_as_counterfactual_flip(
+    tmp_path: Path,
+):
+    config = ExperimentConfig(
+        experiment_name="abstention-flip",
+        hmda_source_sha256="0" * 64,
+        token_budgets=[2048],
+        systems=["monolith", "adaptive"],
+        bootstrap_replicates=100,
+    )
+    cases = [_case(0, "observed"), _case(0, "counterfactual")]
+    generations = []
+    for case in cases:
+        generations.extend(
+            [
+                Generation(
+                    run_id=f"{case.case_id}-monolith",
+                    case_id=case.case_id,
+                    pair_id=case.pair_id,
+                    counterfactual_variant=case.counterfactual_variant,
+                    system="monolith",
+                    token_budget=2048,
+                    model=config.generator_model,
+                    status="budget_exhausted",
+                ),
+                Generation(
+                    run_id=f"{case.case_id}-adaptive",
+                    case_id=case.case_id,
+                    pair_id=case.pair_id,
+                    counterfactual_variant=case.counterfactual_variant,
+                    system="adaptive",
+                    token_budget=2048,
+                    model=config.generator_model,
+                    parsed_decision={
+                        "decision": "approve",
+                        "reason_codes": ["meets_policy"],
+                    },
+                    calls=[_call()],
+                ),
+            ]
+        )
+    ensure_manifest(tmp_path, config, cases)
+    write_jsonl(generation_path(tmp_path, config), generations)
+
+    analyze_run(repo=tmp_path, config=config, cases=cases)
+    summary = pd.read_csv(
+        tmp_path
+        / "experiments"
+        / "runs"
+        / "abstention-flip"
+        / "analysis"
+        / "tables"
+        / "system_summary.csv"
+    ).set_index("system")
+
+    assert summary.loc["monolith", "counterfactual_pair_decision_coverage"] == 0
+    assert pd.isna(summary.loc["monolith", "counterfactual_flip_rate"])
+    assert summary.loc["adaptive", "counterfactual_pair_decision_coverage"] == 1
+    assert summary.loc["adaptive", "counterfactual_flip_rate"] == 0

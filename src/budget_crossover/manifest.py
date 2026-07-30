@@ -14,7 +14,7 @@ from .config import ExperimentConfig
 from .records import Case
 from .systems import PROMPT_REVISION
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -23,6 +23,14 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _canonical_hash(value: Any) -> str:
     return _sha256_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _dependency_lock(repo: Path) -> dict[str, str | None]:
+    path = repo / "uv.lock"
+    return {
+        "path": "uv.lock",
+        "sha256": _sha256_bytes(path.read_bytes()) if path.exists() else None,
+    }
 
 
 def _source_hash(repo: Path) -> str:
@@ -145,6 +153,7 @@ def _immutable_payload(
         "cases_sha256": _canonical_hash(case_payload),
         "hmda_source_sha256": config.hmda_source_sha256,
         "source_sha256": _source_hash(repo),
+        "dependency_lock": _dependency_lock(repo),
         "gateway_protocol": gateway_protocol,
         "credential_model_patterns": credential_patterns,
         "resolved_deployments": {

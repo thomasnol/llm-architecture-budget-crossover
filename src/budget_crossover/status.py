@@ -35,6 +35,11 @@ def summarize_run(
         "experiment": config.experiment_name,
         "expected_cells": expected_cells,
         "scored_cells": len(scored),
+        "completed_cells": sum(row.status == "ok" for row in generations),
+        "budget_exhausted_cells": sum(row.status == "budget_exhausted" for row in generations),
+        "invalid_generation_status_cells": sum(
+            row.status not in {"ok", "budget_exhausted"} for row in generations
+        ),
         "remaining_cells": max(0, expected_cells - len(scored)),
         "error_attempts": len(attempts),
         "unique_failed_cells": len(failed),
