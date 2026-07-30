@@ -3,7 +3,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from budget_crossover.gateway import CubicConcurrencyLimiter, GatewayClient
+from budget_crossover.gateway import (
+    CubicConcurrencyLimiter,
+    GatewayClient,
+    GatewayRequestError,
+)
 
 
 @pytest.mark.asyncio
@@ -27,6 +31,7 @@ async def test_cubic_limiter_grows_then_multiplicatively_decreases():
 @pytest.mark.asyncio
 async def test_model_allowlists_match_the_two_gateway_credentials(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
+    monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
     monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
     monkeypatch.setenv("LLM_GATEWAY_CLIENT_ID_1", "first")
     monkeypatch.setenv("LLM_GATEWAY_CLIENT_SECRET_1", "secret-one")
@@ -140,9 +145,7 @@ async def test_credential_report_authenticates_both_pairs(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/oauth/token":
-            identifier = (
-                "first" if b"client_id=first" in request.content else "second"
-            )
+            identifier = "first" if b"client_id=first" in request.content else "second"
             token_ids.add(identifier)
             return httpx.Response(
                 200,
@@ -165,3 +168,101 @@ async def test_credential_report_authenticates_both_pairs(monkeypatch):
     assert [slot["status"] for slot in report["slots"]] == ["ok", "ok"]
     assert report["slots"][0]["reported_model_ids"] == ["claude-sonnet-4-6"]
     assert report["slots"][1]["reported_model_ids"] == ["gpt-5.4-mini"]
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_gateway_error_preserves_sanitized_request_context(
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
+    monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_ID_1", "first")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_SECRET_1", "secret-one")
+    monkeypatch.setenv("LLM_GATEWAY_MODELS_1", "claude-sonnet-4-6")
+    monkeypatch.delenv("LLM_GATEWAY_CLIENT_ID_2", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_CLIENT_SECRET_2", raising=False)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if request.url.path == "/oauth/token":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-token", "expires_in": 3600},
+            )
+        return httpx.Response(
+            400,
+            headers={"x-request-id": "bad-request-17"},
+            json={"error": {"message": "temperature is unsupported; secret-one must be hidden"}},
+        )
+
+    client = GatewayClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(GatewayRequestError) as raised:
+            await client.complete(
+                model="claude-sonnet-4-6",
+                system="system",
+                user="case",
+                max_tokens=64,
+                stage="strong_monolith",
+                credential_slot=1,
+            )
+    finally:
+        await client.close()
+
+    error = raised.value
+    assert requests == 2  # one OAuth request and one non-retried chat request
+    assert error.status_code == 400
+    assert error.model == "claude-sonnet-4-6"
+    assert error.stage == "strong_monolith"
+    assert error.credential_slot == 1
+    assert error.request_id == "bad-request-17"
+    assert error.retryable is False
+    assert "temperature is unsupported" in error.detail
+    assert "secret-one" not in error.detail
+    assert "secret-one" not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_remains_retryable_after_gateway_retries(
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY_1", "api-key")
+    monkeypatch.setenv("LLM_GATEWAY_MODELS_1", "gpt-5.4-mini")
+    monkeypatch.delenv("LLM_GATEWAY_CLIENT_ID_2", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_CLIENT_SECRET_2", raising=False)
+    monkeypatch.setattr("budget_crossover.gateway.asyncio.sleep", _no_sleep)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise httpx.ConnectError("temporary disconnect", request=request)
+
+    client = GatewayClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(GatewayRequestError) as raised:
+            await client.complete(
+                model="gpt-5.4-mini",
+                system="system",
+                user="case",
+                max_tokens=64,
+                stage="monolith",
+            )
+    finally:
+        await client.close()
+
+    assert requests == 5
+    assert raised.value.retryable is True
+    assert raised.value.status_code is None
+    assert raised.value.stage == "monolith"
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None

@@ -12,8 +12,8 @@ The counterfactual probe has the same boundary. It can reveal direct sensitivity
 to one changed monitoring field inside this prompt. It cannot reveal structural
 disparity, proxy use in unobserved data, or a causal effect in real lending.
 Likewise, a compliance agent may improve policy fidelity while adding latency,
-or it may repeat the first agent's mistake. The strong-model monolith and
-complete token ledger make those alternatives visible.
+or it may repeat the first agent's mistake. The fixed-model primary study and
+separate routing ablation keep those alternatives distinguishable.
 
 No live gateway result appears in this protocol. After the external run, the
 remaining work is to inspect case-level failures, regenerate the evidence-gated
@@ -24,18 +24,17 @@ the paper.
 
 \subsection{Threats to Validity}
 
-Three design risks remain even after the controls. First, the supervisor model
-is stronger than the worker model. This is intentional for a realistic
-guardrail, but it confounds extra coordination with extra model capability. The
-strong monolith isolates that alternative: if it matches the guarded systems in
-one call, the practical recommendation changes. Second, adaptive routing uses a
+Three design risks remain even after the controls. First, the routing ablation
+combines model selection with extra calls; its conclusion therefore concerns a
+deployable composite policy, not a pure architecture effect. The primary study
+holds the model fixed. Second, adaptive routing uses a
 self-reported confidence value. Confidence is a routing signal, not a calibrated
 probability. We therefore report escalation behavior and performance by route
 instead of treating 0.90 as evidence that an answer is 90\% likely to be correct.
 Third, the prompt estimator is conservative but approximate. Only the gateway's
 usage object determines realized token cost.
 
-The main sample has 96 independent applications. Power depends on the number of
+The main sample has 192 independent applications. Power depends on the number of
 applications where adaptive and monolithic systems disagree, which cannot be
 known before the run. The analysis reports an observed-discordance minimum
 detectable effect, and a non-significant comparison will not be called
@@ -49,7 +48,7 @@ that the execution can still be audited and repeated inside the same gateway.
 This design tests a practical claim: orchestration should earn its extra calls.
 HMDA supplies realistic mortgage records, a transparent sandbox supplies
 auditable labels, and protected-attribute twins supply a controlled invariance
-check. Six workflows then compete under the same total-token ledger. The code,
+check. Five workflows then compete under the same total-token ledger. The code,
 data checksum, prompts, pilot gates, metrics, and figures are frozen before model
 execution. The next step is empirical, not editorial: run the complete grid,
 validate it, and let the measured trade-off determine the conclusion.

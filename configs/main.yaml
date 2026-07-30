@@ -1,24 +1,46 @@
 experiment_name: main
-seed: 20260728
-sample_size: 60
-task_quotas:
-  Appetite Check: 14
-  Business Classification: 2
-  Deductibles: 7
-  Policy Limits: 13
-  Product Recommendations: 14
-  Small Business Elibility Check: 10
-budgets: [256, 512, 1024, 2048, 4096]
-architectures: [direct, self_critique, debate]
-generator_model: ${GATEWAY_MODEL_GENERATOR:-gpt-5.4-mini}
-temperature: 0.0
-max_context_chars: 72000
+seed: 20260729
+hmda_year: 2024
+hmda_states:
+  - DC
+  - ND
+  - VT
+  - WY
+hmda_raw_filename: hmda_2024_dc_nd_vt_wy.csv
+hmda_source_sha256: ed1f933f5b3487310c8364aebba8cb8b82d3f9870ff744648899e62baceaf4f5
+base_application_count: 192
+exclude_pilot_applications: true
+pilot_base_application_count: 24
+pilot_experiment_name: pilot
+token_budgets:
+  - 4096
+  - 6144
+  - 8192
+  - 12288
+systems:
+  - monolith
+  - retrieval
+  - committee
+  - guardrail
+  - adaptive
+generator_model: ${GATEWAY_MODEL_PRIMARY:-gpt-5.4-mini}
+supervisor_model: ${GATEWAY_MODEL_SUPERVISOR:-claude-sonnet-4-6}
+stage_max_output_tokens: 256
+minimum_call_output_tokens: 64
+prompt_chars_per_token: 2.5
+prompt_token_overhead: 64
+direct_temperature: 0.0
+specialist_temperature: 0.0
+adaptive_confidence_threshold: 0.90
 request_timeout_seconds: 180
-global_case_concurrency: 8
-generation_runtime_hours: 4.75
-judging_runtime_hours: 3.0
-judge_models:
-  - ${GATEWAY_MODEL_JUDGE_A:-gpt-5.4}
-  - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4-6}
-adjudicator_model: ${GATEWAY_MODEL_ADJUDICATOR:-claude-opus-4-6}
+runtime_hours: 6.0
 bootstrap_replicates: 5000
+minimum_high_budget_schema_validity: 0.95
+maximum_budget_overrun_rate: 0.01
+sesoi_accuracy_difference: 0.05
+# Populate only with approved internal prices. Token and latency metrics remain
+# primary when no price schedule is supplied.
+model_prices_per_million: {}
+repetitions: 2
+require_preflight: true
+permanent_error_threshold: 3

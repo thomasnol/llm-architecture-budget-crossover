@@ -9,7 +9,9 @@ T_{isb}=\sum_{k=1}^{K_{is}}\left(P_{isk}+C_{isk}\right),
 \label{eq:budget}
 \end{equation}
 where $P$ and $C$ are gateway-reported prompt and completion tokens for internal
-call $k$. We test $B\in\{2048,4096,8192\}$. Before issuing a call, the controller
+call $k$. A high-budget calibration run recommends pooled realized-cost
+quantiles subject to a common feasibility floor. The frozen candidate set is
+$B\in\{4096,6144,8192,12288\}$. Before issuing a call, the controller
 estimates its prompt as $\lceil\text{characters}/2.5\rceil+64$ and reserves at
 least 64 completion tokens. Parallel specialists launch only when the remaining
 budget can fund all three minimum allocations. Reported usage replaces the
@@ -23,9 +25,10 @@ IDs. Each credential has its own CUBIC-inspired concurrency window. Successful
 requests grow the window; 429 and overload responses reduce it
 multiplicatively. The environment variable
 \texttt{LLM\_GATEWAY\_CONCURRENCY\_PER\_KEY} sets the ceiling, and the runner
-creates enough case tasks to reach both ceilings. This preserves high throughput
-without treating the configured ceiling as a promise that the service can
-sustain it.
+uses a bounded worker queue to reach both ceilings. Three equivalent permanent
+request failures open a circuit before the remaining grid is launched. This
+preserves throughput without treating the configured ceiling as a promise that
+the service can sustain it.
 
 \begin{figure}[H]
 \centering
@@ -50,8 +53,8 @@ sustain it.
 \draw[arrow] (ledger) -- (out);
 \end{tikzpicture}
 \caption{Architectures differ in information flow, but every internal call
-debits the same case-level token ledger. Strong monolith shares the monolith
-path; adaptive shares the guardrail path only when it escalates.}
+debits the same case-level token ledger. Adaptive shares the guardrail path only
+when it escalates.}
 \label{fig:architectures}
 \end{figure}
 
@@ -60,27 +63,28 @@ path; adaptive shares the guardrail path only when it escalates.}
 The primary unit is the source application, not either counterfactual row. Let
 $c_{is0}$ and $c_{is1}$ indicate a correct decision on the observed and changed
 variants. Primary success is $S_{is}=c_{is0}c_{is1}$. Secondary outcomes include
-per-case decision accuracy, exact decision-plus-reason accuracy, schema validity,
-decision and full-policy invariance, token use, call count, wall time, summed API
+intention-to-treat and completed-decision accuracy, exact
+decision-plus-reason accuracy, schema validity, counterfactual flip rate, token
+use, call count, wall time, summed API
 latency, escalation rate, and accuracy by routine, threshold, and exception
 cases. Approved internal prices may support a secondary dollar estimate, but
 token and latency measures do not depend on a confidential price schedule.
 
 The confirmatory comparison is adaptive routing against the base monolith within
 each budget. We report the paired difference in $S$, an application-cluster
-bootstrap 95\% interval, and an exact McNemar test. The three budget-level
+bootstrap 95\% interval, and an exact McNemar test. The four budget-level
 $p$-values receive Holm correction \citep{holm1979}. Support requires a gain of
 at least five percentage points, an interval excluding zero, adjusted
 $p<0.05$, an overrun rate no greater than 1\%, and a non-dominated
 accuracy-token operating point. A sign change between adjacent tested budgets is
 called a crossover only when the paired uncertainty supports that description.
-Otherwise, we report three discrete comparisons.
+Otherwise, we report four discrete comparisons.
 
-The pilot includes 864 cells; the main grid includes
-$192\times6\times3=3{,}456$. The main run is blocked unless every high-budget
-system reaches 95\% schema validity, no operating point exceeds 1\% overrun, and
-at least one budget shows accuracy disagreement. A run manifest freezes the
-expanded configuration, case hash, HMDA checksum, prompt version, source hash,
-model IDs, seed, Git commit, and dirty-worktree state. Checkpointed JSONL makes
-network failures resumable. Scored outputs and retryable execution errors use
-separate files, so a transient error cannot duplicate a canonical cell.
+The pilot includes $48\times5\times4=960$ cells; the main grid includes
+$384\times5\times4\times2=15{,}360$. The main run is blocked unless preflight
+passes, the unique pilot grid is complete, every high-budget system reaches
+95\% schema validity, no operating point exceeds 1\% overrun, and at least one
+budget shows accuracy disagreement. A run manifest freezes the expanded
+configuration, case hash, HMDA checksum, prompt revision, source hash, resolved
+model deployments, non-secret gateway protocol, seed, Git commit, and
+dirty-worktree state. Checkpointed JSONL makes network failures resumable.

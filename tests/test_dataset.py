@@ -1,29 +1,33 @@
 from pathlib import Path
 
-from budget_crossover.dataset import build_cases, sample_cases
+"""Tests for canonical HMDA case construction."""
+
+from budget_crossover.config import load_experiment_config
+from budget_crossover.dataset import build_case_set, case_set_profile
+from budget_crossover.validation import validate_cases
 
 REPO = Path(__file__).resolve().parents[1]
 
 
-def test_builds_unique_leakage_controlled_cases():
-    cases = build_cases(REPO / "data" / "raw" / "train.parquet")
-    assert len(cases) == 80
-    assert len({case.case_id for case in cases}) == 80
-    assert max(case.evidence_chars for case in cases) < 72000
-    assert all(case.accepted_reference_answers for case in cases)
+def test_case_sets_are_balanced_paired_and_disjoint():
+    pilot_config = load_experiment_config(REPO / "configs" / "pilot.yaml")
+    main_config = load_experiment_config(REPO / "configs" / "main.yaml")
+    pilot = build_case_set(REPO, pilot_config)
+    main = build_case_set(REPO, main_config)
+
+    pilot_profile = case_set_profile(pilot)
+    main_profile = case_set_profile(main)
+    assert pilot_profile["cases"] == 48
+    assert main_profile["cases"] == 384
+    assert set(main_profile["policy_decisions"].values()) == {48}
+    assert set(main_profile["states"].values()) == {48}
+    assert {case.source_row_id for case in pilot}.isdisjoint({case.source_row_id for case in main})
 
 
-def test_main_sample_is_reproducible_and_stratified():
-    cases = build_cases(REPO / "data" / "raw" / "train.parquet")
-    quotas = {
-        "Appetite Check": 14,
-        "Business Classification": 2,
-        "Deductibles": 7,
-        "Policy Limits": 13,
-        "Product Recommendations": 14,
-        "Small Business Elibility Check": 10,
-    }
-    first = sample_cases(cases, sample_size=60, seed=20260728, task_quotas=quotas)
-    second = sample_cases(cases, sample_size=60, seed=20260728, task_quotas=quotas)
-    assert [case.case_id for case in first] == [case.case_id for case in second]
-    assert {task: sum(case.task == task for case in first) for task in quotas} == quotas
+def test_counterfactuals_change_only_one_monitoring_attribute():
+    config = load_experiment_config(REPO / "configs" / "pilot.yaml")
+    cases = build_case_set(REPO, config)
+    report = validate_cases(repo=REPO, config=config, cases=cases)
+    assert report["pass"] is True
+    assert report["post_decision_fields_supplied_to_models"] is False
+    assert report["historical_action_used_as_gold"] is False

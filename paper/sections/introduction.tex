@@ -28,6 +28,14 @@ feedback source has useful information or an external check
 segregated monitoring evidence and a fixed policy; it does not simply ask the
 underwriter to ``think again.''
 
+Cost-aware cascades and routers show that model selection can improve a
+quality--cost frontier \citep{chen2023frugalgpt,ong2024routellm}. That is a
+different intervention from orchestration. We therefore hold the model fixed in
+the primary architecture study and evaluate weak-to-strong escalation in a
+separate ablation. We also report accuracy jointly with realized tokens and
+coverage, following the Pareto-oriented evaluation advocated by recent
+agent-leaderboard work \citep{ma2026hal}.
+
 HMDA is useful here because it contains real mortgage application, property, and
 monitoring fields. The public files are privacy modified and remain the most
 comprehensive public source on mortgage market activity
@@ -40,10 +48,10 @@ only as a secondary description.
 
 The contribution is an experiment, not a proposed lending policy. It makes four
 choices explicit. First, every architecture pays for prompt and completion
-tokens across all internal calls. Second, a one-call Claude Sonnet control tests
-whether an apparent orchestration gain is really a model-strength gain. Third,
-counterfactual twins test a narrow invariance property without claiming to
-measure market discrimination or legal compliance. Fourth, the full grid,
+tokens across all internal calls. Second, the primary comparison holds the model
+fixed while a separate routing ablation tests selective Claude escalation.
+Third, counterfactual twins test a narrow invariance property without claiming
+to measure market discrimination or legal compliance. Fourth, the full grid,
 including malformed outputs and budget exhaustion, is retained. These choices
 make a negative result useful: if a committee spends more and performs no better,
 the experiment will show it.
@@ -59,7 +67,7 @@ the experiment will show it.
 \node[box] (hmda) {Official 2024 HMDA\\predecision fields};
 \node[box, right=of hmda] (oracle) {Transparent policy\\and leakage filters};
 \node[box, right=of oracle] (twins) {Observed and\\counterfactual twins};
-\node[box, right=of twins] (grid) {6 systems $\times$\\3 token budgets};
+\node[box, right=of twins] (grid) {5 systems $\times$\\4 token budgets};
 \node[box, right=of grid] (analysis) {Paired accuracy,\\invariance, cost};
 \draw[arrow] (hmda) -- (oracle);
 \draw[arrow] (oracle) -- (twins);

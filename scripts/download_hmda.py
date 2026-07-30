@@ -59,9 +59,7 @@ def main() -> None:
     if args.destination.exists():
         observed = sha256_file(args.destination)
         if observed != EXPECTED_SHA256:
-            raise RuntimeError(
-                f"{args.destination} exists with unexpected checksum {observed}"
-            )
+            raise RuntimeError(f"{args.destination} exists with unexpected checksum {observed}")
         print(f"Verified existing {args.destination} ({observed})")
         return
     download(args.destination)

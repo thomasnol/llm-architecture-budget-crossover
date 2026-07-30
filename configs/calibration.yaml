@@ -1,4 +1,5 @@
-experiment_name: pilot
+experiment_name: calibration
+study_kind: architecture
 seed: 20260729
 hmda_year: 2024
 hmda_states:
@@ -11,12 +12,9 @@ hmda_source_sha256: ed1f933f5b3487310c8364aebba8cb8b82d3f9870ff744648899e62bacea
 base_application_count: 24
 exclude_pilot_applications: false
 pilot_base_application_count: 24
-pilot_experiment_name: pilot
+pilot_experiment_name: calibration
 token_budgets:
-  - 4096
-  - 6144
-  - 8192
-  - 12288
+  - 16384
 systems:
   - monolith
   - retrieval

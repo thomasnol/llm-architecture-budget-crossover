@@ -9,7 +9,16 @@ smoke run.
 - Copy `.env.example` to `.env` and populate both OAuth client ID/secret pairs.
 - Run `gateway-check`; both credential slots must report `status: ok`.
 - Run the pilot, analyze it, and pass the pilot validation gate.
-- Run all 3,456 main cells, then run `analyze-v3` and `validate-v3`.
+- Complete gateway preflight and the high-budget calibration run.
+- Accept or revise the four primary budgets on a new branch.
+- Run and validate every pilot cell before opening the main-study gate.
+- Run all 15,360 main architecture cells, then run `validate` and `analyze`.
+- Run the separate weak-to-strong routing ablation.
+- Inspect case-level errors, paired comparisons, crossover intervals, and
+  protected-attribute flip-rate slices.
+- Rewrite the abstract, results, and discussion from validated generated
+  artifacts only.
+- Complete citation, reproducibility, limitation, and consistency review.
 - Preserve `generations.jsonl`, `errors.jsonl`, the run manifest, validation,
   analysis tables, and figures.
 

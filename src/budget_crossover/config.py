@@ -3,86 +3,148 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
-ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]+))?\}")
+ENV_DEFAULT_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}")
+
+ARCHITECTURE_SYSTEMS = {
+    "monolith",
+    "retrieval",
+    "committee",
+    "guardrail",
+    "adaptive",
+}
+ROUTING_SYSTEMS = {
+    "always_primary",
+    "always_supervisor",
+    "selective_supervisor",
+}
+
+
+def _expand_string(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        configured = os.getenv(match.group(1))
+        return configured if configured else match.group(2)
+
+    return os.path.expandvars(ENV_DEFAULT_PATTERN.sub(replace, value))
+
+
+def _expand(value: Any) -> Any:
+    if isinstance(value, str):
+        return _expand_string(value)
+    if isinstance(value, list):
+        return [_expand(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand(item) for key, item in value.items()}
+    return value
 
 
 class ExperimentConfig(BaseModel):
     experiment_name: str
-    seed: int = 20260728
-    sample_size: int = Field(ge=1, le=80)
-    task_quotas: dict[str, int] | None = None
-    budgets: list[int]
-    architectures: list[str]
-    generator_model: str
-    temperature: float = Field(ge=0.0, le=2.0)
-    max_context_chars: int = Field(default=72000, ge=8000)
-    request_timeout_seconds: float = Field(default=180, gt=0)
-    global_case_concurrency: int = Field(default=8, ge=1, le=16)
-    generation_runtime_hours: float = Field(default=4.75, gt=0, le=8.0)
-    judging_runtime_hours: float = Field(default=3.0, gt=0, le=8.0)
-    judge_models: list[str]
-    adjudicator_model: str
-    bootstrap_replicates: int = Field(default=5000, ge=100)
+    study_kind: Literal["architecture", "routing"] = "architecture"
+    execution_mode: Literal["gateway", "offline_smoke"] = "gateway"
+    seed: int = 20260729
+    hmda_year: int = 2024
+    hmda_states: list[str] = Field(default_factory=lambda: ["DC", "ND", "VT", "WY"])
+    hmda_raw_filename: str = "hmda_2024_dc_nd_vt_wy.csv"
+    hmda_source_sha256: str
+    base_application_count: int = 96
+    exclude_pilot_applications: bool = True
+    pilot_base_application_count: int = 24
+    pilot_experiment_name: str = "pilot"
+    token_budgets: list[int] = Field(default_factory=lambda: [4096, 6144, 8192, 12288])
+    systems: list[str] = Field(
+        default_factory=lambda: [
+            "monolith",
+            "retrieval",
+            "committee",
+            "guardrail",
+            "adaptive",
+        ]
+    )
+    generator_model: str = "gpt-5.4-mini"
+    supervisor_model: str = "claude-sonnet-4-6"
+    stage_max_output_tokens: int = 256
+    minimum_call_output_tokens: int = 64
+    prompt_chars_per_token: float = 2.5
+    prompt_token_overhead: int = 64
+    direct_temperature: float = 0.0
+    specialist_temperature: float = 0.2
+    adaptive_confidence_threshold: float = 0.90
+    request_timeout_seconds: int = 180
+    runtime_hours: float = 6.0
+    bootstrap_replicates: int = 5000
+    minimum_high_budget_schema_validity: float = 0.95
+    maximum_budget_overrun_rate: float = 0.01
+    sesoi_accuracy_difference: float = 0.05
+    model_prices_per_million: dict[str, dict[str, float]] = Field(default_factory=dict)
+    repetitions: int = 1
+    require_preflight: bool = True
+    permanent_error_threshold: int = 3
 
-    @field_validator("judging_runtime_hours")
-    @classmethod
-    def validate_total_runtime(cls, value: float, info) -> float:
-        generation = info.data.get("generation_runtime_hours", 0.0)
-        if generation + value > 8.0:
-            raise ValueError("generation_runtime_hours + judging_runtime_hours must be <= 8")
-        return value
-
-    @field_validator("task_quotas")
-    @classmethod
-    def validate_task_quotas(cls, value: dict[str, int] | None) -> dict[str, int] | None:
-        if value is not None and any(count < 1 for count in value.values()):
-            raise ValueError("task quota values must be positive")
-        return value
-
-    @field_validator("budgets")
-    @classmethod
-    def validate_budgets(cls, value: list[int]) -> list[int]:
-        if sorted(set(value)) != value:
-            raise ValueError("budgets must be sorted and unique")
-        if value[0] < 256 or value[-1] > 12000:
-            raise ValueError("budgets must remain in [256, 12000]")
-        return value
-
-    @field_validator("architectures")
-    @classmethod
-    def validate_architectures(cls, value: list[str]) -> list[str]:
-        supported = {"direct", "self_critique", "debate"}
-        unknown = set(value) - supported
+    @model_validator(mode="after")
+    def validate_design(self) -> ExperimentConfig:
+        supported = ARCHITECTURE_SYSTEMS if self.study_kind == "architecture" else ROUTING_SYSTEMS
+        unknown = set(self.systems) - supported
         if unknown:
-            raise ValueError(f"unsupported architectures: {sorted(unknown)}")
-        return value
+            raise ValueError(f"unsupported systems: {sorted(unknown)}")
+        if self.study_kind == "architecture" and (
+            "monolith" not in self.systems or "adaptive" not in self.systems
+        ):
+            raise ValueError("architecture study requires monolith and adaptive")
+        if self.study_kind == "routing" and set(self.systems) != ROUTING_SYSTEMS:
+            raise ValueError(
+                "routing study requires always_primary, always_supervisor, and selective_supervisor"
+            )
+        if len(self.systems) != len(set(self.systems)):
+            raise ValueError("systems must not contain duplicates")
+        if not self.hmda_states or any(
+            not re.fullmatch(r"[A-Z]{2}", value) for value in self.hmda_states
+        ):
+            raise ValueError("hmda_states must contain two-letter uppercase codes")
+        if len(self.hmda_states) != len(set(self.hmda_states)):
+            raise ValueError("hmda_states must not contain duplicates")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.hmda_source_sha256):
+            raise ValueError("hmda_source_sha256 must be a lowercase SHA-256 digest")
+        if not self.token_budgets or self.token_budgets != sorted(set(self.token_budgets)):
+            raise ValueError("token_budgets must be unique and strictly increasing")
+        if self.token_budgets[0] < 512:
+            raise ValueError("the smallest token budget must be at least 512")
+        if self.base_application_count < 1 or self.pilot_base_application_count < 1:
+            raise ValueError("application counts must be positive")
+        if self.exclude_pilot_applications and self.experiment_name == self.pilot_experiment_name:
+            raise ValueError("the pilot cannot exclude itself")
+        if not self.generator_model.strip() or not self.supervisor_model.strip():
+            raise ValueError("generator and supervisor model IDs must be non-empty")
+        if not 0 < self.minimum_call_output_tokens <= self.stage_max_output_tokens:
+            raise ValueError("call output limits are inconsistent")
+        if self.prompt_chars_per_token <= 0 or self.prompt_token_overhead < 0:
+            raise ValueError("prompt estimation parameters must be positive")
+        if self.runtime_hours <= 0 or self.runtime_hours > 8:
+            raise ValueError("runtime_hours must be in (0, 8]")
+        if self.permanent_error_threshold < 1:
+            raise ValueError("permanent_error_threshold must be positive")
+        if self.repetitions < 1:
+            raise ValueError("repetitions must be positive")
+        for value, name in [
+            (self.adaptive_confidence_threshold, "adaptive_confidence_threshold"),
+            (
+                self.minimum_high_budget_schema_validity,
+                "minimum_high_budget_schema_validity",
+            ),
+            (self.maximum_budget_overrun_rate, "maximum_budget_overrun_rate"),
+            (self.sesoi_accuracy_difference, "sesoi_accuracy_difference"),
+        ]:
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+        return self
 
 
-def _expand_env(value: Any) -> Any:
-    if isinstance(value, str):
-
-        def replace(match: re.Match[str]) -> str:
-            name = match.group(1)
-            expanded = os.getenv(name) or match.group(2)
-            if not expanded:
-                raise ValueError(f"required environment variable {name} is not set")
-            return expanded
-
-        return ENV_PATTERN.sub(replace, value)
-    if isinstance(value, list):
-        return [_expand_env(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _expand_env(item) for key, item in value.items()}
-    return value
-
-
-def load_config(path: Path) -> ExperimentConfig:
-    load_dotenv()
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return ExperimentConfig.model_validate(_expand_env(raw))
+def load_experiment_config(path: Path) -> ExperimentConfig:
+    load_dotenv(path.resolve().parent.parent / ".env", override=False)
+    payload = yaml.safe_load(path.read_text())
+    return ExperimentConfig.model_validate(_expand(payload))

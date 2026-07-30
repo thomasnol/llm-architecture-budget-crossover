@@ -6,7 +6,7 @@
 - Voice: direct, empirical, and plain, following the supplied
   `final_project.tex`; define mechanics before interpreting them.
 - Status: protocol until a complete external gateway run passes
-  `validate-v3`. Never treat the offline scripted smoke run as evidence.
+  `validate`. Never treat the offline scripted smoke run as evidence.
 - Typography: 10 pt article body, 0.72-inch margins, restrained navy/teal
   palette, compact tables, vector TikZ diagrams, and vector analysis charts.
 - Required structure: standalone abstract; explicit research question; related

@@ -19,6 +19,38 @@ RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 CONGESTION_STATUS_CODES = {408, 425, 429, 502, 503, 504}
 
 
+class GatewayRequestError(RuntimeError):
+    """Sanitized, attributable failure at the gateway request boundary."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int | None,
+        detail: str,
+        model: str,
+        stage: str,
+        credential_slot: int,
+        request_id: str | None,
+        retryable: bool,
+    ) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.model = model
+        self.stage = stage
+        self.credential_slot = credential_slot
+        self.request_id = request_id
+        self.retryable = retryable
+        status = str(status_code) if status_code is not None else "transport"
+        super().__init__(
+            f"gateway {status} at stage={stage!r} model={model!r} "
+            f"credential_slot={credential_slot}: {detail}"
+        )
+
+    @property
+    def signature(self) -> str:
+        return f"{self.status_code}:{self.model}:{self.stage}:{self.credential_slot}:{self.detail}"
+
+
 def _truthy(value: str | None) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
 
@@ -121,7 +153,7 @@ class CubicConcurrencyLimiter:
         self._virtual_time = 0.0
         self._k = max(
             0.0,
-            ((self._w_max - self._window) / self.cubic_c) ** (1 / 3),
+            (max(0.0, self._w_max - self._window) / self.cubic_c) ** (1 / 3),
         )
 
     def _on_success(self) -> None:
@@ -129,9 +161,7 @@ class CubicConcurrencyLimiter:
             self._window = float(self.max_concurrency)
             return
         self._virtual_time += 1.0 / max(1.0, self._window)
-        cubic_target = (
-            self.cubic_c * (self._virtual_time - self._k) ** 3 + self._w_max
-        )
+        cubic_target = self.cubic_c * (self._virtual_time - self._k) ** 3 + self._w_max
         alpha = 3 * (1 - self.beta) / (1 + self.beta)
         reno_target = self._epoch_window + alpha * self._virtual_time
         target = min(float(self.max_concurrency), max(cubic_target, reno_target))
@@ -179,10 +209,7 @@ class GatewayClient:
         per_key = int(os.getenv("LLM_GATEWAY_CONCURRENCY_PER_KEY", "4"))
         self.slots: list[CredentialSlot] = []
         default_models = {
-            1: (
-                "gpt-5.4,gpt-5.4-mini,gpt-5.4-nano,"
-                "claude-opus-4-6,claude-sonnet-4-6"
-            ),
+            1: ("gpt-5.4,gpt-5.4-mini,gpt-5.4-nano,claude-opus-4-6,claude-sonnet-4-6"),
             2: "gpt-5.4,gpt-5.4-mini,gpt-5.4-nano",
         }
         for index in (1, 2):
@@ -190,9 +217,7 @@ class GatewayClient:
             client_id = os.getenv(f"LLM_GATEWAY_CLIENT_ID_{index}") or None
             client_secret = os.getenv(f"LLM_GATEWAY_CLIENT_SECRET_{index}") or None
             if api_key or (client_id and client_secret):
-                raw_patterns = os.getenv(
-                    f"LLM_GATEWAY_MODELS_{index}", default_models[index]
-                )
+                raw_patterns = os.getenv(f"LLM_GATEWAY_MODELS_{index}", default_models[index])
                 patterns = tuple(part.strip() for part in raw_patterns.split(",") if part.strip())
                 self.slots.append(
                     CredentialSlot(
@@ -219,10 +244,18 @@ class GatewayClient:
     async def close(self) -> None:
         await self.client.aclose()
 
-    async def _slot(self, model: str) -> CredentialSlot:
+    async def _slot(
+        self,
+        model: str,
+        *,
+        required_index: int | None = None,
+    ) -> CredentialSlot:
         eligible = [slot for slot in self.slots if slot.supports(model)]
+        if required_index is not None:
+            eligible = [slot for slot in eligible if slot.index == required_index]
         if not eligible:
-            raise RuntimeError(f"no configured credential supports model {model!r}")
+            suffix = f" on credential slot {required_index}" if required_index is not None else ""
+            raise RuntimeError(f"no configured credential supports model {model!r}{suffix}")
         async with self._rr_lock:
             start = self._rr % len(eligible)
             self._rr += 1
@@ -307,11 +340,7 @@ class GatewayClient:
                 payload = await self._list_models_for_slot(slot)
                 data = payload.get("data", []) if isinstance(payload, dict) else []
                 reported = sorted(
-                    {
-                        str(item["id"])
-                        for item in data
-                        if isinstance(item, dict) and item.get("id")
-                    }
+                    {str(item["id"]) for item in data if isinstance(item, dict) and item.get("id")}
                 )
                 return {
                     "credential_slot": slot.index,
@@ -348,12 +377,14 @@ class GatewayClient:
         user: str,
         max_tokens: int,
         temperature: float = 0.0,
+        stage: str = "completion",
+        credential_slot: int | None = None,
     ) -> GatewayResponse:
         if not self.configured:
             raise RuntimeError("gateway endpoint/credentials are not configured")
         last_error: Exception | None = None
         for attempt in range(5):
-            slot = await self._slot(model)
+            slot = await self._slot(model, required_index=credential_slot)
             await slot.limiter.acquire()
             try:
                 started = time.perf_counter()
@@ -402,12 +433,26 @@ class GatewayClient:
                 await slot.limiter.release(
                     congestion=error.response.status_code in CONGESTION_STATUS_CODES
                 )
-                last_error = error
-                if error.response.status_code not in RETRYABLE_STATUS_CODES:
-                    raise
+                structured = self._structured_request_error(
+                    error.response,
+                    model=model,
+                    stage=stage,
+                    slot=slot,
+                )
+                last_error = structured
+                if not structured.retryable:
+                    raise structured from error
             except httpx.HTTPError as error:
                 await slot.limiter.release(congestion=True)
-                last_error = error
+                last_error = GatewayRequestError(
+                    status_code=None,
+                    detail=str(error)[:2000],
+                    model=model,
+                    stage=stage,
+                    credential_slot=slot.index,
+                    request_id=None,
+                    retryable=True,
+                )
             except (KeyError, ValueError) as error:
                 await slot.limiter.release()
                 last_error = error
@@ -421,4 +466,35 @@ class GatewayClient:
             if attempt == 4:
                 break
             await asyncio.sleep(min(20.0, 0.75 * (2**attempt)))
+        if isinstance(last_error, GatewayRequestError):
+            raise last_error
         raise RuntimeError(f"gateway call failed after retries: {last_error}") from last_error
+
+    def _structured_request_error(
+        self,
+        response: httpx.Response,
+        *,
+        model: str,
+        stage: str,
+        slot: CredentialSlot,
+    ) -> GatewayRequestError:
+        detail = response.text.strip() or response.reason_phrase
+        secrets = [
+            slot.api_key,
+            slot.client_secret,
+            slot.access_token,
+        ]
+        for secret in secrets:
+            if secret:
+                detail = detail.replace(secret, "[REDACTED]")
+        detail = detail[:2000]
+        status_code = response.status_code
+        return GatewayRequestError(
+            status_code=status_code,
+            detail=detail,
+            model=model,
+            stage=stage,
+            credential_slot=slot.index,
+            request_id=response.headers.get("x-request-id"),
+            retryable=status_code in RETRYABLE_STATUS_CODES,
+        )

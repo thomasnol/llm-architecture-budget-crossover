@@ -11,9 +11,9 @@ with one to four units. The resulting 15,181 eligible records are sufficient for
 balanced sampling while keeping the source small enough to audit. The source
 file, schema, endpoint, and SHA-256 digest are frozen in configuration.
 
-The pilot samples 24 applications. The main study samples 96 disjoint
-applications, balanced to 24 per research-policy outcome and 24 per state. Each
-application produces two cases, giving 48 pilot and 192 main cases. We withhold
+The pilot samples 24 applications. The main study samples 192 disjoint
+applications, balanced to 48 per research-policy outcome and 48 per state. Each
+application produces two cases, giving 48 pilot and 384 main cases. We withhold
 historical action, denial reasons, rate spread, pricing, fees, and other
 post-decision fields from every prompt. HMDA does not publish the applicant's
 credit-score value, so we do not invent or impute one.
@@ -65,17 +65,16 @@ policy explicitly excluded?
 \begin{table}[H]
 \centering
 \small
-\caption{Frozen systems. Worker stages use GPT-5.4-mini; oversight stages and
-the strong control use Claude Sonnet 4.6.}
+\caption{Primary systems. Every role uses GPT-5.4-mini so architecture is the
+manipulated factor.}
 \label{tab:systems}
 \begin{tabularx}{\linewidth}{@{}l c c Y@{}}
 \toprule
 System & Calls & Monitoring access & Mechanism \\
 \midrule
 Monolith & 1 & Full & One worker sees all evidence. \\
-Strong monolith & 1 & Full & One supervisor-model call controls for model strength. \\
 Plan-and-retrieve & 2 & Selected & A planner requests at most three evidence documents. \\
-Committee & 4 & Segregated & Three parallel specialists report to a supervisor chair. \\
+Committee & 4 & Segregated & Three parallel specialists report to a chair. \\
 Guardrail & 3 & Audit only & A blind financial draft is audited, then revised. \\
 Adaptive & 1 or 3 & Audit only & Only uncertain, non-approve, invalid, or missing-data drafts escalate. \\
 \bottomrule
@@ -87,4 +86,7 @@ acting systems \citep{yao2023react}. The committee resolves reports by policy
 precedence, not majority vote. The guardrail separates financial underwriting
 from demographic monitoring. Adaptive routing accepts only a valid approve
 decision with confidence at least 0.90 and no missing-data marker; all other
-drafts receive the same audit and revision as the fixed guardrail.
+drafts receive the same audit and revision as the fixed guardrail. A secondary
+routing ablation separately compares always-primary, always-supervisor, and
+selective-supervisor policies; its model effects are not attributed to
+architecture.

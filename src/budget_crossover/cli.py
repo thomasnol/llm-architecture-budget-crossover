@@ -9,57 +9,29 @@ from typing import Annotated
 import typer
 
 from .analysis import analyze_run
-from .config import load_config
-from .dataset import build_cases, sample_cases
+from .calibration import calibrate_run
+from .config import ExperimentConfig, load_experiment_config
+from .dataset import build_case_set, case_set_profile
 from .gateway import GatewayClient
-from .io import read_jsonl, write_jsonl
-from .judging import execute_judging_run
-from .models import Case
-from .runner import execute_generation_run
-from .v2_analysis import analyze_v2
-from .v2_config import V2Config, load_v2_config
-from .v2_dataset import (
-    build_v2_case_set,
-)
-from .v2_judging import execute_v2_judging
-from .v2_models import V2Case
-from .v2_runner import execute_v2_generation
-from .v2_validation import assert_pilot_gate, validate_v2_run
-from .v3_analysis import analyze_v3
-from .v3_config import V3Config, load_v3_config
-from .v3_dataset import build_v3_case_set, case_set_profile
-from .v3_models import V3Case
-from .v3_runner import execute_v3_generation
-from .v3_validation import (
-    assert_v3_pilot_gate,
-    validate_v3_cases,
-    validate_v3_run,
-)
+from .io import write_jsonl
+from .preflight import run_preflight
+from .records import Case
+from .runner import execute_generation
+from .status import summarize_run
+from .validation import assert_pilot_gate, validate_cases, validate_run
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 REPO = Path(__file__).resolve().parents[2]
 
 
-def _cases_for_config(config_path: Path) -> tuple:
-    config = load_config(config_path)
-    all_cases_path = REPO / "data" / "processed" / "cases.jsonl"
-    if all_cases_path.exists():
-        all_cases = read_jsonl(all_cases_path, Case)
-    else:
-        all_cases = build_cases(
-            REPO / "data" / "raw" / "train.parquet",
-            max_context_chars=config.max_context_chars,
-        )
-        write_jsonl(all_cases_path, all_cases)
-    selected = sample_cases(
-        all_cases,
-        sample_size=config.sample_size,
-        seed=config.seed,
-        task_quotas=config.task_quotas,
-    )
-    sample_path = REPO / "data" / "processed" / f"sample_{config.experiment_name}.jsonl"
-    write_jsonl(sample_path, selected)
-    return config, selected
+def _cases_for_config(
+    config_path: Path,
+) -> tuple[ExperimentConfig, list[Case]]:
+    config = load_experiment_config(config_path)
+    cases = build_case_set(REPO, config)
+    selected_path = REPO / "data" / "processed" / f"cases_{config.experiment_name}.jsonl"
+    write_jsonl(selected_path, cases)
+    return config, cases
 
 
 @app.command()
@@ -68,27 +40,26 @@ def prepare(
         REPO / "configs" / "main.yaml"
     ),
 ) -> None:
-    """Build leakage-controlled cases and the deterministic study sample."""
-    loaded, selected = _cases_for_config(config)
-    typer.echo(
-        json.dumps(
-            {
-                "experiment": loaded.experiment_name,
-                "sample_size": len(selected),
-                "tasks": {
-                    task: sum(case.task == task for case in selected)
-                    for task in sorted({case.task for case in selected})
-                },
-                "max_evidence_chars": max(case.evidence_chars for case in selected),
-            },
-            indent=2,
-        )
-    )
+    """Build and validate frozen HMDA policy-sandbox cases."""
+    loaded, cases = _cases_for_config(config)
+    validation = validate_cases(repo=REPO, config=loaded, cases=cases)
+    result = {
+        "experiment": loaded.experiment_name,
+        **case_set_profile(cases),
+        "source_sha256": loaded.hmda_source_sha256,
+        "historical_action_used_as_gold": False,
+        "post_decision_fields_supplied_to_models": False,
+        "validation_pass": validation["pass"],
+        "validation_issues": validation["issues"],
+    }
+    typer.echo(json.dumps(result, indent=2))
+    if not validation["pass"]:
+        raise typer.Exit(code=1)
 
 
-def _run(config_path: Path) -> None:
+def _execute(config_path: Path) -> None:
     loaded, cases = _cases_for_config(config_path)
-    result = asyncio.run(execute_generation_run(repo=REPO, config=loaded, cases=cases))
+    result = asyncio.run(execute_generation(repo=REPO, config=loaded, cases=cases))
     typer.echo(json.dumps(result, indent=2))
 
 
@@ -98,180 +69,31 @@ def pilot(
         REPO / "configs" / "pilot.yaml"
     ),
 ) -> None:
-    """Run the resumable pilot generation sweep."""
-    _run(config)
+    """Run the resumable architecture-by-budget pilot."""
+    _execute(config)
 
 
 @app.command(name="run")
-def main_run(
+def run_main(
     config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
         REPO / "configs" / "main.yaml"
-    ),
-) -> None:
-    """Run the resumable main generation sweep."""
-    _run(config)
-
-
-@app.command()
-def judge(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
-) -> None:
-    """Run two blinded judges and adjudicate their disagreements."""
-    loaded, cases = _cases_for_config(config)
-    result = asyncio.run(execute_judging_run(repo=REPO, config=loaded, cases=cases))
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command()
-def analyze(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
-) -> None:
-    """Compute exact scores, paired uncertainty, crossover estimates, and figures."""
-    loaded, cases = _cases_for_config(config)
-    result = analyze_run(repo=REPO, config=loaded, cases=cases)
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("gateway-check")
-def gateway_check() -> None:
-    """Authenticate both credential pairs and list their deployment identifiers."""
-
-    async def check() -> dict:
-        client = GatewayClient()
-        try:
-            report = await client.credential_report()
-            issues: list[str] = []
-            slots = {slot.index: slot for slot in client.slots}
-            if set(slots) != {1, 2}:
-                issues.append("both credential slots 1 and 2 must be configured")
-            requirements = {
-                1: {
-                    "gpt-5.4",
-                    "gpt-5.4-mini",
-                    "gpt-5.4-nano",
-                    "claude-opus-4-6",
-                    "claude-sonnet-4-6",
-                },
-                2: {"gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"},
-            }
-            for index, models in requirements.items():
-                slot = slots.get(index)
-                if slot is None:
-                    continue
-                unsupported = sorted(
-                    model for model in models if not slot.supports(model)
-                )
-                if unsupported:
-                    issues.append(
-                        f"credential slot {index} does not allow: {unsupported}"
-                    )
-            if any(slot["status"] != "ok" for slot in report["slots"]):
-                issues.append("one or more configured credential slots failed authentication")
-            report["pass"] = not issues
-            report["issues"] = issues
-            return report
-        finally:
-            await client.close()
-
-    report = asyncio.run(check())
-    typer.echo(json.dumps(report, indent=2))
-    if not report["pass"]:
-        raise typer.Exit(code=1)
-
-
-def _v2_cases_for_config(config_path: Path) -> tuple[V2Config, list[V2Case]]:
-    config = load_v2_config(config_path)
-    cases = build_v2_case_set(REPO, config)
-    selected_path = (
-        REPO
-        / "data"
-        / "processed"
-        / f"cases_{config.experiment_name}.jsonl"
-    )
-    write_jsonl(selected_path, cases)
-    return config, cases
-
-
-@app.command("prepare-v2")
-def prepare_v2(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_main.yaml"
-    ),
-) -> None:
-    """Prepare unbiased structured-label cases for the Version 2 study."""
-    loaded, cases = _v2_cases_for_config(config)
-    typer.echo(
-        json.dumps(
-            {
-                "experiment": loaded.experiment_name,
-                "cases": len(cases),
-                "datasets": {
-                    dataset: sum(case.dataset == dataset for case in cases)
-                    for dataset in sorted({case.dataset for case in cases})
-                },
-                "tasks": {
-                    task: sum(case.task == task for case in cases)
-                    for task in sorted({case.task for case in cases})
-                },
-                "schema_parse_failures": 0,
-                "evidence_selection_uses_historical_correctness": False,
-            },
-            indent=2,
-        )
-    )
-
-
-def _run_v2(config_path: Path) -> None:
-    loaded, cases = _v2_cases_for_config(config_path)
-    result = asyncio.run(
-        execute_v2_generation(repo=REPO, config=loaded, cases=cases)
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("pilot-v2")
-def pilot_v2(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_pilot.yaml"
-    ),
-) -> None:
-    """Run the resumable Version 2 manipulation-check pilot."""
-    _run_v2(config)
-
-
-@app.command("run-v2")
-def run_v2(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_main.yaml"
     ),
     force: Annotated[
         bool,
-        typer.Option(
-            help="Override the preregistered pilot gate after documenting the reason."
-        ),
+        typer.Option(help="Override the pilot gate with an audited reason."),
     ] = False,
     force_reason: Annotated[
         str | None,
-        typer.Option(
-            help="Required audit note when --force overrides the pilot gate."
-        ),
+        typer.Option(help="Required audit note when --force is used."),
     ] = None,
 ) -> None:
-    """Run the gated Version 2 main sweep."""
-    loaded = load_v2_config(config)
+    """Run the gated main study."""
+    loaded = load_experiment_config(config)
     if force:
         if not force_reason or not force_reason.strip():
             raise typer.BadParameter("--force requires --force-reason")
         override = (
-            REPO
-            / "experiments"
-            / "runs"
-            / loaded.experiment_name
-            / "pilot_gate_override.json"
+            REPO / "experiments" / "runs" / loaded.experiment_name / "pilot_gate_override.json"
         )
         override.parent.mkdir(parents=True, exist_ok=True)
         override.write_text(
@@ -287,202 +109,51 @@ def run_v2(
         )
     else:
         assert_pilot_gate(REPO, loaded)
-    _run_v2(config)
+    _execute(config)
 
 
-@app.command("judge-v2")
-def judge_v2(
+@app.command()
+def analyze(
     config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_main.yaml"
+        REPO / "configs" / "main.yaml"
     ),
-) -> None:
-    """Run secondary cross-family judges; structured exact scoring stays primary."""
-    loaded, cases = _v2_cases_for_config(config)
-    result = asyncio.run(
-        execute_v2_judging(repo=REPO, config=loaded, cases=cases)
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("analyze-v2")
-def analyze_v2_command(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_main.yaml"
-    ),
-) -> None:
-    """Analyze accuracy, mechanisms, power, judge coverage, and Pareto efficiency."""
-    loaded, cases = _v2_cases_for_config(config)
-    result = analyze_v2(repo=REPO, config=loaded, cases=cases)
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("validate-v2")
-def validate_v2_command(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v2_main.yaml"
-    ),
-    require_judgments: Annotated[
+    diagnostic: Annotated[
         bool,
-        typer.Option(
-            "--require-judgments/--no-require-judgments",
-            help="Require the frozen secondary-judge audit sample to be complete.",
-        ),
-    ] = True,
-    require_pilot_gate: Annotated[
-        bool,
-        typer.Option(
-            "--require-pilot-gate/--no-require-pilot-gate",
-            help="Require a complete pilot with at least one passing dataset.",
-        ),
-    ] = True,
-) -> None:
-    """Validate completeness, usage accounting, call contracts, and pilot gates."""
-    loaded, cases = _v2_cases_for_config(config)
-    report = validate_v2_run(
-        repo=REPO,
-        config=loaded,
-        cases=cases,
-        require_judgments=require_judgments,
-        require_pilot_gate=require_pilot_gate,
-    )
-    typer.echo(json.dumps(report, indent=2))
-    if not report["pass"]:
-        raise typer.Exit(code=1)
-
-
-def _v3_cases_for_config(config_path: Path) -> tuple[V3Config, list[V3Case]]:
-    config = load_v3_config(config_path)
-    cases = build_v3_case_set(REPO, config)
-    selected_path = (
-        REPO / "data" / "processed" / f"cases_{config.experiment_name}.jsonl"
-    )
-    write_jsonl(selected_path, cases)
-    return config, cases
-
-
-@app.command("prepare-v3")
-def prepare_v3(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v3_main.yaml"
-    ),
-) -> None:
-    """Build the frozen HMDA policy-sandbox cases and counterfactual twins."""
-    loaded, cases = _v3_cases_for_config(config)
-    validation = validate_v3_cases(repo=REPO, config=loaded, cases=cases)
-    result = {
-        "experiment": loaded.experiment_name,
-        **case_set_profile(cases),
-        "source_sha256": loaded.hmda_source_sha256,
-        "historical_action_used_as_gold": False,
-        "post_decision_fields_supplied_to_models": False,
-        "validation_pass": validation["pass"],
-        "validation_issues": validation["issues"],
-    }
-    typer.echo(json.dumps(result, indent=2))
-    if not validation["pass"]:
-        raise typer.Exit(code=1)
-
-
-def _run_v3(config_path: Path) -> None:
-    loaded, cases = _v3_cases_for_config(config_path)
-    result = asyncio.run(
-        execute_v3_generation(repo=REPO, config=loaded, cases=cases)
-    )
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("pilot-v3")
-def pilot_v3(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v3_pilot.yaml"
-    ),
-) -> None:
-    """Run the resumable HMDA architecture-by-token-budget pilot."""
-    _run_v3(config)
-
-
-@app.command("run-v3")
-def run_v3(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v3_main.yaml"
-    ),
-    force: Annotated[
-        bool,
-        typer.Option(
-            help="Override the preregistered pilot gate after documenting the reason."
-        ),
+        typer.Option(help="Allow incomplete input and watermark all outputs as diagnostic."),
     ] = False,
-    force_reason: Annotated[
-        str | None,
-        typer.Option(
-            help="Required audit note when --force overrides the pilot gate."
-        ),
-    ] = None,
 ) -> None:
-    """Run the gated HMDA main study."""
-    loaded = load_v3_config(config)
-    if force:
-        if not force_reason or not force_reason.strip():
-            raise typer.BadParameter("--force requires --force-reason")
-        override = (
-            REPO
-            / "experiments"
-            / "runs"
-            / loaded.experiment_name
-            / "pilot_gate_override.json"
+    """Generate validated statistical tables and figures."""
+    loaded, cases = _cases_for_config(config)
+    typer.echo(
+        json.dumps(
+            analyze_run(
+                repo=REPO,
+                config=loaded,
+                cases=cases,
+                diagnostic=diagnostic,
+            ),
+            indent=2,
         )
-        override.parent.mkdir(parents=True, exist_ok=True)
-        override.write_text(
-            json.dumps(
-                {
-                    "experiment": loaded.experiment_name,
-                    "reason": force_reason.strip(),
-                    "recorded_at": datetime.now(UTC).isoformat(),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-    else:
-        assert_v3_pilot_gate(REPO, loaded)
-    _run_v3(config)
+    )
 
 
-@app.command("analyze-v3")
-def analyze_v3_command(
+@app.command()
+def validate(
     config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v3_main.yaml"
-    ),
-) -> None:
-    """Analyze policy accuracy, compliance invariance, budgets, and mechanisms."""
-    loaded, cases = _v3_cases_for_config(config)
-    result = analyze_v3(repo=REPO, config=loaded, cases=cases)
-    typer.echo(json.dumps(result, indent=2))
-
-
-@app.command("validate-v3")
-def validate_v3_command(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "v3_main.yaml"
+        REPO / "configs" / "main.yaml"
     ),
     require_generations: Annotated[
         bool,
-        typer.Option(
-            "--require-generations/--no-require-generations",
-            help="Require every case-system-budget cell to be present.",
-        ),
+        typer.Option("--require-generations/--no-require-generations"),
     ] = True,
     require_pilot_gate: Annotated[
         bool,
-        typer.Option(
-            "--require-pilot-gate/--no-require-pilot-gate",
-            help="Require the preregistered pilot manipulation checks to pass.",
-        ),
+        typer.Option("--require-pilot-gate/--no-require-pilot-gate"),
     ] = True,
 ) -> None:
-    """Validate source, counterfactuals, leakage controls, grid, and token budgets."""
-    loaded, cases = _v3_cases_for_config(config)
-    report = validate_v3_run(
+    """Validate source, cases, grid completeness, and token accounting."""
+    loaded, cases = _cases_for_config(config)
+    report = validate_run(
         repo=REPO,
         config=loaded,
         cases=cases,
@@ -492,3 +163,59 @@ def validate_v3_command(
     typer.echo(json.dumps(report, indent=2))
     if not report["pass"]:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def preflight(
+    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
+        REPO / "configs" / "pilot.yaml"
+    ),
+) -> None:
+    """Verify real completions for every configured model and credential."""
+    loaded = load_experiment_config(config)
+    report = asyncio.run(run_preflight(repo=REPO, config=loaded))
+    typer.echo(json.dumps(report, indent=2))
+    if not report["pass"]:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def calibrate(
+    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
+        REPO / "configs" / "calibration.yaml"
+    ),
+) -> None:
+    """Recommend four feasible budgets from calibration trajectories."""
+    loaded = load_experiment_config(config)
+    typer.echo(json.dumps(calibrate_run(repo=REPO, config=loaded), indent=2))
+
+
+@app.command()
+def status(
+    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
+        REPO / "configs" / "pilot.yaml"
+    ),
+) -> None:
+    """Summarize coverage and operational failures."""
+    loaded, cases = _cases_for_config(config)
+    expected = len(cases) * len(loaded.systems) * len(loaded.token_budgets) * loaded.repetitions
+    typer.echo(
+        json.dumps(
+            summarize_run(repo=REPO, config=loaded, expected_cells=expected),
+            indent=2,
+        )
+    )
+
+
+@app.command("gateway-check", hidden=True)
+def gateway_check() -> None:
+    """Authenticate configured credential pairs and list deployments."""
+
+    async def check() -> dict:
+        client = GatewayClient()
+        try:
+            return await client.credential_report()
+        finally:
+            await client.close()
+
+    typer.echo(json.dumps(asyncio.run(check()), indent=2))

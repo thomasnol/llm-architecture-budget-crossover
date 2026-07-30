@@ -30,10 +30,10 @@ NumPy/SciPy, seaborn/matplotlib, pytest, Ruff, LaTeX.
 ### Task 1: Canonical module and command surface
 
 **Files:**
-- Rename: `src/budget_crossover/v3_*.py` to focused unversioned modules
+- Rename the prior version-prefixed source modules to focused unversioned modules
 - Modify: `src/budget_crossover/cli.py`
-- Rename: `configs/v3_pilot.yaml`, `configs/v3_main.yaml`
-- Rename: `scripts/smoke_v3_pipeline.py`
+- Rename the prior version-prefixed pilot and main configurations
+- Rename the prior version-prefixed smoke-pipeline script
 - Delete: superseded source, configuration, test, and experiment files
 - Test: canonicalized files under `tests/`
 
