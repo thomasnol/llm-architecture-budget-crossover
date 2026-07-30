@@ -19,6 +19,6 @@ generation_runtime_hours: 4.75
 judging_runtime_hours: 3.0
 judge_models:
   - ${GATEWAY_MODEL_JUDGE_A:-gpt-5.4}
-  - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4.6}
+  - ${GATEWAY_MODEL_JUDGE_B:-claude-sonnet-4-6}
 adjudicator_model: ${GATEWAY_MODEL_ADJUDICATOR:-claude-opus-4-6}
 bootstrap_replicates: 5000

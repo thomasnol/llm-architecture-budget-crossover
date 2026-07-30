@@ -1,0 +1,43 @@
+experiment_name: v3_main
+seed: 20260729
+hmda_year: 2024
+hmda_states:
+  - DC
+  - ND
+  - VT
+  - WY
+hmda_raw_filename: hmda_2024_dc_nd_vt_wy.csv
+hmda_source_sha256: ed1f933f5b3487310c8364aebba8cb8b82d3f9870ff744648899e62baceaf4f5
+base_application_count: 96
+exclude_pilot_applications: true
+pilot_base_application_count: 24
+pilot_experiment_name: v3_pilot
+token_budgets:
+  - 2048
+  - 4096
+  - 8192
+systems:
+  - monolith
+  - strong_monolith
+  - retrieval
+  - committee
+  - guardrail
+  - adaptive
+generator_model: ${GATEWAY_MODEL_GENERATOR:-gpt-5.4-mini}
+supervisor_model: ${GATEWAY_MODEL_SUPERVISOR:-claude-sonnet-4-6}
+stage_max_output_tokens: 256
+minimum_call_output_tokens: 64
+prompt_chars_per_token: 2.5
+prompt_token_overhead: 64
+direct_temperature: 0.0
+specialist_temperature: 0.2
+adaptive_confidence_threshold: 0.90
+request_timeout_seconds: 180
+runtime_hours: 6.0
+bootstrap_replicates: 5000
+minimum_high_budget_schema_validity: 0.95
+maximum_budget_overrun_rate: 0.01
+sesoi_accuracy_difference: 0.05
+# Populate only with approved internal prices. Token and latency metrics remain
+# primary when no price schedule is supplied.
+model_prices_per_million: {}

@@ -1,0 +1,90 @@
+\section{Data and Method}
+
+\subsection{Frozen HMDA Cohort}
+
+We use the official CFPB/FFIEC Data Browser rather than a Kaggle mirror. The
+frozen source contains 2024 applications from the District of Columbia, North
+Dakota, Vermont, and Wyoming with historical action 1 (originated) or 3
+(denied). We restrict the cohort to conventional, first-lien, closed-end,
+consumer home-purchase applications for owner-occupied, site-built properties
+with one to four units. The resulting 15,181 eligible records are sufficient for
+balanced sampling while keeping the source small enough to audit. The source
+file, schema, endpoint, and SHA-256 digest are frozen in configuration.
+
+The pilot samples 24 applications. The main study samples 96 disjoint
+applications, balanced to 24 per research-policy outcome and 24 per state. Each
+application produces two cases, giving 48 pilot and 192 main cases. We withhold
+historical action, denial reasons, rate spread, pricing, fees, and other
+post-decision fields from every prompt. HMDA does not publish the applicant's
+credit-score value, so we do not invent or impute one.
+
+\subsection{Transparent Policy Oracle}
+
+Let $x$ contain annual income, property value, loan-to-value ratio (LTV),
+debt-to-income ratio (DTI), term, and conforming status. The research decision is
+the first satisfied branch:
+\begin{equation}
+y(x)=
+\begin{cases}
+\text{manual review}, & \text{if a required financial field is missing},\\
+\text{deny}, & \text{if DTI}\geq 50\%,\ \text{LTV}>100\%,\ \text{or term}>360,\\
+\text{conditional review}, & \text{if DTI}\in[43,49]\%,\\
+ & \quad \text{LTV}\in(90,100]\%,\ \text{or nonconforming},\\
+\text{approve}, & \text{otherwise}.
+\end{cases}
+\label{eq:policy}
+\end{equation}
+The oracle emits the decision and every applicable reason at the controlling
+level. Unit tests cover boundaries and rule precedence. This policy is
+deliberately small. It creates interpretable ground truth for workflow
+evaluation; it is not a production credit model or lending recommendation.
+
+Race, ethnicity, sex, age band, tract minority share, and tract income measures
+live in a separate compliance-monitoring document. The sandbox prevents these
+fields from affecting the decision, consistent with the experiment's narrow
+control objective and with Regulation B restrictions on using protected
+characteristics in credit evaluation \citep{cfpb2026regb}. Legal obligations
+are broader and fact dependent, so the experiment does not certify compliance.
+
+\subsection{Counterfactual Pairs}
+
+For each application, we change exactly one reported race, sex, or ethnicity
+field and leave every financial document byte-identical. The policy label also
+remains fixed. This is a metamorphic test: when an input that the sandbox
+prohibits changes, the decision should not change. Similar behavioral testing
+checks model capabilities through controlled input perturbations rather than
+internal explanations \citep{ribeiro2020checklist}.
+
+The pair does not estimate counterfactual fairness in the causal sense. It also
+does not measure approval-rate disparity in the HMDA population. It answers a
+smaller engineering question: did this workflow use a field that its supplied
+policy explicitly excluded?
+
+\subsection{Architectures}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Frozen systems. Worker stages use GPT-5.4-mini; oversight stages and
+the strong control use Claude Sonnet 4.6.}
+\label{tab:systems}
+\begin{tabularx}{\linewidth}{@{}l c c Y@{}}
+\toprule
+System & Calls & Monitoring access & Mechanism \\
+\midrule
+Monolith & 1 & Full & One worker sees all evidence. \\
+Strong monolith & 1 & Full & One supervisor-model call controls for model strength. \\
+Plan-and-retrieve & 2 & Selected & A planner requests at most three evidence documents. \\
+Committee & 4 & Segregated & Three parallel specialists report to a supervisor chair. \\
+Guardrail & 3 & Audit only & A blind financial draft is audited, then revised. \\
+Adaptive & 1 or 3 & Audit only & Only uncertain, non-approve, invalid, or missing-data drafts escalate. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The retrieval workflow follows the tool-selection idea behind reasoning-and-
+acting systems \citep{yao2023react}. The committee resolves reports by policy
+precedence, not majority vote. The guardrail separates financial underwriting
+from demographic monitoring. Adaptive routing accepts only a valid approve
+decision with confidence at least 0.90 and no missing-data marker; all other
+drafts receive the same audit and revision as the fixed guardrail.

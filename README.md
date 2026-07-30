@@ -1,117 +1,132 @@
-# When Extra Inference Calls Pay
+# Budgeted agent orchestration for mortgage adjudication
 
-This repository runs a preregistered, resource-accounted comparison of LLM
-decision systems. It asks when verification or candidate coordination improves
-an answer enough to justify the prompt tokens, completion tokens, calls, and
-wall time that the system actually used.
+This repository evaluates whether an LLM decision workflow should remain
+monolithic, retrieve evidence, convene specialists, add an independent compliance
+guardrail, or route adaptively when the entire workflow is constrained by a
+case-level **total-token budget**.
 
-The study does **not** assume that a larger completion-token ceiling is consumed
-compute. It also does not promise a universal architecture crossover. It
-compares eight production systems at observed operating points and reports
-discrete accuracy-resource frontiers.
+Version 3 is a clean redesign around option C: official 2024 Home Mortgage
+Disclosure Act (HMDA) data from CFPB/FFIEC. HMDA records seed realistic mortgage
+applications, but reported lender action is **not** treated as the correct
+underwriting decision. Historical action is observational and institution
+specific. Instead, a transparent research-only policy oracle creates reproducible
+approve, conditional-review, deny, and manual-review labels from predecision
+financial fields.
 
-## What is tested
+Each sampled application produces a protected-attribute counterfactual twin.
+Financial evidence and the policy label remain identical; one monitoring-only
+attribute changes. This permits a controlled compliance-invariance test without
+claiming to estimate discrimination in the mortgage market.
 
-- 12-case insurance + 18-case MMLU-Pro pilot.
-- Disjoint 68-case insurance + 200-case MMLU-Pro main study.
-- Direct GPT-5.4-mini, single-call checklist, direct GPT-5.4,
-  same-model self-critique, external critique, best-of-2, best-of-4, and
-  adaptive verify/escalate.
-- Deterministic task-specific JSON decisions as the primary outcome.
-- Per-call gateway `prompt_tokens`, `completion_tokens`, and `total_tokens`,
-  plus call count, wall time, and summed API latency.
-- Paired bootstrap intervals, exact McNemar tests with Holm correction,
-  a five-point smallest effect of practical interest, mechanism diagnostics,
-  and descriptive Pareto frontiers.
+## Why HMDA, not the other candidates?
 
-The 2026-07-29 preregistration is in
-[`experiments/V2_PREREGISTRATION.md`](experiments/V2_PREREGISTRATION.md).
-The reason the earlier ceiling-based experiment is not used for inference is in
-[`experiments/V1_AUDIT.md`](experiments/V1_AUDIT.md).
+- Home Credit is a rich relational default-risk dataset, but its target is
+  post-credit default—not approval correctness.
+- Lending Club contains funded loans and post-origination performance, creating
+  selective labels for an approval study.
+- HMDA contains real mortgage applications, actual action taken, financial and
+  property fields, and compliance-monitoring demographics. Its weakness is also
+  explicit: actual action is a historical outcome, not normative ground truth.
 
-## Fast setup
+The design decision and limitations are documented in
+[`experiments/V3_PREREGISTRATION.md`](experiments/V3_PREREGISTRATION.md).
+Version 1 and Version 2 remain in the repository as an audit trail, but they are
+not the canonical study.
+
+## Canonical study
+
+- Source: 2024 HMDA Data Browser export served on 2026-07-29, filtered through
+  the official API to DC, ND, VT, and WY and to originated/denied records. The
+  exact bytes are frozen by SHA-256.
+- Scope: conventional, first-lien, closed-end, consumer home-purchase
+  applications for owner-occupied, site-built, one-to-four-unit properties.
+- Pilot: 24 source applications × 2 counterfactual variants = 48 cases.
+- Main: 96 disjoint source applications × 2 variants = 192 cases.
+- Outcomes: policy decision accuracy, full decision-plus-reason accuracy,
+  counterfactual decision consistency, budget compliance, calls, realized total
+  tokens, latency, and optional approved-price cost.
+- Systems: worker monolith, strong-model monolith, plan-and-retrieve, specialist
+  committee, compliance guardrail, and adaptive guarded routing.
+- Nominal case-level total-token budgets: 2,048, 4,096, and 8,192.
+
+The policy sandbox is an evaluation instrument, not lending advice, a credit
+policy, or evidence that a historical lender decision was correct or incorrect.
+
+## Setup
 
 ```bash
 uv sync --extra dev
 cp .env.example .env
-# Fill in the gateway/token endpoints and both OAuth client pairs.
+# Fill in the internal gateway endpoint and credential pairs.
 
-bash scripts/download_data.sh
+uv run python scripts/download_hmda.py
 uv run budget-crossover gateway-check
 uv run pytest -q
 uv run ruff check src tests
+uv run python scripts/smoke_v3_pipeline.py
 ```
 
-The frozen dataset downloader verifies SHA-256 checksums. Credentials stay in
-the ignored `.env` file.
+The downloader uses the official CFPB/FFIEC Data Browser, validates the expected
+CSV schema, and rejects any file whose SHA-256 differs from the preregistered
+digest.
 
-Each OAuth pair has an explicit model allowlist. Credential 1 accepts the three
-GPT-5.4 deployments plus Claude Opus/Sonnet 4.6; credential 2 accepts only the
-three GPT-5.4 deployments. `LLM_GATEWAY_CONCURRENCY_PER_KEY` is the manual hard
-ceiling for each pair. Below that ceiling, a separate
-[RFC 9438](https://www.rfc-editor.org/rfc/rfc9438.html)-inspired CUBIC
-controller probes upward after successful calls and applies a 0.7
-multiplicative decrease after rate-limit, timeout, or overload signals. This is
-application-level adaptive concurrency, not a replacement for TCP congestion
-control.
-
-## Run the study
+## Prepare and run
 
 ```bash
-# Pilot: 30 cases × 8 systems.
-uv run budget-crossover prepare-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover pilot-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover analyze-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover validate-v2 \
-  --config configs/v2_pilot.yaml \
-  --no-require-judgments \
+# Data-only preparation and leakage/counterfactual validation.
+uv run budget-crossover prepare-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover prepare-v3 --config configs/v3_main.yaml
+uv run budget-crossover validate-v3 \
+  --config configs/v3_main.yaml \
+  --no-require-generations \
   --no-require-pilot-gate
 
-# Main: the command checks the pilot gate before spending the main budget.
-uv run budget-crossover prepare-v2 --config configs/v2_main.yaml
-uv run budget-crossover run-v2 --config configs/v2_main.yaml
-uv run budget-crossover judge-v2 --config configs/v2_main.yaml
-uv run budget-crossover analyze-v2 --config configs/v2_main.yaml
-uv run budget-crossover validate-v2 --config configs/v2_main.yaml
+# Pilot, analysis, and manipulation checks.
+uv run budget-crossover pilot-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover analyze-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover validate-v3 \
+  --config configs/v3_pilot.yaml \
+  --no-require-pilot-gate
 
-# Populate and compile the empirical LaTeX paper.
-make -C paper results
+# The main run is blocked unless the pilot checks pass.
+uv run budget-crossover run-v3 --config configs/v3_main.yaml
+uv run budget-crossover analyze-v3 --config configs/v3_main.yaml
+uv run budget-crossover validate-v3 --config configs/v3_main.yaml
 ```
 
-The commands are resumable. Rerun the same command after a transient failure.
-Do not delete individual bad responses: malformed and truncated outputs are
-part of the system result. A run manifest rejects resumes after code, config,
-data, prompt, model, seed, or case-set changes.
+Runs are checkpointed and resumable. A manifest freezes the configuration, cases,
+HMDA checksum, prompt version, code hash, both model IDs, seed, and Git state. A
+resume is rejected after an immutable input changes. Canonical scored outputs
+and retryable transport errors are stored separately, so a successful retry
+cannot duplicate an experimental cell.
 
-The full operational guide, failure recovery rules, output contract, and
-runtime estimates are in [`experiments/RUNBOOK.md`](experiments/RUNBOOK.md).
+GPT-5.4-mini worker calls can use both OAuth pairs. Claude Sonnet 4.6 oversight
+calls and the strong-model control use pair 1. Each pair has its own
+CUBIC-inspired concurrency window; raise
+`LLM_GATEWAY_CONCURRENCY_PER_KEY` to raise the ceiling without changing code.
 
-## Paper
+## Build the white paper
 
-The paper uses modular LaTeX:
-
-```text
-paper/main.tex
-paper/sections/*.tex
-paper/generated/results_values.tex
-paper/references.bib
+```bash
+uv run python paper/build_paper.py
+cd paper
+latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=build main.tex
 ```
 
-Before experiments, `make -C paper` compiles a clearly marked protocol draft.
-After a complete run, `make -C paper results` validates the experiment, writes
-the numeric macros and table rows from the analysis files, and produces:
+Without a validated main run, the builder produces a clearly labeled
+preregistered LaTeX protocol and makes no empirical model-performance claims.
+The current protocol compiles to five pages and includes vector study and
+architecture diagrams. After a complete validated main run, the result gate
+incorporates generated tables and vector figures.
 
-```text
-paper/build/architecture_budget_frontiers.pdf
-```
+The operator guide is in [`experiments/RUNBOOK.md`](experiments/RUNBOOK.md).
+The post-run paper checklist is in
+[`experiments/REMAINING_WORK.md`](experiments/REMAINING_WORK.md).
 
-The result builder refuses to make empirical claims if the pilot, generation
-grid, usage accounting, call contracts, schema/truncation thresholds, frozen
-judge sample, or sampled judgments fail validation.
+## Data governance
 
-## Security
-
-Run directories contain model prompts and responses and are ignored by Git.
-Review them before sharing. Never commit `.env` or internal gateway pricing.
-Dollar cost is reported only when approved internal prices are placed in the
-configuration; otherwise the paper reports token and latency frontiers.
+Downloaded HMDA files, processed case packets, run transcripts, and analysis
+outputs are ignored by Git. HMDA public data are privacy-modified, but the
+workflow still avoids re-identification, suppresses public row identifiers in the
+paper, and never sends historical action, denial reasons, pricing, or other
+post-decision outcome fields to models.

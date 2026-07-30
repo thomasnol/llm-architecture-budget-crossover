@@ -1,0 +1,86 @@
+\section{Experimental Protocol}
+
+\subsection{Budget Intervention and Gateway}
+
+For case $i$, system $s$, and nominal budget $B$, the workflow consumes
+\begin{equation}
+T_{isb}=\sum_{k=1}^{K_{is}}\left(P_{isk}+C_{isk}\right),
+\qquad T_{isb}\leq B,
+\label{eq:budget}
+\end{equation}
+where $P$ and $C$ are gateway-reported prompt and completion tokens for internal
+call $k$. We test $B\in\{2048,4096,8192\}$. Before issuing a call, the controller
+estimates its prompt as $\lceil\text{characters}/2.5\rceil+64$ and reserves at
+least 64 completion tokens. Parallel specialists launch only when the remaining
+budget can fund all three minimum allocations. Reported usage replaces the
+estimate after each response. An overrun is retained and excluded from the
+budget-feasible frontier; budget exhaustion receives no special retry.
+
+The internal gateway supplies \texttt{prompt\_tokens},
+\texttt{completion\_tokens}, and \texttt{total\_tokens} for each call. Two OAuth
+credential pairs share GPT traffic, while only pair 1 accepts the Claude model
+IDs. Each credential has its own CUBIC-inspired concurrency window. Successful
+requests grow the window; 429 and overload responses reduce it
+multiplicatively. The environment variable
+\texttt{LLM\_GATEWAY\_CONCURRENCY\_PER\_KEY} sets the ceiling, and the runner
+creates enough case tasks to reach both ceilings. This preserves high throughput
+without treating the configured ceiling as a promise that the service can
+sustain it.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=navy, rounded corners=2pt, fill=lightblue, align=center,
+              minimum width=2.35cm, minimum height=0.70cm, font=\scriptsize},
+  small/.style={draw=teal, rounded corners=2pt, align=center,
+                minimum width=2.55cm, minimum height=0.58cm, font=\scriptsize},
+  arrow/.style={-{Latex[length=1.8mm]}, thick, draw=teal}
+]
+\node[box] (case) at (0,0) {Case + budget};
+\node[small] (mono) at (3.25,1.05) {Monolith};
+\node[small] (ret) at (3.25,0.35) {Plan $\rightarrow$ retrieve};
+\node[small] (comm) at (3.25,-0.35) {3 specialists $\rightarrow$ chair};
+\node[small] (guard) at (3.25,-1.05) {Underwrite $\rightarrow$ audit};
+\node[box] (ledger) at (7.0,0) {Shared token ledger\\prompt + completion};
+\node[box] (out) at (10.4,0) {Decision, reasons,\\calls, latency};
+\foreach \x in {mono,ret,comm,guard} {
+  \draw[arrow] (case.east) -- (\x.west);
+  \draw[arrow] (\x.east) -- (ledger.west);
+}
+\draw[arrow] (ledger) -- (out);
+\end{tikzpicture}
+\caption{Architectures differ in information flow, but every internal call
+debits the same case-level token ledger. Strong monolith shares the monolith
+path; adaptive shares the guardrail path only when it escalates.}
+\label{fig:architectures}
+\end{figure}
+
+\subsection{Outcomes and Inference}
+
+The primary unit is the source application, not either counterfactual row. Let
+$c_{is0}$ and $c_{is1}$ indicate a correct decision on the observed and changed
+variants. Primary success is $S_{is}=c_{is0}c_{is1}$. Secondary outcomes include
+per-case decision accuracy, exact decision-plus-reason accuracy, schema validity,
+decision and full-policy invariance, token use, call count, wall time, summed API
+latency, escalation rate, and accuracy by routine, threshold, and exception
+cases. Approved internal prices may support a secondary dollar estimate, but
+token and latency measures do not depend on a confidential price schedule.
+
+The confirmatory comparison is adaptive routing against the base monolith within
+each budget. We report the paired difference in $S$, an application-cluster
+bootstrap 95\% interval, and an exact McNemar test. The three budget-level
+$p$-values receive Holm correction \citep{holm1979}. Support requires a gain of
+at least five percentage points, an interval excluding zero, adjusted
+$p<0.05$, an overrun rate no greater than 1\%, and a non-dominated
+accuracy-token operating point. A sign change between adjacent tested budgets is
+called a crossover only when the paired uncertainty supports that description.
+Otherwise, we report three discrete comparisons.
+
+The pilot includes 864 cells; the main grid includes
+$192\times6\times3=3{,}456$. The main run is blocked unless every high-budget
+system reaches 95\% schema validity, no operating point exceeds 1\% overrun, and
+at least one budget shows accuracy disagreement. A run manifest freezes the
+expanded configuration, case hash, HMDA checksum, prompt version, source hash,
+model IDs, seed, Git commit, and dirty-worktree state. Checkpointed JSONL makes
+network failures resumable. Scored outputs and retryable execution errors use
+separate files, so a transient error cannot duplicate a canonical cell.

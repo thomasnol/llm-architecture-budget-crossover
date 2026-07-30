@@ -126,3 +126,42 @@ async def test_oauth_pair_and_usage_payload_work_end_to_end(monkeypatch):
     assert first.usage.total_tokens == 118
     assert first.concurrency_window is not None
     assert second.concurrency_window >= first.concurrency_window
+
+
+@pytest.mark.asyncio
+async def test_credential_report_authenticates_both_pairs(monkeypatch):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
+    monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_ID_1", "first")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_SECRET_1", "secret-one")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_ID_2", "second")
+    monkeypatch.setenv("LLM_GATEWAY_CLIENT_SECRET_2", "secret-two")
+    token_ids: set[str] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/token":
+            identifier = (
+                "first" if b"client_id=first" in request.content else "second"
+            )
+            token_ids.add(identifier)
+            return httpx.Response(
+                200,
+                json={"access_token": f"{identifier}-token", "expires_in": 3600},
+            )
+        token = request.headers["authorization"].removeprefix("Bearer ")
+        model = "claude-sonnet-4-6" if token.startswith("first") else "gpt-5.4-mini"
+        return httpx.Response(200, json={"data": [{"id": model}]})
+
+    client = GatewayClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        report = await client.credential_report()
+    finally:
+        await client.close()
+
+    assert token_ids == {"first", "second"}
+    assert report["configured_credential_slots"] == 2
+    assert [slot["status"] for slot in report["slots"]] == ["ok", "ok"]
+    assert report["slots"][0]["reported_model_ids"] == ["claude-sonnet-4-6"]
+    assert report["slots"][1]["reported_model_ids"] == ["gpt-5.4-mini"]

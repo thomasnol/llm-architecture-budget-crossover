@@ -1,205 +1,170 @@
-# Version 2 experiment runbook
+# Version 3 operator runbook
 
-This runbook is written for a fresh clone on the computer that can reach the
-internal LLM Gateway. Commands are run from the repository root.
-
-## 1. Preconditions
-
-- Python 3.11 or newer.
-- `uv`, `curl`, `sha256sum`, `latexmk`, and a standard TeX Live installation.
-- Two OAuth client-ID/client-secret pairs.
-- Credential 1 can access GPT-5.4, GPT-5.4-mini, GPT-5.4-nano, Claude Sonnet
-  4.6, and Claude Opus 4.6. Credential 2 can access only the three GPT
-  deployments.
-- A clean checkout of the frozen experiment commit. The run manifest records
-  the commit and the source-tree hash.
+## 1. Install and configure
 
 ```bash
 uv sync --extra dev
 cp .env.example .env
 ```
 
-Fill `.env` locally. The required V2 model IDs are:
+Configure the internal gateway and credential pairs in `.env`. Never commit the
+file or copy credentials into a run directory.
 
-```text
-gpt-5.4-mini
-gpt-5.4
-claude-sonnet-4-6
-```
-
-Claude Opus 4.6 (`claude-opus-4-6`) remains available for the archived V1
-adjudication workflow but is not used by V2.
-
-Keep each credential's `LLM_GATEWAY_MODELS_1` or
-`LLM_GATEWAY_MODELS_2` allowlist exact. The scheduler never sends a Claude
-request through credential 2. `LLM_GATEWAY_CONCURRENCY_PER_KEY` is a hard
-per-credential ceiling, so raising it is the only concurrency edit needed.
-Each credential starts at four concurrent requests (or the ceiling, when
-lower), then uses an RFC 9438-inspired CUBIC window. Successful completions
-increase the window; HTTP 429, timeout, and overload responses apply a 0.7
-multiplicative decrease. The controller never exceeds the configured ceiling.
-
-Verify gateway access before downloading or running:
+Confirm access. This authenticates both pairs, reports each pair's model
+allowlist, and exits nonzero if either pair fails:
 
 ```bash
 uv run budget-crossover gateway-check
 ```
 
-The response should list every required model. Do not proceed if an ID is
-missing.
+`LLM_GATEWAY_CONCURRENCY_PER_KEY` is the only throughput ceiling in the v3
+runner. Each credential starts with a CUBIC window of at most four requests,
+probes upward on success, and reduces the window on rate limits or overload.
 
-## 2. Freeze and test local inputs
+## 2. Acquire the frozen official source
 
 ```bash
-bash scripts/download_data.sh
+uv run python scripts/download_hmda.py
+```
+
+The downloader queries the official CFPB/FFIEC Data Browser for the frozen
+four-jurisdiction 2024 originated/denied cohort. It validates the header and
+SHA-256. A checksum change is a hard stop, not an invitation to update the digest
+silently.
+
+## 3. Validate code and case construction
+
+```bash
 uv run pytest -q
 uv run ruff check src tests
-uv run budget-crossover prepare-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover prepare-v2 --config configs/v2_main.yaml
-```
+uv run python scripts/smoke_v3_pipeline.py
 
-Expected preparation counts:
-
-```text
-v2_pilot: 30 cases = 12 insurance + 18 MMLU-Pro
-v2_main: 268 cases = 68 insurance + 200 MMLU-Pro
-overlap between pilot and main: 0
-```
-
-The downloader verifies:
-
-```text
-insurance SHA-256:
-55833ec064222f8a98a80af8e9726ad98f8540f8173be97343e50bac3fb37c83
-
-MMLU-Pro SHA-256:
-0e24a191921c2f453518a537a8b2117bd137e7714d4ef1565e9ba06c1ecb9ad8
-```
-
-## 3. Run and inspect the pilot
-
-```bash
-uv run budget-crossover pilot-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover analyze-v2 --config configs/v2_pilot.yaml
-uv run budget-crossover validate-v2 \
-  --config configs/v2_pilot.yaml \
-  --no-require-judgments \
+uv run budget-crossover prepare-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover prepare-v3 --config configs/v3_main.yaml
+uv run budget-crossover validate-v3 \
+  --config configs/v3_main.yaml \
+  --no-require-generations \
   --no-require-pilot-gate
 ```
 
-Expected successful generation cells: `30 × 8 = 240`.
+Expected main profile:
 
-Inspect:
+- 96 source applications;
+- 192 cases;
+- 96 counterfactual pairs;
+- 24 applications in each policy-decision class;
+- 24 applications in each state;
+- no overlap with the 24-application pilot.
 
-```text
-experiments/runs/v2_pilot/run_manifest.json
-experiments/runs/v2_pilot/generations.jsonl
-experiments/runs/v2_pilot/validation.json
-experiments/runs/v2_pilot/analysis/analysis_summary.json
-```
+Preparation must report that historical action is not used as gold and
+post-decision fields are not supplied to models.
 
-At least one dataset must pass all three preregistered pilot checks:
+The offline smoke command exercises and validates all 144 cells in a
+four-application scripted run and builds every table and figure. Its
+`analysis.json` states `results_are_empirical: false`; never cite its scores.
 
-- schema validity at least 98%;
-- direct accuracy between 25% and 90%;
-- system disagreement at least 10%.
-
-If neither passes, stop. Do not use `--force` to obtain a preferred result.
-Diagnose the manipulation and create a new versioned experiment name, config,
-prompt version, and preregistration.
-
-## 4. Run the disjoint main study
+## 4. Pilot
 
 ```bash
-uv run budget-crossover run-v2 --config configs/v2_main.yaml
+uv run budget-crossover pilot-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover analyze-v3 --config configs/v3_pilot.yaml
+uv run budget-crossover validate-v3 \
+  --config configs/v3_pilot.yaml \
+  --no-require-pilot-gate
 ```
 
-Expected successful generation cells: `268 × 8 = 2,144`.
+The pilot contains 48 cases × 6 systems × 3 budgets = 864 generation cells.
+Rerunning the same command resumes missing cells. `ok` and `budget_exhausted`
+cells are final observations. Generic execution errors go to `errors.jsonl` and
+remain eligible for resume.
 
-The generation runner has a 4.5-hour deadline and checkpoints every response.
-If it stops after a gateway outage or deadline, run the identical command
-again. Successful cells are skipped. The immutable manifest prevents mixed
-versions.
+Do not selectively rerun malformed or wrong model answers. A schema problem
+requires an operational version change and a new pilot.
 
-Next, freeze and run the balanced secondary-judge sample:
+## 5. Main study
 
 ```bash
-uv run budget-crossover judge-v2 --config configs/v2_main.yaml
+uv run budget-crossover run-v3 --config configs/v3_main.yaml
 ```
 
-The command refuses to freeze the sample until all 2,144 generation cells are
-present exactly once. With both datasets and all systems, at most 480
-generations are selected and each receives two judges, for at most 960 calls.
-The selected run IDs are stored in:
+The main command checks the pilot gate before issuing model calls. The expected
+grid is 192 cases × 6 systems × 3 budgets = 3,456 cells.
 
-```text
-experiments/runs/v2_main/judge_sample_manifest.json
-```
-
-Resume the identical judge command after transient failures.
-
-## 5. Analyze and validate
+An exceptional gate override must include a durable reason:
 
 ```bash
-uv run budget-crossover analyze-v2 --config configs/v2_main.yaml
-uv run budget-crossover validate-v2 --config configs/v2_main.yaml
+uv run budget-crossover run-v3 \
+  --config configs/v3_main.yaml \
+  --force \
+  --force-reason "documented reason"
 ```
 
-Validation exits with status 1 if any blocking check fails. Important outputs:
+An override permits execution but invalidates a confirmatory claim that depended
+on the failed gate.
 
-```text
-experiments/runs/v2_main/validation.json
-experiments/runs/v2_main/analysis/analysis_summary.json
-experiments/runs/v2_main/analysis/tables/case_level.csv
-experiments/runs/v2_main/analysis/tables/system_summary.csv
-experiments/runs/v2_main/analysis/tables/paired_comparisons.csv
-experiments/runs/v2_main/analysis/tables/mechanisms.csv
-experiments/runs/v2_main/analysis/tables/pareto.csv
-experiments/runs/v2_main/analysis/tables/budget_policy.csv
-experiments/runs/v2_main/analysis/tables/task_breakdown.csv
-experiments/runs/v2_main/analysis/figures/accuracy_cost_insurance.png
-experiments/runs/v2_main/analysis/figures/accuracy_cost_mmlu_pro.png
-```
-
-Schema-invalid or token-cap-truncated responses remain system outcomes. They
-are not selectively rerun. Validation permits at most 2% truncation and
-requires at least 98% schema validity. Exceeding those thresholds invalidates
-the operational setup and requires a new experiment version.
-
-## 6. Build the final LaTeX paper
+## 6. Analyze and validate
 
 ```bash
-make -C paper results
+uv run budget-crossover analyze-v3 --config configs/v3_main.yaml
+uv run budget-crossover validate-v3 --config configs/v3_main.yaml
 ```
 
-This command reruns validation, writes
-`paper/generated/results_values.tex`, and compiles:
+Analysis writes:
 
 ```text
-paper/build/architecture_budget_frontiers.pdf
+experiments/runs/v3_main/analysis/
+├── analysis.json
+├── figures/
+│   ├── counterfactual_consistency_by_budget.png
+│   ├── counterfactual_consistency_by_budget.pdf
+│   ├── decision_accuracy_by_budget.png
+│   ├── decision_accuracy_by_budget.pdf
+│   ├── tokens_vs_accuracy.png
+│   └── tokens_vs_accuracy.pdf
+└── tables/
+    ├── case_results.csv
+    ├── mechanisms.csv
+    ├── paired_comparisons.csv
+    ├── pair_results.csv
+    ├── pareto_frontier.csv
+    └── system_summary.csv
 ```
 
-The generated prose distinguishes:
+The validator checks the frozen source, counterfactual construction, leakage
+controls, exact grid, duplicates, execution errors, token overruns, and pilot
+gate.
 
-- pilot-eligible versus exploratory datasets;
-- statistical evidence versus the 5 percentage-point smallest effect of
-  practical interest;
-- Pareto-efficient point estimates versus a universal threshold;
-- correction of wrong drafts versus regression of correct drafts.
+## 7. Build the paper
 
-## 7. Runtime and recovery policy
-
-Maximum live API time:
-
-```text
-pilot generation     1.25 h
-main generation      4.50 h
-sampled judging      1.50 h
-contingency           0.75 h
-total                 8.00 h
+```bash
+uv run python paper/build_paper.py
+cd paper
+latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=build main.tex
 ```
 
-Safe recovery is to rerun the same command. Never edit JSONL rows, remove a
-failed answer because it hurts accuracy, or change a model/config under the same
-experiment name. For a legitimate design change, preserve the old run and
-create a new experiment name and preregistration amendment.
+If validated main results are absent, the paper remains explicitly a
+five-page preregistered LaTeX protocol. The builder must not infer or fabricate
+results. After a complete validated main run, rebuild to populate empirical
+tables and vector figures. Then complete
+`experiments/REMAINING_WORK.md`.
+
+## Failure recovery
+
+- HTTP 429, timeout, or overload: rerun the same command. The gateway client
+  retries transient errors and the run resumes from checkpoints.
+- Deadline: rerun only if the preregistered execution window still permits it;
+  otherwise report missing cells.
+- Manifest mismatch: do not edit the manifest. Create a new experiment name and
+  document the change.
+- HMDA checksum mismatch: retain the unexpected digest separately, investigate
+  the official release, and preregister a new dataset version if necessary.
+- Budget exhaustion: do not rerun. It is an experimental result.
+- Actual token overrun: retain and report it. Diagnose the estimator only in a
+  new operational version.
+
+## Security and governance
+
+Run directories contain prompts, model responses, and privacy-modified public
+HMDA fields. They are ignored by Git. Do not attempt re-identification, publish
+row-level source identifiers, or treat the counterfactual probes as facts about
+real applicants. Review every artifact before external sharing.

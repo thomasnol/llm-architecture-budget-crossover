@@ -268,10 +268,7 @@ class GatewayClient:
             headers["Authorization"] = f"Bearer {await self._oauth_token(slot)}"
         return headers
 
-    async def list_models(self) -> dict[str, Any]:
-        if not self.configured:
-            raise RuntimeError("gateway endpoint/credentials are not configured")
-        slot = self.slots[0]
+    async def _list_models_for_slot(self, slot: CredentialSlot) -> dict[str, Any]:
         await slot.limiter.acquire()
         try:
             response = await self.client.get(
@@ -294,6 +291,54 @@ class GatewayClient:
         else:
             await slot.limiter.release(successful=True)
             return payload
+
+    async def list_models(self) -> dict[str, Any]:
+        if not self.configured:
+            raise RuntimeError("gateway endpoint/credentials are not configured")
+        return await self._list_models_for_slot(self.slots[0])
+
+    async def credential_report(self) -> dict[str, Any]:
+        """Authenticate every configured pair without exposing secret values."""
+        if not self.configured:
+            raise RuntimeError("gateway endpoint/credentials are not configured")
+
+        async def inspect(slot: CredentialSlot) -> dict[str, Any]:
+            try:
+                payload = await self._list_models_for_slot(slot)
+                data = payload.get("data", []) if isinstance(payload, dict) else []
+                reported = sorted(
+                    {
+                        str(item["id"])
+                        for item in data
+                        if isinstance(item, dict) and item.get("id")
+                    }
+                )
+                return {
+                    "credential_slot": slot.index,
+                    "status": "ok",
+                    "configured_model_patterns": list(slot.model_patterns),
+                    "reported_model_ids": reported,
+                    "concurrency_ceiling": slot.concurrency,
+                    "initial_cubic_window": slot.limiter.limit,
+                }
+            except Exception as error:  # noqa: BLE001 - diagnostic must report all slots
+                return {
+                    "credential_slot": slot.index,
+                    "status": "error",
+                    "configured_model_patterns": list(slot.model_patterns),
+                    "reported_model_ids": [],
+                    "concurrency_ceiling": slot.concurrency,
+                    "initial_cubic_window": slot.limiter.limit,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+
+        slots = await asyncio.gather(*(inspect(slot) for slot in self.slots))
+        return {
+            "base_url": self.base_url,
+            "configured_credential_slots": len(self.slots),
+            "maximum_total_concurrency": self.maximum_total_concurrency,
+            "slots": slots,
+        }
 
     async def complete(
         self,

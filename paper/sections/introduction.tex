@@ -1,0 +1,72 @@
+\section{Introduction}
+
+Mortgage adjudication looks simple only after the decision has been made. Before
+that point, an underwriter must connect income, debt capacity, collateral,
+product rules, missing data, and compliance constraints. A useful AI workflow
+must do the same work without quietly spending an unlimited number of tokens.
+This makes mortgage review a strong test for agent orchestration: the evidence
+is structured, the policy has precedence, and a compliance failure can matter
+even when the final label happens to be correct.
+
+Our research question is direct: under a fixed case-level token budget, which
+orchestration architecture produces the best joint profile of policy accuracy,
+counterfactual invariance, token use, and latency? The intervention is the
+architecture and the nominal total-token budget. The primary outcome is stricter
+than ordinary row accuracy. Both variants of the same application must receive
+the correct policy decision. The experiment therefore penalizes a system that is
+accurate on the observed record but changes its answer when a monitoring-only
+attribute changes.
+
+Recent test-time scaling work shows that extra inference compute can help, but
+the best allocation depends on problem difficulty \citep{snell2024testtime}.
+That result does not imply that more agents are better. Multi-stage systems
+repeat policy text, transmit summaries, and reserve output for later calls.
+Under a hard budget, coordination can crowd out evidence. Research on
+self-correction also warns that prompted feedback is unreliable unless the
+feedback source has useful information or an external check
+\citep{kamoi2024selfcorrection}. Our compliance agent therefore receives
+segregated monitoring evidence and a fixed policy; it does not simply ask the
+underwriter to ``think again.''
+
+HMDA is useful here because it contains real mortgage application, property, and
+monitoring fields. The public files are privacy modified and remain the most
+comprehensive public source on mortgage market activity
+\citep{ffiec2024hmda}. We do not use lender action as the correct underwriting
+answer. Action taken reflects institution policy, missing information, applicant
+behavior, and other facts that HMDA does not expose. Treating it as normative
+truth would reward imitation of historical decisions. We instead use a small,
+deterministic policy as a research instrument and report historical concordance
+only as a secondary description.
+
+The contribution is an experiment, not a proposed lending policy. It makes four
+choices explicit. First, every architecture pays for prompt and completion
+tokens across all internal calls. Second, a one-call Claude Sonnet control tests
+whether an apparent orchestration gain is really a model-strength gain. Third,
+counterfactual twins test a narrow invariance property without claiming to
+measure market discrimination or legal compliance. Fourth, the full grid,
+including malformed outputs and budget exhaustion, is retained. These choices
+make a negative result useful: if a committee spends more and performs no better,
+the experiment will show it.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  box/.style={draw=navy, rounded corners=2pt, fill=lightblue, align=center,
+              minimum width=2.45cm, minimum height=0.72cm, font=\scriptsize},
+  arrow/.style={-{Latex[length=2mm]}, thick, draw=teal}
+]
+\node[box] (hmda) {Official 2024 HMDA\\predecision fields};
+\node[box, right=of hmda] (oracle) {Transparent policy\\and leakage filters};
+\node[box, right=of oracle] (twins) {Observed and\\counterfactual twins};
+\node[box, right=of twins] (grid) {6 systems $\times$\\3 token budgets};
+\node[box, right=of grid] (analysis) {Paired accuracy,\\invariance, cost};
+\draw[arrow] (hmda) -- (oracle);
+\draw[arrow] (oracle) -- (twins);
+\draw[arrow] (twins) -- (grid);
+\draw[arrow] (grid) -- (analysis);
+\end{tikzpicture}
+\caption{The frozen experiment separates source data, normative research labels,
+workflow execution, and paired analysis.}
+\label{fig:pipeline}
+\end{figure}

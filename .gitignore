@@ -19,5 +19,7 @@ work/
 
 # Render QA intermediates.
 paper/rendered/
+paper/build/
+paper/generated/
 paper/*.aux
 paper/*.log

@@ -1,0 +1,76 @@
+\documentclass[10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{setspace}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{float}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{natbib}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{fancyhdr}
+\usetikzlibrary{arrows.meta,positioning,fit}
+
+\setstretch{1.04}
+\setlength{\parindent}{1.1em}
+\setlength{\parskip}{0pt}
+\setlength{\textfloatsep}{7pt plus 2pt minus 2pt}
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\intextsep}{6pt plus 2pt minus 2pt}
+\definecolor{navy}{HTML}{17324D}
+\definecolor{teal}{HTML}{1B7F79}
+\definecolor{lightblue}{HTML}{EEF3F6}
+\definecolor{muted}{HTML}{5F6B76}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  citecolor=teal,
+  urlcolor=teal,
+  pdftitle={Token Budgets Change the Value of Agent Orchestration in Mortgage Adjudication},
+  pdfauthor={Thomas Nolasque}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\footnotesize Token-Budgeted Mortgage Adjudication}
+\rhead{\footnotesize Preregistered protocol}
+\rfoot{\footnotesize \thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\newenvironment{statusbox}
+  {\begin{quote}\small\color{navy}\hrule\medskip}
+  {\medskip\hrule\end{quote}}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\systemnode}[2][]{%
+  \node[draw=navy, rounded corners=2pt, fill=lightblue, align=center,
+        minimum height=0.62cm, font=\scriptsize, #1] {#2};}
+
+\title{\textbf{\color{navy}Token Budgets Change the Value of Agent Orchestration\\
+in Mortgage Adjudication}}
+\author{Thomas Nolasque}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.3em}
+
+\input{sections/abstract}
+\input{sections/introduction}
+\input{sections/method}
+\input{sections/experiment}
+\IfFileExists{generated/results_section.tex}
+  {\input{generated/results_section}}
+  {\section{Results Status}
+   No validated external run is available. Run
+   \texttt{python paper/build\_paper.py} before compiling.}
+\input{sections/discussion}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{document}

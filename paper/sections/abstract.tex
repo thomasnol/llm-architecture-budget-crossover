@@ -1,0 +1,18 @@
+\begin{abstract}
+Agent workflows are often compared by call count or a loose completion limit.
+Neither measure answers the practical question: which architecture makes the
+best decision when every prompt and completion must fit inside the same budget?
+This paper defines a controlled experiment in mortgage adjudication using the
+official 2024 Home Mortgage Disclosure Act data. We convert predecision
+application fields into a transparent research policy with four outcomes:
+approve, conditional review, deny, and manual review. Historical lender action
+remains a descriptive outcome, not ground truth. Each application also receives
+a counterfactual twin that changes one monitoring-only demographic field while
+holding the financial evidence and policy label fixed. We compare a monolith, a
+strong-model monolith, plan-and-retrieve, a specialist committee, a fixed
+compliance guardrail, and adaptive guarded routing at total-token budgets of
+2,048, 4,096, and 8,192. The primary unit is the source application, and success
+requires a correct decision on both twins. This artifact freezes the dataset,
+prompts, budget accounting, metrics, and analysis before the external gateway
+run. It reports no model-performance result yet.
+\end{abstract}
