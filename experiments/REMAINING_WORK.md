@@ -7,10 +7,10 @@ smoke run.
 ## Required external execution
 
 - Copy `.env.example` to `.env` and populate both OAuth client ID/secret pairs.
-- Run `gateway-check`; both credential slots must report `status: ok`.
-- Run the pilot, analyze it, and pass the pilot validation gate.
 - Complete gateway preflight and the high-budget calibration run.
 - Accept or revise the four primary budgets on a new branch.
+- Run the pilot preflight, complete the pilot, analyze it, and pass its
+  validation gate.
 - Run and validate every pilot cell before opening the main-study gate.
 - Run all 15,360 main architecture cells, then run `validate` and `analyze`.
 - Run the separate weak-to-strong routing ablation.
