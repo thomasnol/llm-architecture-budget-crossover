@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from budget_crossover.models import EvidenceItem, PublicCase
 from budget_crossover.retrieval import retrieve
@@ -91,7 +92,10 @@ def test_empty_or_unmatched_queries_fall_back_to_stable_corpus_order():
     unmatched = retrieve(_case(), ("nonexistent-token",), limit=4, max_chars_per_item=200)
 
     assert empty.pre_truncation_ids == ("row-a", "unmatched", "profit", "row-b")
-    assert unmatched == empty
+    assert unmatched.items == empty.items
+    assert unmatched.pre_truncation_ids == empty.pre_truncation_ids
+    assert unmatched.post_truncation_ids == empty.post_truncation_ids
+    assert unmatched.query_hash != empty.query_hash
 
 
 @pytest.mark.parametrize(
@@ -101,3 +105,20 @@ def test_empty_or_unmatched_queries_fall_back_to_stable_corpus_order():
 def test_retrieval_rejects_invalid_limits(limit, max_chars):
     with pytest.raises(ValueError):
         retrieve(_case(), ("revenue",), limit=limit, max_chars_per_item=max_chars)
+
+
+def test_retrieval_result_binds_immutable_tier_limit_query_and_public_input_provenance():
+    result = retrieve(
+        _case(),
+        ("profit", "revenue"),
+        limit=3,
+        max_chars_per_item=200,
+        tier_id="high",
+    )
+
+    assert result.tier_id == "high"
+    assert result.requested_k == 3
+    assert len(result.query_hash) == 64
+    assert len(result.input_hash) == 64
+    with pytest.raises(ValidationError, match="requested_k"):
+        result.model_copy(update={"requested_k": 1})

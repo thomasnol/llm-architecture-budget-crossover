@@ -245,35 +245,60 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
         expected_count=1,
     )
     case = adapted.cases[0]
-    production = retrieve(
-        case.public,
-        ("revenue expense",),
-        limit=1,
-        max_chars_per_item=1000,
-    )
+    production_results = {
+        tier: {
+            case.public.case_id: retrieve(
+                case.public,
+                ("revenue expense",),
+                limit=1,
+                max_chars_per_item=1000,
+                tier_id=tier,
+            )
+        }
+        for tier in ("low", "middle", "high")
+    }
 
     ladders = retrieval_ladder_boundary(
         adapted.cases,
         reference_queries={case.public.case_id: ("revenue expense",)},
         planned_queries={case.public.case_id: ("unmatched",)},
-        production_results={
-            tier: {case.public.case_id: production}
+        production_queries={
+            tier: {case.public.case_id: ("revenue expense",)}
             for tier in ("low", "middle", "high")
         },
+        production_results=production_results,
         tier_limits={"low": 1, "middle": 1, "high": 1},
         max_chars_per_item=1000,
     )
 
     assert ladders["reference"] == {
-        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 1.0}
+        tier: {
+            "tier_id": tier,
+            "requested_k": 1,
+            "provenance_validated": True,
+            "pre_truncation_recall": 1.0,
+            "post_truncation_recall": 1.0,
+        }
         for tier in ("low", "middle", "high")
     }
     assert ladders["planned"] == {
-        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 0.0}
+        tier: {
+            "tier_id": tier,
+            "requested_k": 1,
+            "provenance_validated": True,
+            "pre_truncation_recall": 1.0,
+            "post_truncation_recall": 0.0,
+        }
         for tier in ("low", "middle", "high")
     }
     assert ladders["production"] == {
-        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 1.0}
+        tier: {
+            "tier_id": tier,
+            "requested_k": 1,
+            "provenance_validated": True,
+            "pre_truncation_recall": 1.0,
+            "post_truncation_recall": 1.0,
+        }
         for tier in ("low", "middle", "high")
     }
 
@@ -286,9 +311,20 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
     )
     case = adapted.cases[0]
     case_id = case.public.case_id
-    result = retrieve(case.public, ("revenue",), limit=1, max_chars_per_item=1000)
     queries = {case_id: ("revenue",)}
-    tiers = {tier: {case_id: result} for tier in ("low", "middle", "high")}
+    production_queries = {tier: queries for tier in ("low", "middle", "high")}
+    tiers = {
+        tier: {
+            case_id: retrieve(
+                case.public,
+                ("revenue",),
+                limit=1,
+                max_chars_per_item=1000,
+                tier_id=tier,
+            )
+        }
+        for tier in ("low", "middle", "high")
+    }
     limits = {"low": 1, "middle": 1, "high": 1}
 
     with pytest.raises(ValueError, match="reference query case coverage"):
@@ -296,6 +332,7 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
             adapted.cases,
             reference_queries={},
             planned_queries=queries,
+            production_queries=production_queries,
             production_results=tiers,
             tier_limits=limits,
             max_chars_per_item=1000,
@@ -305,6 +342,7 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
             adapted.cases,
             reference_queries=queries,
             planned_queries=queries | {"extra": ("extra",)},
+            production_queries=production_queries,
             production_results=tiers,
             tier_limits=limits,
             max_chars_per_item=1000,
@@ -314,6 +352,7 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
             adapted.cases,
             reference_queries=queries,
             planned_queries=queries,
+            production_queries=production_queries,
             production_results={tier: tiers[tier] for tier in ("low", "middle")},
             tier_limits=limits,
             max_chars_per_item=1000,
@@ -323,7 +362,8 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
             adapted.cases,
             reference_queries=queries,
             planned_queries=queries,
-            production_results=tiers | {"ultra": {case_id: result}},
+            production_queries=production_queries,
+            production_results=tiers | {"ultra": {case_id: tiers["high"][case_id]}},
             tier_limits=limits,
             max_chars_per_item=1000,
         )
@@ -332,10 +372,124 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
             adapted.cases,
             reference_queries=queries,
             planned_queries=queries,
+            production_queries=production_queries,
             production_results=tiers | {"high": {}},
             tier_limits=limits,
             max_chars_per_item=1000,
         )
+
+
+def test_retrieval_ladders_reject_relabelled_tiers_and_requested_k_mismatch(
+    tmp_path: Path,
+):
+    adapted = adapt_financecomplex_snapshot(
+        _snapshot(tmp_path, [_record("case-1")]),
+        output_dir=tmp_path / "diagnostic",
+        expected_count=1,
+    )
+    case = adapted.cases[0]
+    case_id = case.public.case_id
+    queries = {case_id: ("revenue",)}
+    production_queries = {tier: queries for tier in ("low", "middle", "high")}
+    limits = {"low": 1, "middle": 1, "high": 1}
+    low = retrieve(
+        case.public,
+        ("revenue",),
+        limit=1,
+        max_chars_per_item=1000,
+        tier_id="low",
+    )
+    middle = retrieve(
+        case.public,
+        ("revenue",),
+        limit=1,
+        max_chars_per_item=1000,
+        tier_id="middle",
+    )
+    high = retrieve(
+        case.public,
+        ("revenue",),
+        limit=1,
+        max_chars_per_item=1000,
+        tier_id="high",
+    )
+
+    with pytest.raises(ValueError, match="high retrieval provenance"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_queries=production_queries,
+            production_results={
+                "low": {case_id: low},
+                "middle": {case_id: middle},
+                "high": {case_id: low},
+            },
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+
+    wrong_k_high = retrieve(
+        case.public,
+        ("revenue",),
+        limit=2,
+        max_chars_per_item=1000,
+        tier_id="high",
+    )
+    with pytest.raises(ValueError, match="high retrieval provenance"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_queries=production_queries,
+            production_results={
+                "low": {case_id: low},
+                "middle": {case_id: middle},
+                "high": {case_id: wrong_k_high},
+            },
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+
+    stale_query_high = retrieve(
+        case.public,
+        ("expense",),
+        limit=1,
+        max_chars_per_item=1000,
+        tier_id="high",
+    )
+    with pytest.raises(ValueError, match="high retrieval provenance"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_queries=production_queries,
+            production_results={
+                "low": {case_id: low},
+                "middle": {case_id: middle},
+                "high": {case_id: stale_query_high},
+            },
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+
+    stale_input_high = high.model_copy(update={"input_hash": "0" * 64})
+    with pytest.raises(ValueError, match="high retrieval provenance"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_queries=production_queries,
+            production_results={
+                "low": {case_id: low},
+                "middle": {case_id: middle},
+                "high": {case_id: stale_input_high},
+            },
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+
+    assert high.tier_id == "high"
 
 
 @pytest.mark.parametrize(
@@ -358,6 +512,9 @@ def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
                 "retrieval": {
                     "production": {
                         "high": {
+                            "tier_id": "high",
+                            "requested_k": 1,
+                            "provenance_validated": True,
                             "pre_truncation_recall": 1.0,
                             "post_truncation_recall": 0.94,
                         }
@@ -385,6 +542,9 @@ def test_boundary_report_attributes_each_failure_without_confirmation_pooling(
         "retrieval": {
             "production": {
                 "high": {
+                    "tier_id": "high",
+                    "requested_k": 1,
+                    "provenance_validated": True,
                     "pre_truncation_recall": 1.0,
                     "post_truncation_recall": 0.95,
                 }
@@ -429,6 +589,9 @@ def test_boundary_run_gate_uses_the_preregistered_thresholds():
                     "post_truncation_recall": 0.0,
                 },
                 "high": {
+                    "tier_id": "high",
+                    "requested_k": 1,
+                    "provenance_validated": True,
                     "pre_truncation_recall": 1.0,
                     "post_truncation_recall": 0.95,
                 },
@@ -441,3 +604,27 @@ def test_boundary_run_gate_uses_the_preregistered_thresholds():
     assert report["failures"] == []
     assert report["primary_failure"] is None
     assert report["domain_role"] == "exploratory_only"
+
+
+def test_boundary_run_gate_rejects_high_recall_without_validated_high_provenance():
+    report = build_financecomplex_boundary_report(
+        scorer={"gold_correct_rate": 1.0, "pass": True},
+        lineage_leakage={
+            "reference_document_linkage_rate": 1.0,
+            "leakage_count": 0,
+            "pass": True,
+        },
+        oracle_evidence_model={"pass": True},
+        retrieval={
+            "production": {
+                "high": {
+                    "pre_truncation_recall": 1.0,
+                    "post_truncation_recall": 1.0,
+                }
+            }
+        },
+        orchestration={"pass": True},
+    )
+
+    assert report["exploratory_system_run_gate"] is False
+    assert "retrieval" in report["failures"]

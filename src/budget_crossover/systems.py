@@ -22,7 +22,12 @@ from .models import (
     MechanismTrace,
     PublicCase,
 )
-from .retrieval import RetrievalResult, retrieve
+from .retrieval import (
+    RetrievalResult,
+    retrieval_input_hash,
+    retrieval_query_hash,
+    retrieve,
+)
 from .scoring import normalized_candidate_value
 
 CORE_INSTRUCTIONS = """Follow the stage-specific instructions exactly using only supplied public
@@ -64,8 +69,16 @@ def _query_hash(query: str) -> str:
     return hashlib.sha256(query.encode("utf-8")).hexdigest()
 
 
-def _empty_retrieval() -> RetrievalResult:
-    return RetrievalResult(items=(), pre_truncation_ids=(), post_truncation_ids=())
+def _empty_retrieval(case: PublicCase, tier: BudgetTier) -> RetrievalResult:
+    return RetrievalResult(
+        items=(),
+        pre_truncation_ids=(),
+        post_truncation_ids=(),
+        tier_id=tier.name,
+        requested_k=tier.retrieval_limit,
+        query_hash=retrieval_query_hash(()),
+        input_hash=retrieval_input_hash(case),
+    )
 
 
 def _evidence_text(items: Sequence[EvidenceItem]) -> str:
@@ -305,6 +318,7 @@ async def run_system(
             queries,
             limit=tier.retrieval_limit,
             max_chars_per_item=4000,
+            tier_id=tier.name,
         )
         try:
             response, event = await _complete(
@@ -364,13 +378,13 @@ async def run_system(
             repetition=repetition,
             planned_queries=(),
             actual_queries=(),
-            retrieval=_empty_retrieval(),
+            retrieval=_empty_retrieval(case, tier),
             ledger=ledger,
         )
     events.append(planner_event)
     plan = _parse_plan(planner_response.text, tier.planned_query_limit)
     if plan is None:
-        empty_retrieval = _empty_retrieval()
+        empty_retrieval = _empty_retrieval(case, tier)
         return CellResult(
             case_id=case.case_id,
             system=system,
@@ -396,6 +410,7 @@ async def run_system(
         queries,
         limit=tier.retrieval_limit,
         max_chars_per_item=4000,
+        tier_id=tier.name,
     )
     if system == "unverified_search":
         candidates: list[Candidate] = []

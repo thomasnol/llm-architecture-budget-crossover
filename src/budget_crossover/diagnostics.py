@@ -20,7 +20,12 @@ from .dataset import (
     sha256_file,
 )
 from .models import EvidenceItem, HiddenLabel, PublicCase
-from .retrieval import RetrievalResult, retrieve
+from .retrieval import (
+    RetrievalResult,
+    retrieval_input_hash,
+    retrieval_query_hash,
+    retrieve,
+)
 from .scoring import score_candidate, serialize_gold_oracle
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -500,10 +505,11 @@ def retrieval_ladder_boundary(
     *,
     reference_queries: Mapping[str, Sequence[str]],
     planned_queries: Mapping[str, Sequence[str]],
+    production_queries: Mapping[str, Mapping[str, Sequence[str]]],
     production_results: Mapping[str, Mapping[str, RetrievalResult]],
     tier_limits: Mapping[str, int],
     max_chars_per_item: int,
-) -> dict[str, dict[str, dict[str, float]]]:
+) -> dict[str, dict[str, dict[str, Any]]]:
     case_ids = {case.public.case_id for case in cases}
     tiers = {"low", "middle", "high"}
     if set(reference_queries) != case_ids:
@@ -512,11 +518,28 @@ def retrieval_ladder_boundary(
         raise ValueError("planned query case coverage must match diagnostic cases exactly")
     if set(production_results) != tiers:
         raise ValueError("production tier coverage must be exactly low, middle, and high")
+    if set(production_queries) != tiers:
+        raise ValueError("production query tier coverage must be exactly low, middle, and high")
     if set(tier_limits) != tiers or any(value < 1 for value in tier_limits.values()):
         raise ValueError("tier limits must define positive low, middle, and high limits")
     for tier in sorted(tiers):
         if set(production_results[tier]) != case_ids:
             raise ValueError(f"{tier} production case coverage must match cases exactly")
+        if set(production_queries[tier]) != case_ids:
+            raise ValueError(f"{tier} production query case coverage must match cases exactly")
+    cases_by_id = {case.public.case_id: case for case in cases}
+    for tier in sorted(tiers):
+        expected_k = tier_limits[tier]
+        for case_id, result in production_results[tier].items():
+            if (
+                result.tier_id != tier
+                or result.requested_k != expected_k
+                or result.query_hash != retrieval_query_hash(production_queries[tier][case_id])
+                or result.input_hash != retrieval_input_hash(cases_by_id[case_id].public)
+            ):
+                raise ValueError(
+                    f"{tier} retrieval provenance must match its case, tier, and requested_k"
+                )
 
     query_ladders: dict[str, dict[str, dict[str, RetrievalResult]]] = {
         "reference": {},
@@ -533,6 +556,7 @@ def retrieval_ladder_boundary(
                     queries[case.public.case_id],
                     limit=tier_limits[tier],
                     max_chars_per_item=max_chars_per_item,
+                    tier_id=tier,
                 )
                 for case in cases
             }
@@ -543,6 +567,9 @@ def retrieval_ladder_boundary(
     return {
         name: {
             tier: {
+                "tier_id": tier,
+                "requested_k": tier_limits[tier],
+                "provenance_validated": True,
                 "pre_truncation_recall": _reference_recall(
                     cases, results, "pre_truncation_ids"
                 ),
@@ -565,10 +592,17 @@ def build_financecomplex_boundary_report(
     orchestration: Mapping[str, Any],
     output_path: Path | None = None,
 ) -> dict[str, Any]:
-    production_recall = float(
-        retrieval.get("production", {})
-        .get("high", {})
-        .get("post_truncation_recall", 0.0)
+    high_retrieval = retrieval.get("production", {}).get("high", {})
+    high_provenance_validated = (
+        high_retrieval.get("provenance_validated") is True
+        and high_retrieval.get("tier_id") == "high"
+        and type(high_retrieval.get("requested_k")) is int
+        and high_retrieval["requested_k"] > 0
+    )
+    production_recall = (
+        float(high_retrieval.get("post_truncation_recall", 0.0))
+        if high_provenance_validated
+        else 0.0
     )
     failures: list[str] = []
     if float(scorer.get("gold_correct_rate", 0.0)) != 1.0 or not scorer.get("pass", False):
@@ -581,7 +615,7 @@ def build_financecomplex_boundary_report(
         failures.append("lineage_leakage")
     if not oracle_evidence_model.get("pass", False):
         failures.append("model_with_oracle_evidence")
-    if production_recall < 0.95:
+    if not high_provenance_validated or production_recall < 0.95:
         failures.append("retrieval")
     if not orchestration.get("pass", False):
         failures.append("orchestration")
@@ -589,6 +623,7 @@ def build_financecomplex_boundary_report(
         float(scorer.get("gold_correct_rate", 0.0)) == 1.0
         and float(lineage_leakage.get("reference_document_linkage_rate", 0.0)) == 1.0
         and int(lineage_leakage.get("leakage_count", 0)) == 0
+        and high_provenance_validated
         and production_recall >= 0.95
     )
     report = {
