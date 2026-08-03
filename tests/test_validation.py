@@ -166,6 +166,74 @@ def test_operational_gate_threshold_boundaries_are_inclusive():
     assert upper_hard.passed is True
 
 
+@pytest.mark.parametrize(
+    "non_finite",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=("nan", "positive-infinity", "negative-infinity"),
+)
+def test_gate_inputs_reject_non_finite_verified_search_medians(non_finite: float):
+    with pytest.raises(ValidationError, match="finite"):
+        _passing_inputs().model_copy(
+            update={
+                "verified_search_median_tokens": {
+                    "low": 100.0,
+                    "middle": non_finite,
+                    "high": 144.0,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "non_finite",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=("nan", "positive-infinity", "negative-infinity"),
+)
+@pytest.mark.parametrize("field", ["value", "threshold"])
+def test_gate_components_reject_non_finite_numeric_telemetry(
+    field: str,
+    non_finite: float,
+):
+    payload = {
+        "name": "telemetry",
+        "passed": False,
+        "value": {"nested_rate": 0.5},
+        "comparison": ">=",
+        "threshold": {"nested_rate": 0.9},
+    }
+    payload[field] = {"nested_rate": non_finite}
+
+    with pytest.raises(ValidationError, match="finite"):
+        GateComponent(**payload)
+    with pytest.raises(ValidationError, match="finite"):
+        GateComponent.model_construct(**payload)
+
+
+def test_finite_failed_telemetry_still_emits_an_operational_gate_artifact():
+    artifact = evaluate_operational_gates(
+        _passing_inputs().model_copy(
+            update={
+                "verified_search_median_tokens": {
+                    "low": 100.0,
+                    "middle": 119.0,
+                    "high": 144.0,
+                }
+            }
+        )
+    )
+
+    assert artifact.passed is False
+    assert artifact.failed_components == (
+        "verified_search_low_to_middle_token_growth",
+    )
+    growth = next(
+        component
+        for component in artifact.components
+        if component.name == "verified_search_low_to_middle_token_growth"
+    )
+    assert growth.value == pytest.approx(0.19)
+
+
 def test_complete_grid_compares_exact_cell_keys_not_only_counts():
     expected = _cell_grid()
     replacement = expected[0].model_copy(update={"repetition": 1})

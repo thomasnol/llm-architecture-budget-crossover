@@ -3,6 +3,7 @@ from __future__ import annotations
 """Non-overridable operational gates for the canonical experiment."""
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +14,8 @@ from .runner import CellKey
 
 
 def _freeze_gate_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("gate telemetry numbers must be finite")
     if isinstance(value, dict):
         return FrozenDict(
             {key: _freeze_gate_value(item) for key, item in value.items()}
@@ -119,6 +122,16 @@ class GateComponent(FrozenModel):
     numerator: int | None = None
     denominator: int | None = None
     zero_denominator_rule: str | None = None
+
+    @classmethod
+    def model_construct(
+        cls,
+        _fields_set: set[str] | None = None,
+        **values: Any,
+    ) -> GateComponent:
+        """Retain Pydantic's API without exposing its validation bypass."""
+        del _fields_set
+        return cls.model_validate(values)
 
     @field_validator("value", "threshold", mode="after")
     @classmethod

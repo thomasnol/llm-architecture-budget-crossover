@@ -199,3 +199,36 @@ Fresh verification of the fix-round tree:
 - `.venv/bin/pytest -q`: `197 passed in 3.64s`;
 - `.venv/bin/ruff check .`: `All checks passed!`;
 - `git diff --check`: exit 0 with no output.
+
+## Fix round 2: finite gate telemetry
+
+Operational gate telemetry now fails closed at its typed boundary when any float
+is NaN or positive/negative infinity. The same recursive finite-number check
+guards all nested `GateComponent.value` and `GateComponent.threshold` data, and
+`GateComponent.model_construct` routes through validation rather than exposing a
+bypass. This prevents non-finite component payloads and avoids the misleading
+artifact-summary error previously caused by `NaN != NaN` during canonical
+component recomputation.
+
+Finite telemetry that merely misses a gate remains an ordinary operational result:
+the verified-search 19% low-to-middle growth fixture emits a failed artifact with
+the named growth component rather than raising a protocol validation error.
+
+### Fix-round 2 RED/GREEN ledger
+
+| Regression | Observed RED | GREEN evidence |
+|---|---|---|
+| Non-finite verified-search medians | NaN and positive infinity were accepted; negative infinity produced only the positivity error | NaN, `+inf`, and `-inf` all raise the explicit finite-telemetry validation error at `OperationalGateInputs` construction |
+| Non-finite component values | nested NaN/`+inf`/`-inf` values validated | normal construction and `model_construct` reject all three values |
+| Non-finite component thresholds | nested NaN/`+inf`/`-inf` thresholds validated | normal construction and `model_construct` reject all three thresholds |
+| Ordinary finite gate failure | existing behavior characterization stayed green | 19% growth emits the expected failed component artifact with finite value `0.19` |
+
+### Fix-round 2 verification
+
+Fresh verification of the fix-round 2 tree:
+
+- `.venv/bin/pytest tests/test_analysis.py tests/test_calibration.py tests/test_validation.py -q`:
+  `64 passed in 2.96s`;
+- `.venv/bin/pytest -q`: `207 passed in 3.61s`;
+- `.venv/bin/ruff check .`: `All checks passed!`;
+- `git diff --check`: exit 0 with no output.
