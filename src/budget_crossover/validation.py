@@ -1,302 +1,348 @@
 from __future__ import annotations
 
-"""Case, run, and pilot-gate validation."""
+"""Non-overridable operational gates for the canonical experiment."""
 
 import json
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from pydantic import Field, model_validator
 
-from .config import ExperimentConfig
-from .dataset import case_set_profile, validate_hmda_source
-from .io import read_jsonl
-from .manifest import run_dir
-from .records import Case, FailureAttempt, Generation
-from .runner import error_path, generation_path
+from .models import FrozenModel
 
 
-def validate_cases(
-    *,
-    repo: Path,
-    config: ExperimentConfig,
-    cases: list[Case],
-) -> dict[str, Any]:
-    source = repo / "data" / "raw" / config.hmda_raw_filename
-    validate_hmda_source(source, config)
-    issues: list[str] = []
-    expected_cases = config.base_application_count * 2
-    if len(cases) != expected_cases:
-        issues.append(f"expected {expected_cases} cases, found {len(cases)}")
-    if len({case.case_id for case in cases}) != len(cases):
-        issues.append("case IDs are not unique")
-    pair_counts = Counter(case.pair_id for case in cases)
-    if any(value != 2 for value in pair_counts.values()):
-        issues.append("every source application must have exactly two counterfactual cases")
+class OperationalGateInputs(FrozenModel):
+    expected_cells: int = Field(gt=0)
+    observed_cells: int = Field(ge=0)
+    authoritative_usage_cells: int = Field(ge=0)
+    expected_paired_cells: int = Field(gt=0)
+    observed_paired_cells: int = Field(ge=0)
+    unique_paired_cells: int = Field(ge=0)
+    label_leakage_count: int = Field(ge=0)
+    budget_overrun_count: int = Field(ge=0)
+    schema_valid_cells: int = Field(ge=0)
+    matched_blocks_total: int = Field(ge=0)
+    unresolved_external_matched_blocks: int = Field(ge=0)
+    expected_mechanism_counts: dict[str, int]
+    observed_mechanism_counts: dict[str, int]
+    low_tier_cases: int = Field(ge=0)
+    low_tier_feasible_cases: int = Field(ge=0)
+    verified_search_median_tokens: dict[str, float]
+    easy_monolith_correct: int = Field(ge=0)
+    easy_monolith_total: int = Field(ge=0)
+    hard_monolith_correct: int = Field(ge=0)
+    hard_monolith_total: int = Field(ge=0)
+    checker_true_negatives: int = Field(ge=0)
+    checker_actual_negatives: int = Field(ge=0)
+    checker_true_positives: int = Field(ge=0)
+    checker_actual_positives: int = Field(ge=0)
+    correct_first_drafts_repaired: int = Field(ge=0)
+    correct_to_wrong_repairs: int = Field(ge=0)
+    checker_detected_wrong_first_drafts: int = Field(ge=0)
+    wrong_first_drafts_corrected: int = Field(ge=0)
 
-    for pair_id in pair_counts:
-        pair = [case for case in cases if case.pair_id == pair_id]
-        if len(pair) != 2:
-            continue
-        observed, counterfactual = sorted(
-            pair, key=lambda case: case.counterfactual_variant, reverse=True
+    @model_validator(mode="after")
+    def validate_counts(self) -> OperationalGateInputs:
+        bounded = (
+            (self.authoritative_usage_cells, self.observed_cells),
+            (self.unique_paired_cells, self.observed_paired_cells),
+            (self.schema_valid_cells, self.observed_cells),
+            (self.unresolved_external_matched_blocks, self.matched_blocks_total),
+            (self.low_tier_feasible_cases, self.low_tier_cases),
+            (self.easy_monolith_correct, self.easy_monolith_total),
+            (self.hard_monolith_correct, self.hard_monolith_total),
+            (self.checker_true_negatives, self.checker_actual_negatives),
+            (self.checker_true_positives, self.checker_actual_positives),
+            (self.correct_to_wrong_repairs, self.correct_first_drafts_repaired),
+            (
+                self.wrong_first_drafts_corrected,
+                self.checker_detected_wrong_first_drafts,
+            ),
         )
-        if {case.counterfactual_variant for case in pair} != {
-            "observed",
-            "counterfactual",
-        }:
-            issues.append(f"{pair_id} has invalid counterfactual variant labels")
-        if observed.gold_decision != counterfactual.gold_decision:
-            issues.append(f"{pair_id} changes the policy gold decision")
-        for name in ("application", "collateral", "credit", "quality_control"):
-            if observed.documents[name] != counterfactual.documents[name]:
-                issues.append(f"{pair_id} changes non-monitoring document {name}")
-        changed = [
-            key
-            for key in observed.protected_attributes
-            if observed.protected_attributes[key] != counterfactual.protected_attributes[key]
-        ]
-        if changed != [observed.changed_protected_attribute]:
-            issues.append(
-                f"{pair_id} should change only {observed.changed_protected_attribute}; "
-                f"changed {changed}"
-            )
+        if any(numerator > denominator for numerator, denominator in bounded):
+            raise ValueError("gate numerators cannot exceed their denominators")
+        if set(self.verified_search_median_tokens) != {"low", "middle", "high"}:
+            raise ValueError("verified-search medians require low, middle, and high tiers")
+        if any(value <= 0 for value in self.verified_search_median_tokens.values()):
+            raise ValueError("verified-search median tokens must be positive")
+        if any(value < 0 for value in self.expected_mechanism_counts.values()):
+            raise ValueError("expected mechanism counts must be nonnegative")
+        if any(value < 0 for value in self.observed_mechanism_counts.values()):
+            raise ValueError("observed mechanism counts must be nonnegative")
+        return self
 
-    for case in cases:
-        financial = "\n".join(
-            case.documents[name]
-            for name in ("application", "collateral", "credit", "quality_control")
-        ).lower()
-        if case.historical_action.lower() in financial:
-            issues.append(f"{case.case_id} leaks its historical action")
-        for name, value in case.protected_attributes.items():
-            if (
-                name != "age_band"
-                and value.lower() not in {"not reported", "joint"}
-                and value.lower() in financial
-            ):
-                issues.append(f"{case.case_id} leaks protected field {name}")
-    profile = case_set_profile(cases)
-    return {
-        "pass": not issues,
-        "issues": sorted(set(issues)),
-        "profile": profile,
-        "source_sha256": config.hmda_source_sha256,
-        "post_decision_fields_supplied_to_models": False,
-        "historical_action_used_as_gold": False,
-        "counterfactual_pairs_valid": not any(
-            "counterfactual" in issue or "changes" in issue for issue in issues
+
+class GateComponent(FrozenModel):
+    name: str
+    passed: bool
+    value: Any
+    comparison: str
+    threshold: Any
+    numerator: int | None = None
+    denominator: int | None = None
+    zero_denominator_rule: str | None = None
+
+
+class OperationalGateArtifact(FrozenModel):
+    schema_version: int = 1
+    passed: bool
+    override_allowed: bool = False
+    failed_components: tuple[str, ...]
+    inputs: OperationalGateInputs
+    components: tuple[GateComponent, ...]
+
+
+def evaluate_operational_gates(
+    inputs: OperationalGateInputs,
+    *,
+    output_path: Path | None = None,
+) -> OperationalGateArtifact:
+    """Evaluate every preregistered component without an override path."""
+    medians = inputs.verified_search_median_tokens
+    observed_rate_denominator = inputs.observed_cells or 1
+
+    def rate(numerator: int, denominator: int) -> float:
+        return numerator / denominator if denominator else 0.0
+
+    components = (
+        GateComponent(
+            name="complete_grid",
+            passed=inputs.observed_cells == inputs.expected_cells,
+            value=inputs.observed_cells,
+            comparison="==",
+            threshold=inputs.expected_cells,
+            numerator=inputs.observed_cells,
+            denominator=inputs.expected_cells,
         ),
-    }
-
-
-def _pilot_gate_path(repo: Path, config: ExperimentConfig) -> Path:
-    return (
-        repo
-        / "experiments"
-        / "runs"
-        / config.pilot_experiment_name
-        / "analysis"
-        / "tables"
-        / "system_summary.csv"
+        GateComponent(
+            name="unique_paired_cells",
+            passed=(
+                inputs.observed_paired_cells == inputs.expected_paired_cells
+                and inputs.unique_paired_cells == inputs.observed_paired_cells
+            ),
+            value=inputs.unique_paired_cells,
+            comparison="==",
+            threshold=inputs.expected_paired_cells,
+            numerator=inputs.unique_paired_cells,
+            denominator=inputs.expected_paired_cells,
+        ),
+        GateComponent(
+            name="authoritative_usage",
+            passed=(
+                inputs.observed_cells > 0
+                and inputs.authoritative_usage_cells == inputs.observed_cells
+            ),
+            value=inputs.authoritative_usage_cells / observed_rate_denominator,
+            comparison="==",
+            threshold=1.0,
+            numerator=inputs.authoritative_usage_cells,
+            denominator=inputs.observed_cells,
+        ),
+        GateComponent(
+            name="label_leakage",
+            passed=inputs.label_leakage_count == 0,
+            value=inputs.label_leakage_count,
+            comparison="==",
+            threshold=0,
+        ),
+        GateComponent(
+            name="budget_overruns",
+            passed=inputs.budget_overrun_count == 0,
+            value=inputs.budget_overrun_count,
+            comparison="==",
+            threshold=0,
+        ),
+        GateComponent(
+            name="schema_validity",
+            passed=(
+                inputs.observed_cells > 0
+                and inputs.schema_valid_cells * 100 >= inputs.observed_cells * 99
+            ),
+            value=inputs.schema_valid_cells / observed_rate_denominator,
+            comparison=">=",
+            threshold=0.99,
+            numerator=inputs.schema_valid_cells,
+            denominator=inputs.observed_cells,
+        ),
+        GateComponent(
+            name="unresolved_external_matched_blocks",
+            passed=(
+                inputs.matched_blocks_total == 0
+                or inputs.unresolved_external_matched_blocks * 100
+                <= inputs.matched_blocks_total
+            ),
+            value=(
+                inputs.unresolved_external_matched_blocks / inputs.matched_blocks_total
+                if inputs.matched_blocks_total
+                else 0.0
+            ),
+            comparison="<=",
+            threshold=0.01,
+            numerator=inputs.unresolved_external_matched_blocks,
+            denominator=inputs.matched_blocks_total,
+            zero_denominator_rule="pass_only_when_total_and_unresolved_are_zero",
+        ),
+        GateComponent(
+            name="exact_mechanism_counts",
+            passed=(
+                dict(inputs.observed_mechanism_counts)
+                == dict(inputs.expected_mechanism_counts)
+            ),
+            value=dict(inputs.observed_mechanism_counts),
+            comparison="==",
+            threshold=dict(inputs.expected_mechanism_counts),
+        ),
+        GateComponent(
+            name="low_tier_feasibility",
+            passed=(
+                inputs.low_tier_cases > 0
+                and inputs.low_tier_feasible_cases == inputs.low_tier_cases
+            ),
+            value=rate(inputs.low_tier_feasible_cases, inputs.low_tier_cases),
+            comparison="==",
+            threshold=1.0,
+            numerator=inputs.low_tier_feasible_cases,
+            denominator=inputs.low_tier_cases,
+        ),
+        GateComponent(
+            name="verified_search_low_to_middle_token_growth",
+            passed=medians["middle"] >= medians["low"] * 1.20,
+            value=medians["middle"] / medians["low"] - 1.0,
+            comparison=">=",
+            threshold=0.20,
+        ),
+        GateComponent(
+            name="verified_search_middle_to_high_token_growth",
+            passed=medians["high"] >= medians["middle"] * 1.20,
+            value=medians["high"] / medians["middle"] - 1.0,
+            comparison=">=",
+            threshold=0.20,
+        ),
+        GateComponent(
+            name="easy_monolith_accuracy",
+            passed=(
+                inputs.easy_monolith_total > 0
+                and inputs.easy_monolith_correct * 100
+                >= inputs.easy_monolith_total * 90
+            ),
+            value=rate(inputs.easy_monolith_correct, inputs.easy_monolith_total),
+            comparison=">=",
+            threshold=0.90,
+            numerator=inputs.easy_monolith_correct,
+            denominator=inputs.easy_monolith_total,
+        ),
+        GateComponent(
+            name="hard_monolith_accuracy_lower",
+            passed=(
+                inputs.hard_monolith_total > 0
+                and inputs.hard_monolith_correct * 100
+                >= inputs.hard_monolith_total * 30
+            ),
+            value=rate(inputs.hard_monolith_correct, inputs.hard_monolith_total),
+            comparison=">=",
+            threshold=0.30,
+            numerator=inputs.hard_monolith_correct,
+            denominator=inputs.hard_monolith_total,
+        ),
+        GateComponent(
+            name="hard_monolith_accuracy_upper",
+            passed=(
+                inputs.hard_monolith_total > 0
+                and inputs.hard_monolith_correct * 100
+                <= inputs.hard_monolith_total * 85
+            ),
+            value=rate(inputs.hard_monolith_correct, inputs.hard_monolith_total),
+            comparison="<=",
+            threshold=0.85,
+            numerator=inputs.hard_monolith_correct,
+            denominator=inputs.hard_monolith_total,
+        ),
+        GateComponent(
+            name="checker_specificity",
+            passed=(
+                inputs.checker_actual_negatives > 0
+                and inputs.checker_true_negatives * 100
+                >= inputs.checker_actual_negatives * 95
+            ),
+            value=rate(inputs.checker_true_negatives, inputs.checker_actual_negatives),
+            comparison=">=",
+            threshold=0.95,
+            numerator=inputs.checker_true_negatives,
+            denominator=inputs.checker_actual_negatives,
+        ),
+        GateComponent(
+            name="checker_sensitivity",
+            passed=(
+                inputs.checker_actual_positives > 0
+                and inputs.checker_true_positives * 100
+                >= inputs.checker_actual_positives * 60
+            ),
+            value=rate(inputs.checker_true_positives, inputs.checker_actual_positives),
+            comparison=">=",
+            threshold=0.60,
+            numerator=inputs.checker_true_positives,
+            denominator=inputs.checker_actual_positives,
+        ),
+        GateComponent(
+            name="correct_to_wrong_repair",
+            passed=(
+                inputs.correct_first_drafts_repaired > 0
+                and inputs.correct_to_wrong_repairs * 100
+                <= inputs.correct_first_drafts_repaired * 5
+            ),
+            value=rate(
+                inputs.correct_to_wrong_repairs,
+                inputs.correct_first_drafts_repaired,
+            ),
+            comparison="<=",
+            threshold=0.05,
+            numerator=inputs.correct_to_wrong_repairs,
+            denominator=inputs.correct_first_drafts_repaired,
+        ),
+        GateComponent(
+            name="wrong_first_draft_correction",
+            passed=(
+                inputs.checker_detected_wrong_first_drafts > 0
+                and inputs.wrong_first_drafts_corrected * 100
+                >= inputs.checker_detected_wrong_first_drafts * 20
+            ),
+            value=rate(
+                inputs.wrong_first_drafts_corrected,
+                inputs.checker_detected_wrong_first_drafts,
+            ),
+            comparison=">=",
+            threshold=0.20,
+            numerator=inputs.wrong_first_drafts_corrected,
+            denominator=inputs.checker_detected_wrong_first_drafts,
+        ),
     )
-
-
-def _pilot_validation_path(repo: Path, config: ExperimentConfig) -> Path:
-    return repo / "experiments" / "runs" / config.pilot_experiment_name / "validation.json"
-
-
-def pilot_gate_status(repo: Path, config: ExperimentConfig) -> dict[str, Any]:
-    path = _pilot_gate_path(repo, config)
-    if not path.exists():
-        return {"pass": False, "issues": [f"pilot summary is missing: {path}"]}
-    summary = pd.read_csv(path)
-    high = summary[summary["token_budget"] == max(config.token_budgets)]
-    issues: list[str] = []
-    validation_path = _pilot_validation_path(repo, config)
-    if not validation_path.exists():
-        issues.append(f"pilot validation is missing: {validation_path}")
-    else:
-        validation = json.loads(validation_path.read_text())
-        if not validation.get("pass"):
-            issues.append("pilot validation did not pass")
-        if validation.get("requirements", {}).get("require_generations") is not True:
-            issues.append("pilot validation did not require the full generation grid")
-    if set(high["system"]) != set(config.systems):
-        issues.append("pilot high-budget system grid is incomplete")
-    if (
-        not high.empty
-        and high["schema_validity"].min() < config.minimum_high_budget_schema_validity
-    ):
-        issues.append("pilot high-budget schema validity is below threshold")
-    if (
-        not summary.empty
-        and summary["budget_overrun_rate"].max() > config.maximum_budget_overrun_rate
-    ):
-        issues.append("pilot token-budget overrun rate is above threshold")
-    if (
-        not summary.empty
-        and summary.groupby("token_budget")["decision_accuracy"].nunique().max() < 2
-    ):
-        issues.append("pilot shows no accuracy disagreement across architectures")
-    return {"pass": not issues, "issues": issues}
-
-
-def assert_pilot_gate(repo: Path, config: ExperimentConfig) -> None:
-    status = pilot_gate_status(repo, config)
-    if not status["pass"]:
-        raise RuntimeError("pilot gate failed: " + "; ".join(status["issues"]))
-
-
-def generation_grid_status(
-    cases: list[Case],
-    generations: list[Generation],
-    config: ExperimentConfig,
-) -> dict[str, int | bool]:
-    expected = {
-        (case.case_id, system, budget, repetition)
-        for case in cases
-        for system in config.systems
-        for budget in config.token_budgets
-        for repetition in range(config.repetitions)
-    }
-    observed = [(row.case_id, row.system, row.token_budget, row.repetition) for row in generations]
-    missing = len(expected - set(observed))
-    extra = len(set(observed) - expected)
-    duplicates = len(observed) - len(set(observed))
-    return {
-        "expected": len(expected),
-        "observed": len(observed),
-        "missing": missing,
-        "extra": extra,
-        "duplicates": duplicates,
-        "complete": not (missing or extra or duplicates),
-    }
-
-
-def validate_run(
-    *,
-    repo: Path,
-    config: ExperimentConfig,
-    cases: list[Case],
-    require_generations: bool = True,
-    require_pilot_gate: bool = True,
-) -> dict[str, Any]:
-    case_validation = validate_cases(repo=repo, config=config, cases=cases)
-    issues = list(case_validation["issues"])
-    generations = read_jsonl(generation_path(repo, config), Generation)
-    error_attempts = read_jsonl(error_path(repo, config), FailureAttempt)
-    grid = generation_grid_status(cases, generations, config)
-    if require_generations:
-        if grid["missing"] or grid["extra"]:
-            issues.append(
-                f"generation grid mismatch: {grid['missing']} missing, {grid['extra']} extra"
-            )
-        if grid["duplicates"]:
-            issues.append(f"generation grid contains {grid['duplicates']} duplicate cells")
-        preflight_path = run_dir(repo, config) / "preflight.json"
-        if config.require_preflight and config.execution_mode == "gateway":
-            if not preflight_path.exists():
-                issues.append("passing gateway preflight report is missing")
-            else:
-                preflight = json.loads(preflight_path.read_text())
-                if not preflight.get("pass"):
-                    issues.append("gateway preflight did not pass")
-        errors = sum(row.status == "error" for row in generations)
-        if errors:
-            issues.append(f"generation grid contains {errors} execution errors")
-        invalid_statuses = sorted(
-            {row.status for row in generations if row.status not in {"ok", "budget_exhausted"}}
+    failed_components = tuple(
+        component.name for component in components if not component.passed
+    )
+    artifact = OperationalGateArtifact(
+        passed=not failed_components,
+        failed_components=failed_components,
+        inputs=inputs,
+        components=components,
+    )
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(artifact.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
-        if invalid_statuses:
-            issues.append(f"generation grid contains invalid statuses: {invalid_statuses}")
-        missing_usage_calls = 0
-        inconsistent_usage_calls = 0
-        accounting_mismatches = 0
-        empty_successes = 0
-        for row in generations:
-            if row.status == "ok" and not row.calls:
-                empty_successes += 1
-            observed_total = 0
-            complete_usage = True
-            for call in row.calls:
-                usage = call.response.usage
-                if (
-                    usage.prompt_tokens is None
-                    or usage.completion_tokens is None
-                    or usage.total_tokens is None
-                ):
-                    missing_usage_calls += 1
-                    complete_usage = False
-                    continue
-                if usage.total_tokens < (usage.prompt_tokens + usage.completion_tokens):
-                    inconsistent_usage_calls += 1
-                observed_total += usage.total_tokens
-            if complete_usage and row.calls:
-                accounted = row.diagnostics.get("accounted_tokens")
-                if accounted is None or int(accounted) != observed_total:
-                    accounting_mismatches += 1
-        if empty_successes:
-            issues.append(f"{empty_successes} successful cells contain no API calls")
-        if missing_usage_calls:
-            issues.append(f"{missing_usage_calls} API calls are missing gateway usage fields")
-        if inconsistent_usage_calls:
-            issues.append(
-                f"{inconsistent_usage_calls} API calls report total tokens below "
-                "prompt plus completion tokens"
-            )
-        if accounting_mismatches:
-            issues.append(
-                f"{accounting_mismatches} cells disagree with the authoritative "
-                "gateway token totals"
-            )
-        overruns = sum(
-            bool(row.diagnostics.get("budget_overrun", False))
-            or (row.total_tokens is not None and row.total_tokens > row.token_budget)
-            for row in generations
-        )
-        overrun_rate = overruns / len(generations) if generations else 1.0
-        if overrun_rate > config.maximum_budget_overrun_rate:
-            issues.append(
-                f"budget overrun rate {overrun_rate:.3f} exceeds "
-                f"{config.maximum_budget_overrun_rate:.3f}"
-            )
-    else:
-        overrun_rate = None
-        missing_usage_calls = None
-        inconsistent_usage_calls = None
-        accounting_mismatches = None
-        empty_successes = None
-    pilot_status = {"pass": True, "issues": []}
-    if require_pilot_gate and config.experiment_name != config.pilot_experiment_name:
-        pilot_status = pilot_gate_status(repo, config)
-        if not pilot_status["pass"]:
-            issues.extend(f"pilot: {issue}" for issue in pilot_status["issues"])
-    result = {
-        "pass": not issues,
-        "issues": sorted(set(issues)),
-        "requirements": {
-            "require_generations": require_generations,
-            "require_pilot_gate": require_pilot_gate,
-        },
-        "case_validation": case_validation,
-        "generation_cells_expected": grid["expected"],
-        "generation_cells_observed": grid["observed"],
-        "generation_grid": grid,
-        "error_attempts_observed": len(error_attempts),
-        "retryable_error_attempts_observed": sum(attempt.retryable for attempt in error_attempts),
-        "permanent_error_attempts_observed": sum(
-            not attempt.retryable for attempt in error_attempts
-        ),
-        "missing_usage_calls": missing_usage_calls,
-        "inconsistent_usage_calls": inconsistent_usage_calls,
-        "token_accounting_mismatches": accounting_mismatches,
-        "successful_cells_without_calls": empty_successes,
-        "budget_overrun_rate": overrun_rate,
-        "pilot_gate": pilot_status,
-    }
-    output = run_dir(repo, config) / "validation.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2, sort_keys=True))
-    return result
+    return artifact
+
+
+# Import-only bridges for the Task 5 CLI rebuild. They fail closed rather than
+# applying removed domain-specific validation semantics.
+def validate_cases(*_args: object, **_kwargs: object) -> dict[str, object]:
+    raise RuntimeError("the legacy case validator was removed; migrate to canonical artifacts")
+
+
+def validate_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+    raise RuntimeError("the legacy run validator was removed; migrate to operational gates")
+
+
+def assert_pilot_gate(*_args: object, **_kwargs: object) -> None:
+    raise RuntimeError("the legacy pilot gate was removed; migrate to the gate artifact")

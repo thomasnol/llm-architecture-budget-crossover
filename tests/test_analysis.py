@@ -1,456 +1,366 @@
-from pathlib import Path
+from decimal import Decimal
 
-"""Tests for canonical experiment analysis."""
-
-import pandas as pd
 import pytest
 
 from budget_crossover.analysis import (
-    _crossover_estimates,
-    _estimated_cost,
-    _frontier,
-    _paired_comparisons,
+    MaskedPilotDiscordance,
+    MatchedBlock,
+    PairedCaseOutcome,
+    SystemCaseMetric,
     analyze_run,
+    cluster_bootstrap_crossover,
+    confirm_crossover,
+    exact_mcnemar_power,
+    exact_mcnemar_test,
+    holm_adjust,
+    minimum_paired_sample_size,
+    pareto_dominance_probabilities,
+    score_itt_results,
+    size_internal_pilot,
 )
-from budget_crossover.config import ExperimentConfig
-from budget_crossover.io import write_jsonl
-from budget_crossover.manifest import ensure_manifest
-from budget_crossover.models import CallRecord, GatewayResponse, Usage
-from budget_crossover.records import Case, Generation
-from budget_crossover.runner import generation_path
+from budget_crossover.models import (
+    AnswerSpec,
+    Candidate,
+    CellResult,
+    HiddenLabel,
+    MechanismTrace,
+    PublicCase,
+)
 
 
-def _call(model: str = "gpt-5.4-mini") -> CallRecord:
-    return CallRecord(
-        stage="final",
-        token_cap=256,
-        response=GatewayResponse(
-            text="",
-            model=model,
-            usage=Usage(
-                prompt_tokens=100,
-                completion_tokens=20,
-                total_tokens=120,
-            ),
-            latency_seconds=0.1,
-            credential_slot=1,
+def test_exact_one_sided_mcnemar_uses_the_conditional_binomial_tail():
+    low = exact_mcnemar_test(improved=0, regressed=6, alternative="less")
+    high = exact_mcnemar_test(improved=6, regressed=0, alternative="greater")
+    tie = exact_mcnemar_test(improved=0, regressed=0, alternative="greater")
+
+    assert low.p_value == pytest.approx(0.015625)
+    assert low.reject is True
+    assert high.p_value == pytest.approx(0.015625)
+    assert high.reject is True
+    assert tie.p_value == 1.0
+    assert tie.reject is False
+    assert high.convention == "conditional_binomial_discordant_pairs"
+
+
+def test_exact_mcnemar_power_integrates_over_random_discordant_counts():
+    # With q=.05 and a five-point alternative, every discordant pair favors the
+    # alternative. At N=5 rejection occurs only when all five pairs discord,
+    # hence power = .05**5 = 0.0000003125.
+    power = exact_mcnemar_power(
+        independent_pairs=5,
+        discordance_rate=0.05,
+        alternative_difference=0.05,
+    )
+
+    assert power == pytest.approx(0.0000003125, rel=1e-12)
+
+
+def test_exact_sample_size_lookup_returns_the_first_n_reaching_ninety_percent():
+    sizing = minimum_paired_sample_size(discordance_rate=0.05)
+
+    assert sizing.required_n == 158
+    assert sizing.achieved_power == pytest.approx(0.9004240718552209)
+    assert sizing.previous_power == pytest.approx(0.8974508517633653)
+    assert sizing.target_power == 0.90
+
+
+@pytest.mark.parametrize(
+    ("discordant", "required_n", "hard_n", "easy_n", "stop"),
+    [
+        (25, 886, 900, 100, False),
+        (26, 921, 921, 79, False),
+        (30, 1060, None, None, True),
+    ],
+)
+def test_blinded_internal_pilot_allocates_or_stops_without_unblinding(
+    discordant: int,
+    required_n: int,
+    hard_n: int | None,
+    easy_n: int | None,
+    stop: bool,
+):
+    masked = MaskedPilotDiscordance(
+        independent_documents=100,
+        low_discordant=discordant,
+        high_discordant=discordant,
+        repetitions=5,
+    )
+
+    result = size_internal_pilot(masked)
+
+    assert result.required_hard_n == required_n
+    assert result.allocated_hard_n == hard_n
+    assert result.allocated_easy_n == easy_n
+    assert result.underpowered_stop is stop
+    assert result.architecture_identity_available is False
+    assert result.discordance_direction_available is False
+    assert result.unblinded is False
+    assert result.independent_n_used == 100
+    assert result.repetitions_increase_n is False
+
+
+def _public(case_id: str, document_id: str) -> PublicCase:
+    return PublicCase(
+        case_id=case_id,
+        dataset="finqa",
+        document_id=document_id,
+        question="What is the value?",
+        evidence=(),
+        stratum="headroom",
+    )
+
+
+def _label(case_id: str) -> HiddenLabel:
+    return HiddenLabel(
+        case_id=case_id,
+        answer=AnswerSpec(value=Decimal(10), unit=None, entity=None, period=None),
+        gold_derivation="10",
+        gold_support_ids=(),
+        source_lineage=("snapshot", "doc", case_id),
+    )
+
+
+def _cell(
+    case_id: str,
+    system: str,
+    repetition: int,
+    *,
+    value: str | None,
+) -> CellResult:
+    return CellResult(
+        case_id=case_id,
+        system=system,
+        tier="low",
+        repetition=repetition,
+        status=("ok" if value is not None else "architecture_failure"),
+        candidate=(
+            Candidate(
+                value=value,
+                unit=None,
+                entity=None,
+                period=None,
+                expression=None,
+                citations=(),
+            )
+            if value is not None
+            else None
+        ),
+        trace=MechanismTrace(
+            exit_reason=("completed" if value is not None else "architecture_error")
         ),
     )
 
 
-def _case(pair: int, variant: str) -> Case:
-    protected = "White" if variant == "observed" else "Black or African American"
-    return Case(
-        case_id=f"pair-{pair}-{variant}",
-        pair_id=f"pair-{pair}",
-        counterfactual_variant=variant,
-        source_row_id=str(pair),
-        state="DC",
-        historical_action="originated",
-        policy_decision="approve",
-        policy_reason_codes=["meets_policy"],
-        documents={
-            "application": "income",
-            "collateral": "ltv",
-            "credit": "dti",
-            "quality_control": "complete",
-            "compliance_monitoring": f"race {protected}",
-        },
-        protected_attributes={
-            "race": protected,
-            "sex": "Female",
-            "ethnicity": "Not Hispanic or Latino",
-            "age_band": "35-44",
-        },
-        changed_protected_attribute="race",
-        complexity="routine",
+def test_itt_exact_scoring_excludes_whole_unresolved_external_blocks_and_not_repetitions():
+    cases = (
+        _public("kept", "doc-kept"),
+        _public("external-a", "doc-a"),
+        _public("external-b", "doc-b"),
+    )
+    labels = tuple(_label(case.case_id) for case in cases)
+    results = tuple(
+        _cell(case.case_id, system, repetition, value=("10" if system == "verified_search" else None))
+        for case in cases
+        for repetition in range(2)
+        for system in ("monolith", "verified_search")
+    )
+    blocks = (
+        MatchedBlock(
+            block_id="external-block",
+            case_ids=("external-a", "external-b"),
+            external=True,
+            resolved=False,
+        ),
     )
 
+    scored = score_itt_results(cases, labels, results, matched_blocks=blocks)
 
-def test_analysis_clusters_counterfactual_twins(tmp_path: Path):
-    config = ExperimentConfig(
-        experiment_name="mock",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        repetitions=2,
-        bootstrap_replicates=100,
-        model_prices_per_million={
-            "gpt-5.4-mini": {"input": 1.0, "output": 2.0},
-        },
-    )
-    cases = [
-        _case(pair, variant) for pair in range(4) for variant in ("observed", "counterfactual")
-    ]
-    generations = []
-    for case_index, case in enumerate(cases):
-        for system in config.systems:
-            for repetition in range(config.repetitions):
-                correct = system == "adaptive" or case_index % 2 == 0
-                decision = "approve" if correct else "deny"
-                reasons = ["meets_policy"] if correct else ["excessive_dti"]
-                generations.append(
-                    Generation(
-                        run_id=f"{case.case_id}-{system}-{repetition}",
-                        case_id=case.case_id,
-                        pair_id=case.pair_id,
-                        counterfactual_variant=case.counterfactual_variant,
-                        system=system,
-                        token_budget=2048,
-                        repetition=repetition,
-                        model=config.generator_model,
-                        supervisor_model=config.supervisor_model,
-                        parsed_decision={
-                            "decision": decision,
-                            "reason_codes": reasons,
-                        },
-                        calls=[_call()],
-                        wall_time_seconds=0.1,
-                    )
-                )
-    ensure_manifest(tmp_path, config, cases)
-    write_jsonl(generation_path(tmp_path, config), generations)
-    report = analyze_run(repo=tmp_path, config=config, cases=cases)
-    assert report["observed_generations"] == 32
-    assert report["unique_generation_cells"] == 32
-    tables = tmp_path / "experiments" / "runs" / "mock" / "analysis" / "tables"
-    summary = pd.read_csv(tables / "system_summary.csv")
-    adaptive = summary[summary["system"] == "adaptive"].iloc[0]
-    assert adaptive["decision_accuracy"] == 1
-    assert adaptive["source_applications"] == 4
-    assert adaptive["pair_repetitions"] == 8
-    comparisons = pd.read_csv(tables / "paired_comparisons.csv")
-    assert comparisons.iloc[0]["paired_applications"] == 4
-    figures = tmp_path / "experiments" / "runs" / "mock" / "analysis" / "figures"
-    assert (figures / "cost_vs_accuracy.pdf").exists()
-
-
-def test_analysis_rejects_incomplete_grid_unless_diagnostic_is_explicit(
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="incomplete",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-    )
-    cases = [_case(0, "observed"), _case(0, "counterfactual")]
-    one_generation = Generation(
-        run_id="only-one",
-        case_id=cases[0].case_id,
-        pair_id=cases[0].pair_id,
-        counterfactual_variant=cases[0].counterfactual_variant,
-        system="monolith",
-        token_budget=2048,
-        model=config.generator_model,
-        parsed_decision={
-            "decision": "approve",
-            "reason_codes": ["meets_policy"],
-        },
-        calls=[_call()],
-    )
-    ensure_manifest(tmp_path, config, cases)
-    write_jsonl(generation_path(tmp_path, config), [one_generation])
-
-    with pytest.raises(RuntimeError, match="incomplete generation grid"):
-        analyze_run(repo=tmp_path, config=config, cases=cases)
-
-    report = analyze_run(
-        repo=tmp_path,
-        config=config,
-        cases=cases,
-        diagnostic=True,
-    )
-    assert report["diagnostic"] is True
-    assert report["incomplete"] is True
-    assert report["generation_completion_rate"] == 0.25
-
-
-def test_coverage_itt_accuracy_and_counterfactual_flip_rate_are_explicit(
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="estimands",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-    )
-    cases = [_case(0, "observed"), _case(0, "counterfactual")]
-    generations = []
-    for system, decisions in {
-        "monolith": ["approve", "deny"],
-        "adaptive": ["approve", "approve"],
-    }.items():
-        for case, decision in zip(cases, decisions, strict=True):
-            generations.append(
-                Generation(
-                    run_id=f"{case.case_id}-{system}",
-                    case_id=case.case_id,
-                    pair_id=case.pair_id,
-                    counterfactual_variant=case.counterfactual_variant,
-                    system=system,
-                    token_budget=2048,
-                    model=config.generator_model,
-                    parsed_decision={
-                        "decision": decision,
-                        "reason_codes": (
-                            ["meets_policy"] if decision == "approve" else ["excessive_dti"]
-                        ),
-                    },
-                    calls=[_call()],
-                )
-            )
-    ensure_manifest(tmp_path, config, cases)
-    write_jsonl(generation_path(tmp_path, config), generations)
-
-    analyze_run(repo=tmp_path, config=config, cases=cases)
-    summary = pd.read_csv(
-        tmp_path
-        / "experiments"
-        / "runs"
-        / "estimands"
-        / "analysis"
-        / "tables"
-        / "system_summary.csv"
-    ).set_index("system")
-
-    assert summary.loc["monolith", "coverage_rate"] == 1
-    assert summary.loc["monolith", "intention_to_treat_accuracy"] == 0.5
-    assert summary.loc["monolith", "conditional_decision_accuracy"] == 0.5
-    assert summary.loc["monolith", "counterfactual_flip_rate"] == 1
-    assert summary.loc["adaptive", "intention_to_treat_accuracy"] == 1
-    assert summary.loc["adaptive", "counterfactual_flip_rate"] == 0
-    flip_slice = pd.read_csv(
-        tmp_path
-        / "experiments"
-        / "runs"
-        / "estimands"
-        / "analysis"
-        / "tables"
-        / "counterfactual_flip_by_attribute.csv"
-    ).set_index("system")
-    assert flip_slice.loc["monolith", "changed_protected_attribute"] == "race"
-    assert flip_slice.loc["monolith", "source_applications"] == 1
-    assert flip_slice.loc["monolith", "pair_repetitions"] == 1
-    assert flip_slice.loc["monolith", "counterfactual_flip_rate"] == 1
-    assert flip_slice.loc["adaptive", "counterfactual_flip_rate"] == 0
-
-
-def test_crossover_estimate_bootstraps_at_source_application_level():
-    config = ExperimentConfig(
-        experiment_name="crossover",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-    )
-    rows = []
-    for pair in range(4):
-        for budget in config.token_budgets:
-            rows.extend(
-                [
-                    {
-                        "pair_id": f"pair-{pair}",
-                        "system": "monolith",
-                        "token_budget": budget,
-                        "both_decisions_correct": 1,
-                    },
-                    {
-                        "pair_id": f"pair-{pair}",
-                        "system": "adaptive",
-                        "token_budget": budget,
-                        "both_decisions_correct": int(budget == 4096),
-                    },
-                ]
-            )
-
-    crossover = _crossover_estimates(pd.DataFrame(rows), config=config)
-
-    assert crossover.iloc[0]["system"] == "adaptive"
-    assert crossover.iloc[0]["crossover_detected"]
-    assert crossover.iloc[0]["crossover_budget"] == 4096
-    assert crossover.iloc[0]["crossover_ci_low"] == 4096
-    assert crossover.iloc[0]["crossover_ci_high"] == 4096
-
-
-def test_identical_curves_do_not_create_a_spurious_crossover():
-    config = ExperimentConfig(
-        experiment_name="no-crossover",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-    )
-    rows = [
-        {
-            "pair_id": f"pair-{pair}",
-            "system": system,
-            "token_budget": budget,
-            "both_decisions_correct": 1,
-        }
-        for pair in range(4)
-        for budget in config.token_budgets
-        for system in config.systems
-    ]
-
-    crossover = _crossover_estimates(pd.DataFrame(rows), config=config)
-
-    assert not crossover.iloc[0]["crossover_detected"]
-    assert pd.isna(crossover.iloc[0]["crossover_budget"])
-    assert crossover.iloc[0]["bootstrap_crossover_support_rate"] == 0
-
-
-def test_mcnemar_requires_success_in_every_repetition():
-    config = ExperimentConfig(
-        experiment_name="repeated-pairs",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        repetitions=2,
-        bootstrap_replicates=100,
-    )
-    pair_frame = pd.DataFrame(
-        [
-            {
-                "pair_id": "pair-0",
-                "system": system,
-                "token_budget": 2048,
-                "both_decisions_correct": value,
-            }
-            for system, values in {
-                "monolith": [0, 0],
-                "adaptive": [1, 0],
-            }.items()
-            for value in values
-        ]
-    )
-
-    comparison = _paired_comparisons(pair_frame, config=config)
-
-    assert comparison.iloc[0]["accuracy_difference_vs_baseline"] == 0.5
-    assert comparison.iloc[0]["improved_applications"] == 0
-    assert comparison.iloc[0]["mcnemar_success_rule"] == "all_repetitions_both_twins_correct"
-
-
-def test_estimated_cost_requires_prices_for_every_call():
-    config = ExperimentConfig(
-        experiment_name="cost",
-        hmda_source_sha256="0" * 64,
-        model_prices_per_million={
-            "gpt-5.4-mini": {"input": 1.0, "output": 2.0},
-        },
-    )
-    generation = Generation(
-        run_id="mixed-model",
-        case_id="case",
-        pair_id="pair",
-        counterfactual_variant="observed",
-        system="selective_supervisor",
-        token_budget=4096,
-        model=config.generator_model,
-        calls=[
-            _call("gpt-5.4-mini"),
-            _call("claude-sonnet-4-6"),
-        ],
-    )
-
-    assert _estimated_cost(generation, config) is None
-
-    config.model_prices_per_million["claude-sonnet-4-6"] = {
-        "input": 3.0,
-        "output": 4.0,
+    assert scored.excluded_case_ids == ("external-a", "external-b")
+    assert scored.excluded_matched_blocks == ("external-block",)
+    assert scored.independent_documents == 1
+    assert scored.scored_cells == 4
+    assert scored.primary_cells == 2
+    assert scored.repetitions_increase_n is False
+    kept = {(row.system, row.repetition): row.correct for row in scored.outcomes}
+    assert kept == {
+        ("monolith", 0): False,
+        ("monolith", 1): False,
+        ("verified_search", 0): True,
+        ("verified_search", 1): True,
     }
-    assert _estimated_cost(generation, config) == pytest.approx(0.00052)
 
 
-def test_pareto_table_reports_token_and_optional_cost_frontiers():
-    summary = pd.DataFrame(
-        [
-            {
-                "token_budget": 4096,
-                "system": "monolith",
-                "system_label": "Monolith",
-                "decision_accuracy": 0.8,
-                "mean_total_tokens": 1000,
-                "mean_estimated_cost_usd": 0.01,
-            },
-            {
-                "token_budget": 4096,
-                "system": "adaptive",
-                "system_label": "Adaptive",
-                "decision_accuracy": 0.9,
-                "mean_total_tokens": 900,
-                "mean_estimated_cost_usd": 0.02,
-            },
-        ]
-    )
-
-    frontier = _frontier(summary).set_index("system")
-
-    assert not frontier.loc["monolith", "pareto_efficient_token_within_budget"]
-    assert frontier.loc["adaptive", "pareto_efficient_token_within_budget"]
-    assert frontier.loc["monolith", "pareto_efficient_cost_within_budget"]
-    assert frontier.loc["adaptive", "pareto_efficient_cost_within_budget"]
-
-
-def test_resource_abstention_is_not_misclassified_as_counterfactual_flip(
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="abstention-flip",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-    )
-    cases = [_case(0, "observed"), _case(0, "counterfactual")]
-    generations = []
-    for case in cases:
-        generations.extend(
+def _endpoint_fixture(*, low_pattern: str) -> tuple[PairedCaseOutcome, ...]:
+    rows = []
+    for index in range(6):
+        low = (
+            (True, False)
+            if low_pattern == "verified_worse"
+            else (True, True)
+        )
+        rows.extend(
             [
-                Generation(
-                    run_id=f"{case.case_id}-monolith",
-                    case_id=case.case_id,
-                    pair_id=case.pair_id,
-                    counterfactual_variant=case.counterfactual_variant,
-                    system="monolith",
-                    token_budget=2048,
-                    model=config.generator_model,
-                    status="budget_exhausted",
+                PairedCaseOutcome(
+                    document_id=f"doc-{index}",
+                    tier="low",
+                    monolith_correct=low[0],
+                    verified_search_correct=low[1],
                 ),
-                Generation(
-                    run_id=f"{case.case_id}-adaptive",
-                    case_id=case.case_id,
-                    pair_id=case.pair_id,
-                    counterfactual_variant=case.counterfactual_variant,
-                    system="adaptive",
-                    token_budget=2048,
-                    model=config.generator_model,
-                    parsed_decision={
-                        "decision": "approve",
-                        "reason_codes": ["meets_policy"],
-                    },
-                    calls=[_call()],
+                PairedCaseOutcome(
+                    document_id=f"doc-{index}",
+                    tier="high",
+                    monolith_correct=False,
+                    verified_search_correct=True,
                 ),
             ]
         )
-    ensure_manifest(tmp_path, config, cases)
-    write_jsonl(generation_path(tmp_path, config), generations)
+    return tuple(rows)
 
-    analyze_run(repo=tmp_path, config=config, cases=cases)
-    summary = pd.read_csv(
-        tmp_path
-        / "experiments"
-        / "runs"
-        / "abstention-flip"
-        / "analysis"
-        / "tables"
-        / "system_summary.csv"
-    ).set_index("system")
 
-    assert summary.loc["monolith", "counterfactual_pair_decision_coverage"] == 0
-    assert pd.isna(summary.loc["monolith", "counterfactual_flip_rate"])
-    assert summary.loc["adaptive", "counterfactual_pair_decision_coverage"] == 1
-    assert summary.loc["adaptive", "counterfactual_flip_rate"] == 0
+def test_primary_confirmation_requires_both_directional_exact_endpoint_tests():
+    confirmed = confirm_crossover(
+        _endpoint_fixture(low_pattern="verified_worse"),
+        bootstrap_replicates=200,
+        seed=17,
+    )
+    threshold = confirm_crossover(
+        _endpoint_fixture(low_pattern="equal"),
+        bootstrap_replicates=200,
+        seed=17,
+    )
+
+    assert confirmed.label == "strict_crossover_confirmed"
+    assert confirmed.confirmed is True
+    assert confirmed.endpoint_reversal is True
+    assert confirmed.low.difference == -1.0
+    assert confirmed.low.exact.p_value == pytest.approx(0.015625)
+    assert confirmed.low.one_sided_bound == -1.0
+    assert confirmed.high.difference == 1.0
+    assert confirmed.high.exact.p_value == pytest.approx(0.015625)
+    assert confirmed.high.two_sided_interval == (1.0, 1.0)
+    assert confirmed.low.sesoi_interpretation == "five_point_margin_supported"
+    assert confirmed.sesoi_is_design_alternative_not_automatic_margin is True
+
+    assert threshold.label == "threshold_benefit_only"
+    assert threshold.confirmed is False
+    assert threshold.endpoint_reversal is False
+    assert threshold.low.difference == 0.0
+    assert threshold.low.exact.reject is False
+    assert threshold.high.exact.reject is True
+
+
+def test_five_point_design_alternative_is_not_automatically_a_proven_margin():
+    outcomes = tuple(
+        PairedCaseOutcome(
+            document_id=f"doc-{index}",
+            tier=tier,
+            monolith_correct=(tier == "low" or index >= 2),
+            verified_search_correct=(tier == "high"),
+        )
+        for index in range(20)
+        for tier in ("low", "high")
+    )
+
+    result = confirm_crossover(outcomes, bootstrap_replicates=1000, seed=23)
+
+    assert result.high.difference == pytest.approx(0.10)
+    assert result.high.one_sided_bound < 0.05
+    assert (
+        result.high.sesoi_interpretation
+        == "point_meets_five_point_sesoi_margin_not_proven"
+    )
+    assert result.sesoi_is_design_alternative_not_automatic_margin is True
+
+
+def test_cluster_bootstrap_retains_non_crossing_mass_and_equality_never_crosses():
+    mixed = tuple(
+        PairedCaseOutcome(
+            document_id=document_id,
+            tier=tier,
+            monolith_correct=monolith,
+            verified_search_correct=verified,
+        )
+        for document_id, pattern in {
+            "crossing": {
+                "low": (True, False),
+                "middle": (True, False),
+                "high": (False, True),
+            },
+            "tied": {
+                "low": (True, True),
+                "middle": (True, True),
+                "high": (True, True),
+            },
+        }.items()
+        for tier, (monolith, verified) in pattern.items()
+    )
+
+    bootstrap = cluster_bootstrap_crossover(
+        mixed,
+        tier_values={"low": 4096, "middle": 12288, "high": 32768},
+        bootstrap_replicates=100,
+        seed=7,
+    )
+    equality = cluster_bootstrap_crossover(
+        tuple(row for row in mixed if row.document_id == "tied"),
+        tier_values={"low": 4096, "middle": 12288, "high": 32768},
+        bootstrap_replicates=20,
+        seed=7,
+    )
+
+    assert bootstrap.endpoint_reversal is True
+    assert bootstrap.transition_estimated is True
+    assert bootstrap.transition_value == 22528.0
+    assert bootstrap.crossing_replicates + bootstrap.non_crossing_replicates == 100
+    assert bootstrap.non_crossing_replicates > 0
+    assert bootstrap.crossing_support < 1.0
+    assert bootstrap.conditional_crossing_interval == (22528.0, 22528.0)
+    assert bootstrap.confidence_set.includes_no_crossing is True
+
+    assert equality.endpoint_reversal is False
+    assert equality.transition_estimated is False
+    assert equality.transition_value is None
+    assert equality.crossing_support == 0.0
+    assert equality.non_crossing_replicates == 20
+    assert equality.conditional_crossing_interval is None
+    assert equality.confidence_set.includes_no_crossing is True
+
+
+def test_exploratory_family_uses_holm_adjustment():
+    adjusted = holm_adjust({"a": 0.01, "b": 0.03, "c": 0.04})
+
+    assert adjusted.method == "holm"
+    assert adjusted.adjusted_p_values == pytest.approx(
+        {"a": 0.03, "b": 0.06, "c": 0.06}
+    )
+
+
+def test_pareto_dominance_claims_are_separate_for_each_realized_resource():
+    metrics = tuple(
+        SystemCaseMetric(
+            document_id=f"doc-{document}",
+            system=system,
+            tier="high",
+            correct=(system == "verified_search"),
+            realized_tokens=(80 if system == "verified_search" else 100),
+            realized_cost=(2.0 if system == "verified_search" else 1.0),
+            realized_latency=(0.8 if system == "verified_search" else 1.0),
+        )
+        for document in range(2)
+        for system in ("monolith", "verified_search")
+    )
+
+    analysis = pareto_dominance_probabilities(metrics, bootstrap_replicates=50, seed=11)
+    verified = {
+        row.resource: row.dominance_probability
+        for row in analysis.comparisons
+        if row.candidate == "verified_search" and row.comparator == "monolith"
+    }
+
+    assert analysis.claims_are_resource_specific is True
+    assert verified == {"tokens": 1.0, "cost": 0.0, "latency": 1.0}
+
+
+def test_legacy_analysis_bridge_fails_closed_with_a_migration_error():
+    with pytest.raises(RuntimeError, match="legacy analyze workflow was removed"):
+        analyze_run()

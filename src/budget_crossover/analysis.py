@@ -1,881 +1,755 @@
 from __future__ import annotations
 
-"""Statistical analysis and artifact generation."""
+"""Exact paired inference and joint case-cluster resampling."""
 
-import json
-import math
-from pathlib import Path
-from typing import Any
+from collections.abc import Mapping, Sequence
+from functools import lru_cache
+from typing import Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
-from scipy.stats import binomtest
+from pydantic import Field, model_validator
+from scipy.stats import binom
 
-from .config import ExperimentConfig
-from .dataset import case_set_profile
-from .io import read_jsonl
-from .manifest import ensure_manifest, record_phase, run_dir
-from .policy import canonical_decision
-from .records import Case, Generation
-from .runner import generation_path
+from .models import CellResult, FrozenModel, HiddenLabel, PublicCase, SystemName, TierName
+from .scoring import score_candidate
 
-SYSTEM_LABELS = {
-    "monolith": "Monolithic full-context",
-    "retrieval": "Plan-and-retrieve",
-    "committee": "Specialist committee",
-    "guardrail": "Underwriter + compliance guardrail",
-    "adaptive": "Adaptive guarded routing",
-    "always_primary": "Always-primary monolith",
-    "always_supervisor": "Always-supervisor monolith",
-    "selective_supervisor": "Selective supervisor routing",
-}
+Alternative = Literal["less", "greater"]
 
 
-def _json_native(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_native(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_native(item) for item in value]
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
+class McNemarResult(FrozenModel):
+    improved: int
+    regressed: int
+    discordant: int
+    alternative: Alternative
+    alpha: float
+    p_value: float
+    reject: bool
+    convention: str = "conditional_binomial_discordant_pairs"
 
 
-def _bootstrap_mean(
-    values: np.ndarray,
+class SampleSizeResult(FrozenModel):
+    discordance_rate: float
+    alternative_difference: float
+    alpha: float
+    target_power: float
+    required_n: int
+    achieved_power: float
+    previous_power: float
+
+
+class MaskedPilotDiscordance(FrozenModel):
+    """Direction-free low/high discordance exposed by the internal pilot."""
+
+    independent_documents: int = Field(gt=0)
+    low_discordant: int = Field(ge=0)
+    high_discordant: int = Field(ge=0)
+    repetitions: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_masked_counts(self) -> MaskedPilotDiscordance:
+        if max(self.low_discordant, self.high_discordant) > self.independent_documents:
+            raise ValueError("discordant counts cannot exceed independent documents")
+        if min(self.low_discordant, self.high_discordant) * 20 < self.independent_documents:
+            raise ValueError("five-point design requires discordance rates of at least .05")
+        return self
+
+
+class PilotSizingResult(FrozenModel):
+    blinded: bool = True
+    architecture_identity_available: bool = False
+    discordance_direction_available: bool = False
+    unblinded: bool = False
+    independent_unit: str = "case_or_document"
+    independent_n_used: int
+    repetitions_observed: int
+    repetitions_increase_n: bool = False
+    low_discordance_rate: float
+    high_discordance_rate: float
+    low_component: SampleSizeResult
+    high_component: SampleSizeResult
+    required_hard_n: int
+    allocated_hard_n: int | None
+    allocated_easy_n: int | None
+    allocated_total_n: int | None
+    underpowered_stop: bool
+    stop_reason: str | None
+
+
+class MatchedBlock(FrozenModel):
+    block_id: str
+    case_ids: tuple[str, ...]
+    external: bool
+    resolved: bool
+
+    @model_validator(mode="after")
+    def validate_cases(self) -> MatchedBlock:
+        if not self.case_ids or len(set(self.case_ids)) != len(self.case_ids):
+            raise ValueError("matched-block case IDs must be nonempty and unique")
+        return self
+
+
+class ITTOutcome(FrozenModel):
+    case_id: str
+    document_id: str
+    system: SystemName
+    tier: TierName
+    repetition: int
+    primary: bool
+    correct: bool
+    status: str
+
+
+class ITTScoringResult(FrozenModel):
+    independent_unit: str = "document_or_case"
+    independent_documents: int
+    scored_cells: int
+    primary_cells: int
+    repetitions_increase_n: bool = False
+    excluded_case_ids: tuple[str, ...]
+    excluded_matched_blocks: tuple[str, ...]
+    outcomes: tuple[ITTOutcome, ...]
+
+
+class PairedCaseOutcome(FrozenModel):
+    document_id: str
+    tier: TierName
+    monolith_correct: bool
+    verified_search_correct: bool
+
+
+class EndpointEffect(FrozenModel):
+    tier: Literal["low", "high"]
+    independent_documents: int
+    difference: float
+    improved: int
+    regressed: int
+    exact: McNemarResult
+    one_sided_bound: float
+    one_sided_bound_type: Literal["upper", "lower"]
+    two_sided_interval: tuple[float, float]
+    sesoi: float
+    sesoi_interpretation: str
+
+
+class CrossoverConfirmation(FrozenModel):
+    alpha: float
+    sesoi: float
+    low: EndpointEffect
+    high: EndpointEffect
+    endpoint_reversal: bool
+    confirmed: bool
+    label: str
+    sesoi_is_design_alternative_not_automatic_margin: bool = True
+
+
+class CrossoverConfidenceSet(FrozenModel):
+    conditional_numeric_interval: tuple[float, float] | None
+    includes_no_crossing: bool
+
+
+class CrossoverBootstrapResult(FrozenModel):
+    bootstrap_unit: str = "document_or_case"
+    bootstrap_replicates: int
+    observed_differences: dict[str, float]
+    endpoint_reversal: bool
+    transition_estimated: bool
+    transition_value: float | None
+    crossing_replicates: int
+    non_crossing_replicates: int
+    crossing_support: float
+    conditional_crossing_interval: tuple[float, float] | None
+    confidence_set: CrossoverConfidenceSet
+
+
+class HolmAdjustment(FrozenModel):
+    method: str = "holm"
+    adjusted_p_values: dict[str, float]
+
+
+class SystemCaseMetric(FrozenModel):
+    document_id: str
+    system: SystemName
+    tier: TierName
+    correct: bool
+    realized_tokens: float = Field(ge=0)
+    realized_cost: float | None = Field(default=None, ge=0)
+    realized_latency: float | None = Field(default=None, ge=0)
+
+
+class ParetoComparison(FrozenModel):
+    tier: TierName
+    candidate: SystemName
+    comparator: SystemName
+    resource: Literal["tokens", "cost", "latency"]
+    dominance_probability: float | None
+    bootstrap_replicates: int
+
+
+class ParetoAnalysis(FrozenModel):
+    bootstrap_unit: str = "document_or_case"
+    claims_are_resource_specific: bool = True
+    comparisons: tuple[ParetoComparison, ...]
+
+
+def exact_mcnemar_test(
     *,
-    rng: np.random.Generator,
-    replicates: int,
-) -> tuple[float, float]:
-    if not len(values):
-        return math.nan, math.nan
-    indexes = rng.integers(0, len(values), size=(replicates, len(values)))
-    means = values[indexes].mean(axis=1)
-    return tuple(np.quantile(means, [0.025, 0.975]).tolist())
+    improved: int,
+    regressed: int,
+    alternative: Alternative,
+    alpha: float = 0.05,
+) -> McNemarResult:
+    """Conditional exact McNemar test on the paired discordant counts.
+
+    ``improved`` counts comparison-correct/baseline-wrong pairs. The ``less``
+    alternative therefore uses the lower tail of that count; ``greater`` uses
+    the upper tail. Concordant pairs condition out of the exact test.
+    """
+    if type(improved) is not int or type(regressed) is not int:
+        raise TypeError("discordant counts must be integers")
+    if improved < 0 or regressed < 0:
+        raise ValueError("discordant counts must be nonnegative")
+    if alternative not in {"less", "greater"}:
+        raise ValueError("alternative must be 'less' or 'greater'")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    discordant = improved + regressed
+    if discordant == 0:
+        p_value = 1.0
+    elif alternative == "greater":
+        p_value = float(binom.sf(improved - 1, discordant, 0.5))
+    else:
+        p_value = float(binom.cdf(improved, discordant, 0.5))
+    return McNemarResult(
+        improved=improved,
+        regressed=regressed,
+        discordant=discordant,
+        alternative=alternative,
+        alpha=alpha,
+        p_value=p_value,
+        reject=p_value <= alpha,
+    )
 
 
-def _estimated_cost(generation: Generation, config: ExperimentConfig) -> float | None:
-    if not generation.calls:
-        return None
-    total = 0.0
-    for call in generation.calls:
-        model = call.response.model
-        price = config.model_prices_per_million.get(model)
-        if price is None:
-            candidates = [
-                value
-                for key, value in config.model_prices_per_million.items()
-                if model.startswith(key)
-            ]
-            price = candidates[0] if len(candidates) == 1 else None
-        prompt = call.response.usage.prompt_tokens
-        completion = call.response.usage.completion_tokens
-        if price is None or prompt is None or completion is None:
-            return None
-        total += (prompt * float(price["input"]) + completion * float(price["output"])) / 1_000_000
-    return total
-
-
-def build_frame(
+def exact_mcnemar_power(
     *,
-    cases: list[Case],
-    generations: list[Generation],
-    config: ExperimentConfig,
-) -> pd.DataFrame:
-    case_map = {case.case_id: case for case in cases}
-    rows: list[dict[str, Any]] = []
-    for generation in generations:
-        case = case_map.get(generation.case_id)
-        if case is None:
+    independent_pairs: int,
+    discordance_rate: float,
+    alternative_difference: float = 0.05,
+    alpha: float = 0.05,
+) -> float:
+    """Power of either directional component under a symmetric alternative.
+
+    The total discordant count is Binomial(N, q). Conditional on that count,
+    the favorable discordant count is Binomial(D, (q + delta) / (2q)).
+    """
+    if type(independent_pairs) is not int or independent_pairs < 1:
+        raise ValueError("independent_pairs must be a positive integer")
+    if not 0 < alternative_difference <= discordance_rate <= 1:
+        raise ValueError("discordance_rate must be in [alternative_difference, 1]")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    discordant = np.arange(independent_pairs + 1)
+    favorable_probability = (
+        discordance_rate + alternative_difference
+    ) / (2 * discordance_rate)
+    critical = np.asarray(binom.isf(alpha, discordant, 0.5), dtype=int) + 1
+    discordant_mass = binom.pmf(discordant, independent_pairs, discordance_rate)
+    conditional_rejection = binom.sf(
+        critical - 1,
+        discordant,
+        favorable_probability,
+    )
+    return float(np.dot(discordant_mass, conditional_rejection))
+
+
+@lru_cache(maxsize=256)
+def minimum_paired_sample_size(
+    *,
+    discordance_rate: float,
+    alternative_difference: float = 0.05,
+    alpha: float = 0.05,
+    target_power: float = 0.90,
+    max_n: int = 10_000,
+) -> SampleSizeResult:
+    """Find the first independent-pair count with target component power."""
+    if not 0 < target_power < 1:
+        raise ValueError("target_power must be between zero and one")
+    if type(max_n) is not int or max_n < 1:
+        raise ValueError("max_n must be a positive integer")
+    previous_power = 0.0
+    for independent_pairs in range(1, max_n + 1):
+        power = exact_mcnemar_power(
+            independent_pairs=independent_pairs,
+            discordance_rate=discordance_rate,
+            alternative_difference=alternative_difference,
+            alpha=alpha,
+        )
+        if power >= target_power:
+            return SampleSizeResult(
+                discordance_rate=discordance_rate,
+                alternative_difference=alternative_difference,
+                alpha=alpha,
+                target_power=target_power,
+                required_n=independent_pairs,
+                achieved_power=power,
+                previous_power=previous_power,
+            )
+        previous_power = power
+    raise RuntimeError(f"target power was not reached by max_n={max_n}")
+
+
+def size_internal_pilot(masked: MaskedPilotDiscordance) -> PilotSizingResult:
+    """Size the main study without exposing architecture identity or direction."""
+    low_rate = masked.low_discordant / masked.independent_documents
+    high_rate = masked.high_discordant / masked.independent_documents
+    low_component = minimum_paired_sample_size(discordance_rate=low_rate)
+    high_component = minimum_paired_sample_size(discordance_rate=high_rate)
+    required_hard_n = max(low_component.required_n, high_component.required_n)
+    if required_hard_n <= 900:
+        hard_n: int | None = 900
+        easy_n: int | None = 100
+    elif required_hard_n <= 1000:
+        hard_n = required_hard_n
+        easy_n = 1000 - required_hard_n
+    else:
+        hard_n = None
+        easy_n = None
+    underpowered_stop = required_hard_n > 1000
+    return PilotSizingResult(
+        independent_n_used=masked.independent_documents,
+        repetitions_observed=masked.repetitions,
+        low_discordance_rate=low_rate,
+        high_discordance_rate=high_rate,
+        low_component=low_component,
+        high_component=high_component,
+        required_hard_n=required_hard_n,
+        allocated_hard_n=hard_n,
+        allocated_easy_n=easy_n,
+        allocated_total_n=(
+            hard_n + easy_n
+            if hard_n is not None and easy_n is not None
+            else None
+        ),
+        underpowered_stop=underpowered_stop,
+        stop_reason=("required_hard_n_exceeds_1000" if underpowered_stop else None),
+    )
+
+
+def score_itt_results(
+    cases: Sequence[PublicCase],
+    labels: Sequence[HiddenLabel],
+    results: Sequence[CellResult],
+    *,
+    matched_blocks: Sequence[MatchedBlock] = (),
+) -> ITTScoringResult:
+    """Score every retained cell exactly; architecture failures are incorrect."""
+    case_by_id = {case.case_id: case for case in cases}
+    label_by_id = {label.case_id: label for label in labels}
+    if len(case_by_id) != len(cases):
+        raise ValueError("public case IDs must be unique")
+    if len(label_by_id) != len(labels) or set(label_by_id) != set(case_by_id):
+        raise ValueError("hidden labels must join one-to-one with public cases")
+    block_case_ids = [case_id for block in matched_blocks for case_id in block.case_ids]
+    if len(block_case_ids) != len(set(block_case_ids)):
+        raise ValueError("a case cannot belong to more than one matched block")
+    if not set(block_case_ids) <= set(case_by_id):
+        raise ValueError("matched blocks contain unknown case IDs")
+    excluded_blocks = tuple(
+        sorted(block.block_id for block in matched_blocks if block.external and not block.resolved)
+    )
+    excluded_cases = tuple(
+        sorted(
+            case_id
+            for block in matched_blocks
+            if block.external and not block.resolved
+            for case_id in block.case_ids
+        )
+    )
+    excluded_set = set(excluded_cases)
+    observed_keys: set[tuple[str, str, str, int]] = set()
+    outcomes: list[ITTOutcome] = []
+    for result in results:
+        if result.case_id not in case_by_id:
+            raise ValueError(f"result contains unknown case ID: {result.case_id}")
+        key = (result.case_id, result.system, result.tier, result.repetition)
+        if key in observed_keys:
+            raise ValueError("result cells must be unique before ITT scoring")
+        observed_keys.add(key)
+        if result.case_id in excluded_set:
             continue
-        candidate = canonical_decision(generation.parsed_decision)
-        gold = canonical_decision(case.gold_decision)
-        decision_correct = (
-            candidate is not None and gold is not None and candidate["decision"] == gold["decision"]
+        correct = (
+            result.status == "ok"
+            and result.candidate is not None
+            and score_candidate(result.candidate, label_by_id[result.case_id].answer).correct
         )
-        policy_complete = candidate == gold
-        action_analogue = (
-            "originated"
-            if candidate is not None and candidate["decision"] == "approve"
-            else (
-                "denied"
-                if candidate is not None and candidate["decision"] == "deny"
-                else "nonfinal_review"
+        outcomes.append(
+            ITTOutcome(
+                case_id=result.case_id,
+                document_id=case_by_id[result.case_id].document_id,
+                system=result.system,
+                tier=result.tier,
+                repetition=result.repetition,
+                primary=result.repetition == 0,
+                correct=correct,
+                status=result.status,
             )
         )
-        actual_total = generation.total_tokens
-        overrun = bool(generation.diagnostics.get("budget_overrun", False))
-        rows.append(
-            {
-                "run_id": generation.run_id,
-                "case_id": case.case_id,
-                "pair_id": case.pair_id,
-                "counterfactual_variant": case.counterfactual_variant,
-                "state": case.state,
-                "historical_action": case.historical_action,
-                "policy_decision": case.policy_decision,
-                "complexity": case.complexity,
-                "changed_protected_attribute": case.changed_protected_attribute,
-                "system": generation.system,
-                "system_label": SYSTEM_LABELS[generation.system],
-                "generator_model": generation.model,
-                "supervisor_model": generation.supervisor_model,
-                "models_used": json.dumps(
-                    sorted({call.response.model for call in generation.calls})
-                ),
-                "credential_slots_used": json.dumps(
-                    sorted(
-                        {
-                            call.response.credential_slot
-                            for call in generation.calls
-                            if call.response.credential_slot is not None
-                        }
-                    )
-                ),
-                "token_budget": generation.token_budget,
-                "repetition": generation.repetition,
-                "status": generation.status,
-                "schema_valid": int(candidate is not None),
-                "decision_correct": int(decision_correct),
-                "policy_complete": int(policy_complete),
-                "candidate_decision": (candidate["decision"] if candidate is not None else None),
-                "historical_action_analogue": action_analogue,
-                "historical_action_concordant": int(action_analogue == case.historical_action),
-                "candidate_policy_json": (
-                    json.dumps(candidate, sort_keys=True) if candidate is not None else None
-                ),
-                "gold_policy_json": json.dumps(gold, sort_keys=True),
-                "prompt_tokens": generation.prompt_tokens,
-                "completion_tokens": generation.completion_tokens,
-                "total_tokens": actual_total,
-                "call_count": len(generation.calls),
-                "wall_time_seconds": generation.wall_time_seconds,
-                "summed_api_latency_seconds": (generation.summed_api_latency_seconds),
-                "budget_exhausted": generation.status == "budget_exhausted",
-                "budget_overrun": overrun,
-                "budget_compliant": (
-                    not overrun
-                    and actual_total is not None
-                    and actual_total <= generation.token_budget
-                ),
-                "escalated": bool(generation.diagnostics.get("escalated", False)),
-                "confidence": generation.confidence,
-                "estimated_cost_usd": _estimated_cost(generation, config),
-            }
-        )
-    return pd.DataFrame(rows)
+    included_documents = {
+        case.document_id for case in cases if case.case_id not in excluded_set
+    }
+    return ITTScoringResult(
+        independent_documents=len(included_documents),
+        scored_cells=len(outcomes),
+        primary_cells=sum(outcome.primary for outcome in outcomes),
+        excluded_case_ids=excluded_cases,
+        excluded_matched_blocks=excluded_blocks,
+        outcomes=tuple(outcomes),
+    )
 
 
-def _pair_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for (pair_id, system, budget, repetition), group in frame.groupby(
-        ["pair_id", "system", "token_budget", "repetition"]
-    ):
-        observed = group[group["counterfactual_variant"] == "observed"]
-        decisions = group["candidate_policy_json"].dropna().tolist()
-        candidate_labels = group["candidate_decision"].dropna().tolist()
-        complete_pair = len(group) == 2
-        decisions_available = complete_pair and len(candidate_labels) == 2
-        policies_available = complete_pair and len(decisions) == 2
-        rows.append(
-            {
-                "pair_id": pair_id,
-                "system": system,
-                "system_label": SYSTEM_LABELS[system],
-                "token_budget": budget,
-                "repetition": repetition,
-                "complete_pair": complete_pair,
-                "pair_decision_accuracy": group["decision_correct"].mean(),
-                "pair_policy_accuracy": group["policy_complete"].mean(),
-                "both_decisions_correct": (
-                    int(complete_pair and group["decision_correct"].eq(1).all())
-                ),
-                "both_policies_complete": (
-                    int(complete_pair and group["policy_complete"].eq(1).all())
-                ),
-                "both_decisions_available": int(decisions_available),
-                "both_policies_available": int(policies_available),
-                "counterfactual_decision_consistent": (
-                    int(len(set(candidate_labels)) == 1) if decisions_available else math.nan
-                ),
-                "counterfactual_decision_flip": (
-                    int(len(set(candidate_labels)) > 1) if decisions_available else math.nan
-                ),
-                "counterfactual_policy_consistent": (
-                    int(len(set(decisions)) == 1) if policies_available else math.nan
-                ),
-                "historical_action": (
-                    observed.iloc[0]["historical_action"]
-                    if len(observed)
-                    else group.iloc[0]["historical_action"]
-                ),
-                "policy_decision": group.iloc[0]["policy_decision"],
-                "complexity": group.iloc[0]["complexity"],
-                "state": group.iloc[0]["state"],
-                "changed_protected_attribute": group.iloc[0]["changed_protected_attribute"],
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _flip_by_attribute(pair_frame: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for (system, budget, attribute), group in pair_frame.groupby(
-        ["system", "token_budget", "changed_protected_attribute"]
-    ):
-        available = group.dropna(subset=["counterfactual_decision_flip"])
-        rows.append(
-            {
-                "system": system,
-                "system_label": SYSTEM_LABELS[system],
-                "token_budget": budget,
-                "changed_protected_attribute": attribute,
-                "source_applications": group["pair_id"].nunique(),
-                "pair_repetitions": len(group),
-                "available_source_applications": available["pair_id"].nunique(),
-                "available_pair_repetitions": len(available),
-                "counterfactual_decision_flips": int(
-                    available["counterfactual_decision_flip"].sum()
-                ),
-                "counterfactual_flip_rate": (
-                    float(available["counterfactual_decision_flip"].mean())
-                    if len(available)
-                    else math.nan
-                ),
-            }
-        )
-    return pd.DataFrame(rows).sort_values(["token_budget", "system", "changed_protected_attribute"])
-
-
-def _summary(
-    frame: pd.DataFrame,
-    pair_frame: pd.DataFrame,
+def _sesoi_interpretation(
     *,
-    config: ExperimentConfig,
-    case_count: int,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(config.seed)
-    rows: list[dict[str, Any]] = []
-    expected_cells = case_count * config.repetitions
-    for system in config.systems:
-        for budget in config.token_budgets:
-            group = frame[(frame["system"] == system) & (frame["token_budget"] == budget)]
-            pairs = pair_frame[
-                (pair_frame["system"] == system) & (pair_frame["token_budget"] == budget)
+    difference: float,
+    one_sided_bound: float,
+    direction: Alternative,
+    direction_rejected: bool,
+    sesoi: float,
+) -> str:
+    margin_supported = (
+        one_sided_bound >= sesoi
+        if direction == "greater"
+        else one_sided_bound <= -sesoi
+    )
+    point_meets = difference >= sesoi if direction == "greater" else difference <= -sesoi
+    if margin_supported:
+        return "five_point_margin_supported"
+    if point_meets:
+        return "point_meets_five_point_sesoi_margin_not_proven"
+    if direction_rejected:
+        return "direction_supported_below_five_point_sesoi"
+    return "direction_not_established"
+
+
+def confirm_crossover(
+    outcomes: Sequence[PairedCaseOutcome],
+    *,
+    alpha: float = 0.05,
+    sesoi: float = 0.05,
+    bootstrap_replicates: int = 5000,
+    seed: int = 20260803,
+) -> CrossoverConfirmation:
+    """Apply the prespecified intersection-union endpoint confirmation."""
+    if type(bootstrap_replicates) is not int or bootstrap_replicates < 1:
+        raise ValueError("bootstrap_replicates must be a positive integer")
+    if not 0 < sesoi < 1:
+        raise ValueError("sesoi must be between zero and one")
+    keyed: dict[tuple[str, str], PairedCaseOutcome] = {}
+    for outcome in outcomes:
+        if outcome.tier not in {"low", "high"}:
+            continue
+        key = (outcome.document_id, outcome.tier)
+        if key in keyed:
+            raise ValueError("primary paired outcomes must be unique by document and tier")
+        keyed[key] = outcome
+    low_ids = {document_id for document_id, tier in keyed if tier == "low"}
+    high_ids = {document_id for document_id, tier in keyed if tier == "high"}
+    if not low_ids or low_ids != high_ids:
+        raise ValueError("every independent document requires both low and high outcomes")
+    document_ids = sorted(low_ids)
+    difference_matrix = np.asarray(
+        [
+            [
+                int(keyed[(document_id, tier)].verified_search_correct)
+                - int(keyed[(document_id, tier)].monolith_correct)
+                for tier in ("low", "high")
             ]
-            pair_clusters = (
-                pairs.groupby("pair_id")["pair_decision_accuracy"].mean()
-                if not pairs.empty
-                else pd.Series(dtype=float)
-            )
-            low, high = _bootstrap_mean(
-                pair_clusters.to_numpy(float),
-                rng=rng,
-                replicates=config.bootstrap_replicates,
-            )
-            completed = group[group["status"] == "ok"]
-            completed_accuracy = (
-                completed["decision_correct"].mean() if len(completed) else math.nan
-            )
-            itt_accuracy = (
-                group["decision_correct"].sum() / expected_cells if expected_cells else math.nan
-            )
-            consistency = (
-                pairs["counterfactual_decision_consistent"].mean() if len(pairs) else math.nan
-            )
-            flip_rate = pairs["counterfactual_decision_flip"].mean() if len(pairs) else math.nan
-            rows.append(
-                {
-                    "system": system,
-                    "system_label": SYSTEM_LABELS[system],
-                    "token_budget": budget,
-                    "cases": len(group),
-                    "expected_cells": expected_cells,
-                    "coverage_rate": len(group) / expected_cells,
-                    "completed_decision_rate": len(completed) / expected_cells,
-                    "infrastructure_missing_rate": (expected_cells - len(group)) / expected_cells,
-                    "source_applications": pairs["pair_id"].nunique(),
-                    "pair_repetitions": len(pairs),
-                    "decision_accuracy": itt_accuracy,
-                    "intention_to_treat_accuracy": itt_accuracy,
-                    "conditional_decision_accuracy": completed_accuracy,
-                    "decision_accuracy_ci_low": low,
-                    "decision_accuracy_ci_high": high,
-                    "policy_complete_accuracy": (group["policy_complete"].sum() / expected_cells),
-                    "historical_action_concordance": group["historical_action_concordant"].mean(),
-                    "both_twins_decision_correct": pairs["both_decisions_correct"].mean(),
-                    "counterfactual_pair_decision_coverage": pairs[
-                        "both_decisions_available"
-                    ].mean(),
-                    "counterfactual_decision_consistency": consistency,
-                    "counterfactual_flip_rate": flip_rate,
-                    "counterfactual_policy_consistency": pairs[
-                        "counterfactual_policy_consistent"
-                    ].mean(),
-                    "schema_validity": group["schema_valid"].mean(),
-                    "resource_abstention_rate": (group["budget_exhausted"].sum() / expected_cells),
-                    "budget_exhaustion_rate": group["budget_exhausted"].mean(),
-                    "budget_overrun_rate": group["budget_overrun"].mean(),
-                    "budget_compliance_rate": group["budget_compliant"].mean(),
-                    "mean_prompt_tokens": group["prompt_tokens"].mean(),
-                    "mean_completion_tokens": group["completion_tokens"].mean(),
-                    "mean_total_tokens": group["total_tokens"].mean(),
-                    "mean_call_count": group["call_count"].mean(),
-                    "mean_wall_time_seconds": group["wall_time_seconds"].mean(),
-                    "mean_summed_api_latency_seconds": group["summed_api_latency_seconds"].mean(),
-                    "mean_estimated_cost_usd": group["estimated_cost_usd"].mean(),
-                    "escalation_rate": group["escalated"].mean(),
-                }
-            )
-    return pd.DataFrame(rows).sort_values(["token_budget", "system"])
+            for document_id in document_ids
+        ],
+        dtype=float,
+    )
+    rng = np.random.default_rng(seed)
+    indexes = rng.integers(
+        0,
+        len(document_ids),
+        size=(bootstrap_replicates, len(document_ids)),
+    )
+    bootstrap_means = difference_matrix[indexes].mean(axis=1)
 
-
-def _paired_comparisons(
-    pair_frame: pd.DataFrame,
-    *,
-    config: ExperimentConfig,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(config.seed + 1)
-    rows: list[dict[str, Any]] = []
-    baseline = "monolith" if config.study_kind == "architecture" else "always_primary"
-    for budget in config.token_budgets:
-        budget_frame = pair_frame[pair_frame["token_budget"] == budget]
-        for system in sorted(set(budget_frame["system"]) - {baseline}):
-            subset = budget_frame[budget_frame["system"].isin([baseline, system])]
-            mean_pivot = subset.pivot_table(
-                index="pair_id",
-                columns="system",
-                values="both_decisions_correct",
-                aggfunc="mean",
-            ).dropna()
-            exact_pivot = subset.pivot_table(
-                index="pair_id",
-                columns="system",
-                values="both_decisions_correct",
-                aggfunc="min",
-            ).dropna()
-            if (
-                baseline not in mean_pivot
-                or system not in mean_pivot
-                or baseline not in exact_pivot
-                or system not in exact_pivot
-            ):
-                continue
-            paired = mean_pivot[system] - mean_pivot[baseline]
-            low, high = _bootstrap_mean(
-                paired.to_numpy(float),
-                rng=rng,
-                replicates=config.bootstrap_replicates,
-            )
-            improved = int(((exact_pivot[baseline] == 0) & (exact_pivot[system] == 1)).sum())
-            regressed = int(((exact_pivot[baseline] == 1) & (exact_pivot[system] == 0)).sum())
-            discordant = improved + regressed
-            p_value = (
-                float(
-                    binomtest(
-                        min(improved, regressed),
-                        n=discordant,
-                        p=0.5,
-                        alternative="two-sided",
-                    ).pvalue
-                )
-                if discordant
-                else 1.0
-            )
-            discordance = discordant / len(exact_pivot) if len(exact_pivot) else math.nan
-            mde = (
-                math.sqrt((1.959964 + 0.841621) ** 2 * discordance / len(exact_pivot))
-                if len(exact_pivot)
-                else math.nan
-            )
-            rows.append(
-                {
-                    "token_budget": budget,
-                    "system": system,
-                    "system_label": SYSTEM_LABELS[system],
-                    "baseline": baseline,
-                    "paired_applications": len(mean_pivot),
-                    "accuracy_difference_vs_baseline": paired.mean(),
-                    "difference_ci_low": low,
-                    "difference_ci_high": high,
-                    "improved_applications": improved,
-                    "regressed_applications": regressed,
-                    "mcnemar_exact_p_value": p_value,
-                    "mcnemar_success_rule": "all_repetitions_both_twins_correct",
-                    "discordance_rate": discordance,
-                    "approx_mde_80pct": mde,
-                }
-            )
-    output = pd.DataFrame(rows)
-    if output.empty:
-        return output
-    output["mcnemar_holm_p_value"] = math.nan
-    for indexes in output.groupby("system").groups.values():
-        ordered = sorted(
-            indexes,
-            key=lambda index: float(output.loc[index, "mcnemar_exact_p_value"]),
+    endpoint_effects: dict[str, EndpointEffect] = {}
+    for column, (tier, alternative, bound_quantile, bound_type) in enumerate(
+        (
+            ("low", "less", 0.95, "upper"),
+            ("high", "greater", 0.05, "lower"),
         )
-        running = 0.0
-        count = len(ordered)
-        for rank, index in enumerate(ordered):
-            adjusted = min(
-                1.0,
-                (count - rank) * float(output.loc[index, "mcnemar_exact_p_value"]),
-            )
-            running = max(running, adjusted)
-            output.loc[index, "mcnemar_holm_p_value"] = running
-    return output
+    ):
+        values = difference_matrix[:, column]
+        improved = int(np.count_nonzero(values == 1))
+        regressed = int(np.count_nonzero(values == -1))
+        exact = exact_mcnemar_test(
+            improved=improved,
+            regressed=regressed,
+            alternative=alternative,
+            alpha=alpha,
+        )
+        two_sided_interval = tuple(
+            float(value)
+            for value in np.quantile(bootstrap_means[:, column], [0.025, 0.975])
+        )
+        one_sided_bound = float(
+            np.quantile(bootstrap_means[:, column], bound_quantile)
+        )
+        difference = float(values.mean())
+        endpoint_effects[tier] = EndpointEffect(
+            tier=tier,
+            independent_documents=len(document_ids),
+            difference=difference,
+            improved=improved,
+            regressed=regressed,
+            exact=exact,
+            one_sided_bound=one_sided_bound,
+            one_sided_bound_type=bound_type,
+            two_sided_interval=two_sided_interval,
+            sesoi=sesoi,
+            sesoi_interpretation=_sesoi_interpretation(
+                difference=difference,
+                one_sided_bound=one_sided_bound,
+                direction=alternative,
+                direction_rejected=exact.reject,
+                sesoi=sesoi,
+            ),
+        )
+    low = endpoint_effects["low"]
+    high = endpoint_effects["high"]
+    endpoint_reversal = low.difference < 0 < high.difference
+    confirmed = endpoint_reversal and low.exact.reject and high.exact.reject
+    if confirmed:
+        label = "strict_crossover_confirmed"
+    elif high.difference > 0 and high.exact.reject:
+        label = "threshold_benefit_only"
+    elif low.difference < 0 and low.exact.reject:
+        label = "low_budget_harm_only"
+    elif endpoint_reversal:
+        label = "endpoint_reversal_not_confirmed"
+    else:
+        label = "no_directional_pattern"
+    return CrossoverConfirmation(
+        alpha=alpha,
+        sesoi=sesoi,
+        low=low,
+        high=high,
+        endpoint_reversal=endpoint_reversal,
+        confirmed=confirmed,
+        label=label,
+    )
 
 
-def _crossing_budget(
-    budgets: list[int],
-    differences: list[float],
+def _strict_transition(
+    tier_values: Sequence[float], differences: Sequence[float]
 ) -> float | None:
-    previous_budget: int | None = None
-    previous_difference: float | None = None
-    for budget, difference in zip(budgets, differences, strict=True):
-        if not math.isfinite(difference):
-            continue
-        if difference == 0:
-            if previous_difference is not None:
-                return float(budget)
-            continue
-        if (
-            previous_budget is not None
-            and previous_difference is not None
-            and previous_difference * difference < 0
-        ):
-            fraction = -previous_difference / (difference - previous_difference)
-            return float(previous_budget + fraction * (budget - previous_budget))
-        previous_budget = budget
-        previous_difference = difference
+    """Interpolate only an adjacent strict negative-to-positive transition."""
+    if not differences[0] < 0 < differences[-1]:
+        return None
+    for left_index in range(len(differences) - 1):
+        left_difference = differences[left_index]
+        right_difference = differences[left_index + 1]
+        if left_difference < 0 < right_difference:
+            fraction = -left_difference / (right_difference - left_difference)
+            return float(
+                tier_values[left_index]
+                + fraction * (tier_values[left_index + 1] - tier_values[left_index])
+            )
     return None
 
 
-def _crossover_estimates(
-    pair_frame: pd.DataFrame,
+def cluster_bootstrap_crossover(
+    outcomes: Sequence[PairedCaseOutcome],
     *,
-    config: ExperimentConfig,
-) -> pd.DataFrame:
-    baseline = "monolith" if config.study_kind == "architecture" else "always_primary"
-    aggregated = (
-        pair_frame.groupby(["pair_id", "system", "token_budget"])["both_decisions_correct"]
-        .mean()
-        .reset_index()
-    )
-    rows: list[dict[str, Any]] = []
-    rng = np.random.default_rng(config.seed + 2)
-    for system in sorted(set(aggregated["system"]) - {baseline}):
-        subset = aggregated[aggregated["system"].isin([baseline, system])]
-        pivot = subset.pivot_table(
-            index="pair_id",
-            columns=["system", "token_budget"],
-            values="both_decisions_correct",
-            aggfunc="mean",
-        )
-        budgets = [
-            budget
-            for budget in config.token_budgets
-            if (baseline, budget) in pivot.columns and (system, budget) in pivot.columns
-        ]
-        if not budgets:
-            continue
-        differences = pd.DataFrame(
-            {budget: pivot[(system, budget)] - pivot[(baseline, budget)] for budget in budgets}
-        ).dropna()
-        if differences.empty:
-            continue
-        estimate = _crossing_budget(
-            budgets,
-            differences.mean(axis=0).tolist(),
-        )
-        indexes = rng.integers(
-            0,
-            len(differences),
-            size=(config.bootstrap_replicates, len(differences)),
-        )
-        bootstrap_means = differences.to_numpy(float)[indexes].mean(axis=1)
-        bootstrap_crossings = [
-            crossing
-            for crossing in (_crossing_budget(budgets, row.tolist()) for row in bootstrap_means)
-            if crossing is not None
-        ]
-        if bootstrap_crossings:
-            low, high = np.quantile(
-                bootstrap_crossings,
-                [0.025, 0.975],
-            ).tolist()
-        else:
-            low, high = math.nan, math.nan
-        rows.append(
-            {
-                "system": system,
-                "system_label": SYSTEM_LABELS[system],
-                "baseline": baseline,
-                "paired_applications": len(differences),
-                "crossover_detected": estimate is not None,
-                "crossover_budget": estimate,
-                "crossover_ci_low": low,
-                "crossover_ci_high": high,
-                "bootstrap_crossover_support_rate": (
-                    len(bootstrap_crossings) / config.bootstrap_replicates
-                ),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _mechanisms(frame: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for (system, budget, complexity), group in frame.groupby(
-        ["system", "token_budget", "complexity"]
+    tier_values: Mapping[str, float],
+    bootstrap_replicates: int = 5000,
+    seed: int = 20260803,
+) -> CrossoverBootstrapResult:
+    """Resample documents once per replicate and carry every tier together."""
+    tier_order = ("low", "middle", "high")
+    if set(tier_values) != set(tier_order):
+        raise ValueError("tier_values must define low, middle, and high")
+    numeric_tiers = tuple(float(tier_values[tier]) for tier in tier_order)
+    if list(numeric_tiers) != sorted(set(numeric_tiers)):
+        raise ValueError("tier values must be unique and strictly increasing")
+    if type(bootstrap_replicates) is not int or bootstrap_replicates < 1:
+        raise ValueError("bootstrap_replicates must be a positive integer")
+    keyed: dict[tuple[str, str], PairedCaseOutcome] = {}
+    for outcome in outcomes:
+        key = (outcome.document_id, outcome.tier)
+        if key in keyed:
+            raise ValueError("paired outcomes must be unique by document and tier")
+        keyed[key] = outcome
+    document_ids = sorted({outcome.document_id for outcome in outcomes})
+    if not document_ids or any(
+        (document_id, tier) not in keyed
+        for document_id in document_ids
+        for tier in tier_order
     ):
-        rows.append(
-            {
-                "system": system,
-                "system_label": SYSTEM_LABELS[system],
-                "token_budget": budget,
-                "complexity": complexity,
-                "cases": len(group),
-                "decision_accuracy": group["decision_correct"].mean(),
-                "policy_complete_accuracy": group["policy_complete"].mean(),
-                "historical_action_concordance": group["historical_action_concordant"].mean(),
-                "schema_validity": group["schema_valid"].mean(),
-                "budget_exhaustion_rate": group["budget_exhausted"].mean(),
-                "mean_total_tokens": group["total_tokens"].mean(),
-                "escalation_rate": group["escalated"].mean(),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _frontier(summary: pd.DataFrame) -> pd.DataFrame:
-    def efficient(
-        group: pd.DataFrame,
-        candidate: pd.Series,
-        resource: str,
-    ) -> bool | None:
-        if pd.isna(candidate[resource]):
-            return None
-        dominated = any(
-            other["decision_accuracy"] >= candidate["decision_accuracy"]
-            and other[resource] <= candidate[resource]
-            and (
-                other["decision_accuracy"] > candidate["decision_accuracy"]
-                or other[resource] < candidate[resource]
-            )
-            for _, other in group.drop(candidate.name).iterrows()
-            if not pd.isna(other[resource])
-        )
-        return not dominated
-
-    rows: list[dict[str, Any]] = []
-    for budget, group in summary.groupby("token_budget"):
-        for _, candidate in group.iterrows():
-            token_efficient = efficient(group, candidate, "mean_total_tokens")
-            cost_efficient = efficient(
-                group,
-                candidate,
-                "mean_estimated_cost_usd",
-            )
-            rows.append(
-                {
-                    "token_budget": budget,
-                    "system": candidate["system"],
-                    "system_label": candidate["system_label"],
-                    "decision_accuracy": candidate["decision_accuracy"],
-                    "mean_total_tokens": candidate["mean_total_tokens"],
-                    "mean_estimated_cost_usd": candidate["mean_estimated_cost_usd"],
-                    "pareto_efficient_within_budget": token_efficient,
-                    "pareto_efficient_token_within_budget": token_efficient,
-                    "pareto_efficient_cost_within_budget": cost_efficient,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def _write_figures(
-    summary: pd.DataFrame,
-    output: Path,
-    *,
-    diagnostic: bool,
-) -> None:
-    sns.set_theme(style="whitegrid", context="paper")
-    output.mkdir(parents=True, exist_ok=True)
-    palette = sns.color_palette("colorblind", n_colors=summary["system"].nunique())
-    labels = list(dict.fromkeys(summary["system"]))
-    colors = dict(zip(labels, palette, strict=True))
-    markers = dict(zip(labels, ["o", "s", "^", "D", "P", "X"][: len(labels)], strict=True))
-
-    def mark(fig: plt.Figure) -> None:
-        if diagnostic:
-            fig.text(
-                0.5,
-                0.5,
-                "INCOMPLETE DIAGNOSTIC",
-                ha="center",
-                va="center",
-                fontsize=20,
-                color="crimson",
-                alpha=0.24,
-                rotation=24,
-            )
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.7))
-    for system, group in summary.groupby("system"):
-        group = group.sort_values("token_budget")
-        ax.plot(
-            group["token_budget"],
-            group["decision_accuracy"],
-            marker=markers[system],
-            label=SYSTEM_LABELS[system],
-            color=colors[system],
-        )
-        ax.fill_between(
-            group["token_budget"],
-            group["decision_accuracy_ci_low"],
-            group["decision_accuracy_ci_high"],
-            alpha=0.14,
-            color=colors[system],
-        )
-    ax.set(
-        xlabel="Nominal total-token budget",
-        ylabel="Decision accuracy",
-        ylim=(-0.02, 1.02),
-        xticks=sorted(summary["token_budget"].unique()),
-    )
-    ax.legend(
-        frameon=False,
-        fontsize=8,
-        ncol=3,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-    )
-    fig.tight_layout()
-    mark(fig)
-    fig.savefig(output / "decision_accuracy_by_budget.png", dpi=220)
-    fig.savefig(output / "decision_accuracy_by_budget.pdf")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.7))
-    for system, group in summary.groupby("system"):
-        group = group.sort_values("token_budget")
-        ax.plot(
-            group["token_budget"],
-            group["counterfactual_flip_rate"],
-            marker=markers[system],
-            label=SYSTEM_LABELS[system],
-            color=colors[system],
-        )
-    ax.set(
-        xlabel="Nominal total-token budget",
-        ylabel="Counterfactual decision flip rate (lower is better)",
-        ylim=(-0.02, 1.02),
-        xticks=sorted(summary["token_budget"].unique()),
-    )
-    ax.legend(
-        frameon=False,
-        fontsize=8,
-        ncol=3,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-    )
-    fig.tight_layout()
-    mark(fig)
-    fig.savefig(output / "counterfactual_flip_rate_by_budget.png", dpi=220)
-    fig.savefig(output / "counterfactual_flip_rate_by_budget.pdf")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.7))
-    for system, group in summary.groupby("system"):
-        ax.scatter(
-            group["mean_total_tokens"],
-            group["decision_accuracy"],
-            label=SYSTEM_LABELS[system],
-            color=colors[system],
-            marker=markers[system],
-            s=44,
-        )
-    ax.set(
-        xlabel="Mean realized total tokens",
-        ylabel="Decision accuracy",
-        ylim=(-0.02, 1.02),
-    )
-    ax.legend(
-        frameon=False,
-        fontsize=8,
-        ncol=3,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-    )
-    fig.tight_layout()
-    mark(fig)
-    fig.savefig(output / "tokens_vs_accuracy.png", dpi=220)
-    fig.savefig(output / "tokens_vs_accuracy.pdf")
-    plt.close(fig)
-
-    priced = summary.dropna(subset=["mean_estimated_cost_usd"])
-    if not priced.empty:
-        fig, ax = plt.subplots(figsize=(7.2, 4.7))
-        for system, group in priced.groupby("system"):
-            ax.scatter(
-                group["mean_estimated_cost_usd"],
-                group["decision_accuracy"],
-                label=SYSTEM_LABELS[system],
-                color=colors[system],
-                marker=markers[system],
-                s=44,
-            )
-        ax.set(
-            xlabel="Mean estimated cost (USD)",
-            ylabel="Decision accuracy",
-            ylim=(-0.02, 1.02),
-        )
-        ax.legend(
-            frameon=False,
-            fontsize=8,
-            ncol=3,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.16),
-        )
-        fig.tight_layout()
-        mark(fig)
-        fig.savefig(output / "cost_vs_accuracy.png", dpi=220)
-        fig.savefig(output / "cost_vs_accuracy.pdf")
-        plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.7))
-    for system, group in summary.groupby("system"):
-        group = group.sort_values("token_budget")
-        ax.plot(
-            group["token_budget"],
-            group["coverage_rate"],
-            marker=markers[system],
-            label=SYSTEM_LABELS[system],
-            color=colors[system],
-        )
-    ax.set(
-        xlabel="Nominal total-token budget",
-        ylabel="Scored-grid coverage",
-        ylim=(-0.02, 1.02),
-        xticks=sorted(summary["token_budget"].unique()),
-    )
-    ax.legend(
-        frameon=False,
-        fontsize=8,
-        ncol=3,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-    )
-    fig.tight_layout()
-    mark(fig)
-    fig.savefig(output / "coverage_by_budget.png", dpi=220)
-    fig.savefig(output / "coverage_by_budget.pdf")
-    plt.close(fig)
-
-
-def analyze_run(
-    *,
-    repo: Path,
-    config: ExperimentConfig,
-    cases: list[Case],
-    diagnostic: bool = False,
-) -> dict[str, Any]:
-    ensure_manifest(repo, config, cases)
-    generations = read_jsonl(generation_path(repo, config), Generation)
-    if not generations:
-        raise RuntimeError("no generations are available to analyze")
-    expected_grid = {
-        (case.case_id, system, budget, repetition)
-        for case in cases
-        for system in config.systems
-        for budget in config.token_budgets
-        for repetition in range(config.repetitions)
-    }
-    observed_grid = [
-        (row.case_id, row.system, row.token_budget, row.repetition) for row in generations
-    ]
-    missing = expected_grid - set(observed_grid)
-    extra = set(observed_grid) - expected_grid
-    duplicates = len(observed_grid) - len(set(observed_grid))
-    incomplete = bool(missing or extra or duplicates)
-    if incomplete and not diagnostic:
-        raise RuntimeError(
-            "incomplete generation grid: "
-            f"{len(missing)} missing, {len(extra)} extra, "
-            f"{duplicates} duplicates"
-        )
-    frame = build_frame(cases=cases, generations=generations, config=config)
-    pair_frame = _pair_frame(frame)
-    flip_by_attribute = _flip_by_attribute(pair_frame)
-    summary = _summary(
-        frame,
-        pair_frame,
-        config=config,
-        case_count=len(cases),
-    )
-    comparisons = _paired_comparisons(pair_frame, config=config)
-    crossovers = _crossover_estimates(pair_frame, config=config)
-    mechanisms = _mechanisms(frame)
-    frontier = _frontier(summary)
-
-    analysis_dir = run_dir(repo, config) / "analysis"
-    tables = analysis_dir / "tables"
-    figures = analysis_dir / "figures"
-    tables.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(tables / "case_results.csv", index=False)
-    pair_frame.to_csv(tables / "pair_results.csv", index=False)
-    flip_by_attribute.to_csv(
-        tables / "counterfactual_flip_by_attribute.csv",
-        index=False,
-    )
-    summary.to_csv(tables / "system_summary.csv", index=False)
-    summary[
+        raise ValueError("every document requires all three tiers")
+    matrix = np.asarray(
         [
-            "system",
-            "token_budget",
-            "expected_cells",
-            "cases",
-            "coverage_rate",
-            "completed_decision_rate",
-            "infrastructure_missing_rate",
-            "resource_abstention_rate",
-        ]
-    ].to_csv(tables / "coverage.csv", index=False)
-    comparisons.to_csv(tables / "paired_comparisons.csv", index=False)
-    crossovers.to_csv(tables / "crossover_estimates.csv", index=False)
-    mechanisms.to_csv(tables / "mechanisms.csv", index=False)
-    frontier.to_csv(tables / "pareto_frontier.csv", index=False)
-    _write_figures(summary, figures, diagnostic=diagnostic)
+            [
+                int(keyed[(document_id, tier)].verified_search_correct)
+                - int(keyed[(document_id, tier)].monolith_correct)
+                for tier in tier_order
+            ]
+            for document_id in document_ids
+        ],
+        dtype=float,
+    )
+    observed = matrix.mean(axis=0)
+    observed_transition = _strict_transition(numeric_tiers, observed)
+    rng = np.random.default_rng(seed)
+    indexes = rng.integers(
+        0,
+        len(document_ids),
+        size=(bootstrap_replicates, len(document_ids)),
+    )
+    replicate_means = matrix[indexes].mean(axis=1)
+    transitions = [
+        _strict_transition(numeric_tiers, replicate.tolist())
+        for replicate in replicate_means
+    ]
+    crossing_values = [value for value in transitions if value is not None]
+    crossing_count = len(crossing_values)
+    non_crossing_count = bootstrap_replicates - crossing_count
+    conditional_interval = (
+        tuple(
+            float(value)
+            for value in np.quantile(crossing_values, [0.025, 0.975])
+        )
+        if crossing_values
+        else None
+    )
+    return CrossoverBootstrapResult(
+        bootstrap_replicates=bootstrap_replicates,
+        observed_differences={
+            tier: float(observed[index]) for index, tier in enumerate(tier_order)
+        },
+        endpoint_reversal=bool(observed[0] < 0 < observed[-1]),
+        transition_estimated=observed_transition is not None,
+        transition_value=observed_transition,
+        crossing_replicates=crossing_count,
+        non_crossing_replicates=non_crossing_count,
+        crossing_support=crossing_count / bootstrap_replicates,
+        conditional_crossing_interval=conditional_interval,
+        confidence_set=CrossoverConfidenceSet(
+            conditional_numeric_interval=conditional_interval,
+            includes_no_crossing=non_crossing_count > 0,
+        ),
+    )
 
-    expected = len(expected_grid)
-    report = {
-        "experiment": config.experiment_name,
-        "case_profile": case_set_profile(cases),
-        "expected_generations": expected,
-        "observed_generations": len(generations),
-        "generation_completion_rate": len(generations) / expected if expected else 0,
-        "diagnostic": diagnostic,
-        "incomplete": incomplete,
-        "missing_generation_cells": len(missing),
-        "extra_generation_cells": len(extra),
-        "duplicate_generation_cells": duplicates,
-        "unique_generation_cells": int(
-            frame[["case_id", "system", "token_budget", "repetition"]].drop_duplicates().shape[0]
-        ),
-        "primary_comparison": (
-            "adaptive versus monolith within each token budget"
-            if config.study_kind == "architecture"
-            else "routing policies versus always-primary within each token budget"
-        ),
-        "primary_unit": "HMDA source application (counterfactual pair)",
-        "results_are_empirical": config.execution_mode == "gateway",
+
+def holm_adjust(p_values: Mapping[str, float]) -> HolmAdjustment:
+    """Control an exploratory family with the step-down Holm procedure."""
+    if any(not 0 <= value <= 1 for value in p_values.values()):
+        raise ValueError("p-values must be between zero and one")
+    ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    count = len(ordered)
+    for rank, (name, p_value) in enumerate(ordered):
+        running = max(running, min(1.0, (count - rank) * p_value))
+        adjusted[name] = running
+    return HolmAdjustment(adjusted_p_values=adjusted)
+
+
+def pareto_dominance_probabilities(
+    metrics: Sequence[SystemCaseMetric],
+    *,
+    bootstrap_replicates: int = 5000,
+    seed: int = 20260803,
+) -> ParetoAnalysis:
+    """Estimate pairwise accuracy-resource dominance by document bootstrap."""
+    if type(bootstrap_replicates) is not int or bootstrap_replicates < 1:
+        raise ValueError("bootstrap_replicates must be a positive integer")
+    keyed: dict[tuple[str, str, str], SystemCaseMetric] = {}
+    for metric in metrics:
+        key = (metric.document_id, metric.system, metric.tier)
+        if key in keyed:
+            raise ValueError("metrics must be unique by document, system, and tier")
+        keyed[key] = metric
+    document_ids = sorted({metric.document_id for metric in metrics})
+    combinations = sorted({(metric.tier, metric.system) for metric in metrics})
+    if not document_ids or any(
+        (document_id, system, tier) not in keyed
+        for document_id in document_ids
+        for tier, system in combinations
+    ):
+        raise ValueError("each document must carry every system and tier together")
+    rng = np.random.default_rng(seed)
+    indexes = rng.integers(
+        0,
+        len(document_ids),
+        size=(bootstrap_replicates, len(document_ids)),
+    )
+    accuracy: dict[tuple[str, str], np.ndarray] = {}
+    resources: dict[tuple[str, str, str], np.ndarray | None] = {}
+    field_by_resource = {
+        "tokens": "realized_tokens",
+        "cost": "realized_cost",
+        "latency": "realized_latency",
     }
-    report_path = analysis_dir / "analysis.json"
-    report_path.write_text(json.dumps(_json_native(report), indent=2, sort_keys=True))
-    record_phase(repo, config, phase="analysis", counters=report)
-    return report
+    for tier, system in combinations:
+        rows = [keyed[(document_id, system, tier)] for document_id in document_ids]
+        correct = np.asarray([int(row.correct) for row in rows], dtype=float)
+        accuracy[(tier, system)] = correct[indexes].mean(axis=1)
+        for resource, field in field_by_resource.items():
+            values = [getattr(row, field) for row in rows]
+            resources[(tier, system, resource)] = (
+                None
+                if any(value is None for value in values)
+                else np.asarray(values, dtype=float)[indexes].mean(axis=1)
+            )
+    comparisons: list[ParetoComparison] = []
+    tiers = sorted({tier for tier, _system in combinations})
+    for tier in tiers:
+        systems = sorted(
+            system
+            for candidate_tier, system in combinations
+            if candidate_tier == tier
+        )
+        for candidate in systems:
+            for comparator in systems:
+                if candidate == comparator:
+                    continue
+                candidate_accuracy = accuracy[(tier, candidate)]
+                comparator_accuracy = accuracy[(tier, comparator)]
+                for resource in ("tokens", "cost", "latency"):
+                    candidate_resource = resources[(tier, candidate, resource)]
+                    comparator_resource = resources[(tier, comparator, resource)]
+                    if candidate_resource is None or comparator_resource is None:
+                        probability = None
+                    else:
+                        dominates = (
+                            (candidate_accuracy >= comparator_accuracy)
+                            & (candidate_resource <= comparator_resource)
+                            & (
+                                (candidate_accuracy > comparator_accuracy)
+                                | (candidate_resource < comparator_resource)
+                            )
+                        )
+                        probability = float(dominates.mean())
+                    comparisons.append(
+                        ParetoComparison(
+                            tier=tier,
+                            candidate=candidate,
+                            comparator=comparator,
+                            resource=resource,
+                            dominance_probability=probability,
+                            bootstrap_replicates=bootstrap_replicates,
+                        )
+                    )
+    return ParetoAnalysis(comparisons=tuple(comparisons))
+
+
+# Import-only bridge for the Task 5 CLI rebuild. It fails closed so the
+# superseded analysis workflow cannot emit empirical artifacts.
+def analyze_run(*_args: object, **_kwargs: object) -> dict[str, object]:
+    raise RuntimeError(
+        "the legacy analyze workflow was removed; migrate to the canonical Task 5 workflow"
+    )
