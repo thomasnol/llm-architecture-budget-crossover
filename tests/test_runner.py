@@ -1,305 +1,266 @@
-from pathlib import Path
-
-"""Tests for canonical resumable execution."""
+from __future__ import annotations
 
 import asyncio
-import json
+from pathlib import Path
 
-from budget_crossover.config import ExperimentConfig
+import pytest
+from pydantic import ValidationError
+
 from budget_crossover.gateway import GatewayRequestError
-from budget_crossover.io import read_jsonl
-from budget_crossover.records import Case, FailureAttempt, Generation
+from budget_crossover.io import append_jsonl, read_jsonl
+from budget_crossover.models import CellResult, EvidenceItem, MechanismTrace, PublicCase
 from budget_crossover.runner import (
-    error_path,
-    execute_generation,
-    generation_path,
+    CellKey,
+    InfrastructureAttempt,
+    build_cell_grid,
+    execute_cells,
 )
 
 
-class ConfiguredFakeClient:
-    configured = True
-    maximum_total_concurrency = 1
-
-    def __init__(self, timeout_seconds: float) -> None:
-        self.timeout_seconds = timeout_seconds
-
-    async def close(self) -> None:
-        return None
-
-
-class TwoWorkerFakeClient(ConfiguredFakeClient):
-    maximum_total_concurrency = 2
-
-
-def _case() -> Case:
-    return Case(
-        case_id="case-observed",
-        pair_id="case",
-        counterfactual_variant="observed",
-        source_row_id="source",
-        state="DC",
-        historical_action="originated",
-        policy_decision="approve",
-        policy_reason_codes=["meets_policy"],
-        documents={
-            "application": "application",
-            "collateral": "collateral",
-            "credit": "credit",
-            "quality_control": "quality",
-            "compliance_monitoring": "monitoring",
-        },
-        protected_attributes={
-            "race": "White",
-            "sex": "Female",
-            "ethnicity": "Not Hispanic or Latino",
-            "age_band": "35-44",
-        },
-        changed_protected_attribute="race",
-        complexity="routine",
+def _case(case_id: str) -> PublicCase:
+    return PublicCase(
+        case_id=case_id,
+        dataset="finqa",
+        document_id=f"doc-{case_id}",
+        question="What is the value?",
+        evidence=(
+            EvidenceItem(
+                evidence_id=f"{case_id}-e1",
+                document_id=f"doc-{case_id}",
+                kind="text",
+                text="The value is 10.",
+                ordinal=0,
+            ),
+        ),
+        stratum="headroom",
     )
 
 
-async def test_retryable_errors_do_not_pollute_scored_generation_grid(
-    monkeypatch,
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="runner-test",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-        require_preflight=False,
-    )
-
-    async def fail(*args, **kwargs):
-        raise TimeoutError("transient")
-
-    monkeypatch.setattr("budget_crossover.runner.GatewayClient", ConfiguredFakeClient)
-    monkeypatch.setattr("budget_crossover.runner.run_system", fail)
-
-    report = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
-    )
-
-    assert report["failed_attempts"] == 2
-    assert read_jsonl(generation_path(tmp_path, config), Generation) == []
-    errors = read_jsonl(error_path(tmp_path, config), FailureAttempt)
-    assert len(errors) == 2
-    assert {row.retryable for row in errors} == {True}
-
-
-async def test_three_equivalent_permanent_errors_open_circuit_before_full_grid(
-    monkeypatch,
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="circuit-test",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096, 8192],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-        require_preflight=False,
-        permanent_error_threshold=3,
-    )
-
-    async def fail(*args, **kwargs):
-        raise GatewayRequestError(
-            status_code=400,
-            detail='{"error":"unsupported parameter"}',
-            model="claude-sonnet-4-6",
-            stage="compliance_audit",
-            credential_slot=1,
-            request_id="request-bad",
-            retryable=False,
-        )
-
-    monkeypatch.setattr("budget_crossover.runner.GatewayClient", ConfiguredFakeClient)
-    monkeypatch.setattr("budget_crossover.runner.run_system", fail)
-
-    report = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
-    )
-
-    assert report["circuit_open"] is True
-    assert report["launched"] == 3
-    assert report["failed_attempts"] == 3
-    assert report["remaining_cells"] == 6
-    errors = read_jsonl(error_path(tmp_path, config), FailureAttempt)
-    assert len(errors) == 3
-    assert {row.attempted_model for row in errors} == {"claude-sonnet-4-6"}
-    assert {row.stage for row in errors} == {"compliance_audit"}
-    assert {row.status_code for row in errors} == {400}
-
-    resumed = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
-    )
-    assert resumed["circuit_open"] is True
-    assert resumed["launched"] == 0
-    assert resumed["failed_attempts"] == 0
-    assert resumed["remaining_cells"] == 6
-    assert len(read_jsonl(error_path(tmp_path, config), FailureAttempt)) == 3
-
-    preflight = tmp_path / "experiments" / "runs" / config.experiment_name / "preflight.json"
-    preflight.write_text(
-        json.dumps(
-            {
-                "pass": True,
-                "created_at": "9999-01-01T00:00:00+00:00",
-                "checks": [],
-            }
-        )
-    )
-    after_corrective_preflight = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
-    )
-    assert after_corrective_preflight["launched"] == 3
-    assert after_corrective_preflight["circuit_open"] is True
-
-
-async def test_transient_failures_remain_resumable_without_opening_circuit(
-    monkeypatch,
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="transient-test",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096, 8192],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-        require_preflight=False,
-    )
-
-    async def fail(*args, **kwargs):
-        raise TimeoutError("temporary timeout")
-
-    monkeypatch.setattr("budget_crossover.runner.GatewayClient", ConfiguredFakeClient)
-    monkeypatch.setattr("budget_crossover.runner.run_system", fail)
-
-    report = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
-    )
-
-    assert report["circuit_open"] is False
-    assert report["launched"] == 6
-    assert report["failed_attempts"] == 6
-    assert report["remaining_cells"] == 6
-
-
-async def test_repetitions_are_distinct_resumable_grid_cells(
-    monkeypatch,
-    tmp_path: Path,
-):
-    config = ExperimentConfig(
-        experiment_name="repetition-test",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048],
-        systems=["monolith", "adaptive"],
+def test_cell_grid_is_immutable_and_deterministically_interleaved_within_cases():
+    grid = build_cell_grid(
+        cases=[_case("a"), _case("b")],
+        systems=("monolith", "verified_search"),
+        tiers=("low", "high"),
         repetitions=2,
-        bootstrap_replicates=100,
-        require_preflight=False,
     )
 
-    async def succeed(
-        client,
-        *,
-        case,
-        system,
-        token_budget,
-        config,
-        run_id,
-        repetition,
-    ):
-        return Generation(
-            run_id=run_id,
-            case_id=case.case_id,
-            pair_id=case.pair_id,
-            counterfactual_variant=case.counterfactual_variant,
-            system=system,
-            token_budget=token_budget,
-            repetition=repetition,
-            model=config.generator_model,
-        )
-
-    monkeypatch.setattr("budget_crossover.runner.GatewayClient", ConfiguredFakeClient)
-    monkeypatch.setattr("budget_crossover.runner.run_system", succeed)
-
-    report = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
+    assert grid == (
+        CellKey(case_id="a", system="monolith", tier="low", repetition=0),
+        CellKey(case_id="a", system="verified_search", tier="low", repetition=0),
+        CellKey(case_id="a", system="monolith", tier="high", repetition=0),
+        CellKey(case_id="a", system="verified_search", tier="high", repetition=0),
+        CellKey(case_id="a", system="monolith", tier="low", repetition=1),
+        CellKey(case_id="a", system="verified_search", tier="low", repetition=1),
+        CellKey(case_id="a", system="monolith", tier="high", repetition=1),
+        CellKey(case_id="a", system="verified_search", tier="high", repetition=1),
+        CellKey(case_id="b", system="monolith", tier="low", repetition=0),
+        CellKey(case_id="b", system="verified_search", tier="low", repetition=0),
+        CellKey(case_id="b", system="monolith", tier="high", repetition=0),
+        CellKey(case_id="b", system="verified_search", tier="high", repetition=0),
+        CellKey(case_id="b", system="monolith", tier="low", repetition=1),
+        CellKey(case_id="b", system="verified_search", tier="low", repetition=1),
+        CellKey(case_id="b", system="monolith", tier="high", repetition=1),
+        CellKey(case_id="b", system="verified_search", tier="high", repetition=1),
     )
-    rows = read_jsonl(generation_path(tmp_path, config), Generation)
-
-    assert report["completed"] == 4
-    assert len(rows) == 4
-    assert {(row.system, row.token_budget, row.repetition) for row in rows} == {
-        ("monolith", 2048, 0),
-        ("monolith", 2048, 1),
-        ("adaptive", 2048, 0),
-        ("adaptive", 2048, 1),
-    }
+    with pytest.raises(ValidationError):
+        grid[0].tier = "middle"
 
 
-async def test_active_cells_never_exceed_gateway_concurrency_bound(
+async def test_execution_is_bounded_and_appends_each_terminal_result(
     monkeypatch,
     tmp_path: Path,
 ):
-    config = ExperimentConfig(
-        experiment_name="bounded-workers",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096, 8192],
-        systems=["monolith", "adaptive"],
-        bootstrap_replicates=100,
-        require_preflight=False,
-    )
     active = 0
     peak = 0
 
-    async def succeed(
-        client,
-        *,
-        case,
-        system,
-        token_budget,
-        config,
-        run_id,
-        repetition,
-    ):
+    async def succeed(client, *, case, system, tier, model, repetition):
+        del client, model
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return Generation(
-            run_id=run_id,
+        return CellResult(
             case_id=case.case_id,
-            pair_id=case.pair_id,
-            counterfactual_variant=case.counterfactual_variant,
             system=system,
-            token_budget=token_budget,
+            tier=tier.name,
             repetition=repetition,
-            model=config.generator_model,
+            status="ok",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="completed"),
         )
 
-    monkeypatch.setattr("budget_crossover.runner.GatewayClient", TwoWorkerFakeClient)
     monkeypatch.setattr("budget_crossover.runner.run_system", succeed)
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
 
-    report = await execute_generation(
-        repo=tmp_path,
-        config=config,
-        cases=[_case()],
+    summary = await execute_cells(
+        cases=[_case("a"), _case("b")],
+        systems=("monolith", "verified_search"),
+        tiers=("low",),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=results_path,
+        attempts_path=attempts_path,
+        max_concurrency=2,
     )
 
-    assert report["completed"] == 6
+    rows = read_jsonl(results_path, CellResult)
     assert peak == 2
+    assert summary.scheduled == 4
+    assert summary.completed == 4
+    assert summary.infrastructure_attempts == 0
+    assert len(rows) == 4
+    assert len({(row.case_id, row.system, row.tier, row.repetition) for row in rows}) == 4
+
+
+async def test_resume_skips_terminal_keys_without_duplicate_rows(monkeypatch, tmp_path: Path):
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
+    append_jsonl(
+        results_path,
+        CellResult(
+            case_id="a",
+            system="monolith",
+            tier="low",
+            repetition=0,
+            status="architecture_failure",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="invalid_output"),
+        ),
+    )
+    launched: list[tuple[str, str]] = []
+
+    async def succeed(client, *, case, system, tier, model, repetition):
+        del client, model
+        launched.append((case.case_id, system))
+        return CellResult(
+            case_id=case.case_id,
+            system=system,
+            tier=tier.name,
+            repetition=repetition,
+            status="ok",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="completed"),
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", succeed)
+
+    summary = await execute_cells(
+        cases=[_case("a")],
+        systems=("monolith", "verified_search"),
+        tiers=("low",),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=results_path,
+        attempts_path=attempts_path,
+        max_concurrency=2,
+    )
+
+    rows = read_jsonl(results_path, CellResult)
+    assert launched == [("a", "verified_search")]
+    assert summary.scheduled == 1
+    assert summary.skipped == 1
+    assert len(rows) == 2
+    assert len({(row.case_id, row.system, row.tier, row.repetition) for row in rows}) == 2
+
+
+async def test_infrastructure_errors_are_unscored_attempts_but_architecture_failures_are_terminal(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def mixed_outcomes(client, *, case, system, tier, model, repetition):
+        del client, model
+        if system == "verified_search":
+            raise TimeoutError("temporary gateway timeout")
+        return CellResult(
+            case_id=case.case_id,
+            system=system,
+            tier=tier.name,
+            repetition=repetition,
+            status="architecture_failure",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="budget_exhausted"),
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", mixed_outcomes)
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
+
+    summary = await execute_cells(
+        cases=[_case("a")],
+        systems=("monolith", "verified_search"),
+        tiers=("low",),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=results_path,
+        attempts_path=attempts_path,
+        max_concurrency=1,
+    )
+
+    results = read_jsonl(results_path, CellResult)
+    attempts = read_jsonl(attempts_path, InfrastructureAttempt)
+    assert [(row.system, row.status) for row in results] == [
+        ("monolith", "architecture_failure")
+    ]
+    assert len(attempts) == 1
+    assert attempts[0].system == "verified_search"
+    assert attempts[0].retryable is True
+    assert attempts[0].attempt_number == 1
+    assert summary.completed == 1
+    assert summary.infrastructure_attempts == 1
+    assert summary.remaining == 1
+
+
+async def test_three_equivalent_permanent_errors_open_and_resume_the_circuit(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launches = 0
+
+    async def permanently_fail(client, *, case, system, tier, model, repetition):
+        del client, case, system, tier, model, repetition
+        nonlocal launches
+        launches += 1
+        raise GatewayRequestError(
+            status_code=400,
+            detail="unsupported parameter",
+            model="gpt-test",
+            stage="planner",
+            credential_slot=1,
+            request_id=f"request-{launches}",
+            retryable=False,
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", permanently_fail)
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
+    kwargs = {
+        "cases": [_case("a")],
+        "systems": ("monolith", "verified_search"),
+        "tiers": ("low", "middle", "high"),
+        "repetitions": 1,
+        "model": "gpt-test",
+        "client": object(),
+        "results_path": results_path,
+        "attempts_path": attempts_path,
+        "max_concurrency": 1,
+    }
+
+    first = await execute_cells(**kwargs)
+
+    assert launches == 3
+    assert first.circuit_open is True
+    assert first.infrastructure_attempts == 3
+    assert first.remaining == 6
+    assert len(read_jsonl(attempts_path, InfrastructureAttempt)) == 3
+
+    resumed = await execute_cells(**kwargs)
+
+    assert launches == 3
+    assert resumed.circuit_open is True
+    assert resumed.infrastructure_attempts == 0
+    assert len(read_jsonl(attempts_path, InfrastructureAttempt)) == 3

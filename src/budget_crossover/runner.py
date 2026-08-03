@@ -1,254 +1,234 @@
 from __future__ import annotations
 
-"""Bounded, resumable experiment execution with failure circuit breaking."""
+"""Deterministic, resumable execution for canonical experiment cells."""
 
 import asyncio
-import json
-import random
-import time
 from collections import Counter
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
+from pydantic import Field
 
-from .config import ExperimentConfig
-from .gateway import GatewayClient, GatewayRequestError
+from .budget import BUDGET_TIERS
+from .gateway import GatewayRequestError
 from .io import append_jsonl, read_jsonl
-from .manifest import ensure_manifest, record_phase, run_dir
-from .records import Case, FailureAttempt, Generation
-from .systems import run_system
+from .models import CellResult, FrozenModel, PublicCase, SystemName, TierName
+from .systems import CompletionClient, run_system
 
 
-def generation_path(repo: Path, config: ExperimentConfig) -> Path:
-    return run_dir(repo, config) / "generations.jsonl"
+def generation_path(repo: Path, config: Any) -> Path:
+    return repo / "experiments" / "runs" / str(config.experiment_name) / "generations.jsonl"
 
 
-def error_path(repo: Path, config: ExperimentConfig) -> Path:
-    return run_dir(repo, config) / "errors.jsonl"
+def error_path(repo: Path, config: Any) -> Path:
+    return repo / "experiments" / "runs" / str(config.experiment_name) / "errors.jsonl"
 
 
-def _preflight_passed(repo: Path, config: ExperimentConfig) -> bool:
-    path = run_dir(repo, config) / "preflight.json"
-    if not path.exists():
-        return False
-    try:
-        return bool(json.loads(path.read_text()).get("pass"))
-    except (OSError, json.JSONDecodeError):
-        return False
+class CellKey(FrozenModel):
+    case_id: str
+    system: SystemName
+    tier: TierName
+    repetition: int = Field(ge=0)
 
 
-def _preflight_created_at(
-    repo: Path,
-    config: ExperimentConfig,
-) -> datetime | None:
-    path = run_dir(repo, config) / "preflight.json"
-    if not path.exists():
-        return None
-    try:
-        value = json.loads(path.read_text()).get("created_at")
-        return datetime.fromisoformat(value) if value else None
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return None
+class ExecutionSummary(FrozenModel):
+    scheduled: int = Field(ge=0)
+    completed: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+    infrastructure_attempts: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+    circuit_open: bool
 
 
-def _failure_attempt(
+class InfrastructureAttempt(FrozenModel):
+    case_id: str
+    system: SystemName
+    tier: TierName
+    repetition: int = Field(ge=0)
+    model: str
+    stage: str
+    retryable: bool
+    error_type: str
+    detail: str
+    signature: str
+    attempt_number: int = Field(ge=1)
+    status_code: int | None = None
+    request_id: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+def _cell_tuple(
+    value: CellKey | CellResult | InfrastructureAttempt,
+) -> tuple[str, str, str, int]:
+    return (value.case_id, value.system, value.tier, value.repetition)
+
+
+def _infrastructure_attempt(
     *,
+    key: CellKey,
+    model: str,
     error: Exception,
-    config: ExperimentConfig,
-    case: Case,
-    system: str,
-    token_budget: int,
-    repetition: int,
-    run_id: str,
     attempt_number: int,
-    wall_time_seconds: float,
-) -> FailureAttempt:
+) -> InfrastructureAttempt:
     if isinstance(error, GatewayRequestError):
-        attempted_model = error.model
-        stage = error.stage
-        credential_slot = error.credential_slot
-        status_code = error.status_code
-        request_id = error.request_id
-        retryable = error.retryable
-        detail = error.detail
-        signature = error.signature
-    else:
-        attempted_model = config.generator_model
-        stage = "unknown"
-        credential_slot = None
-        status_code = None
-        request_id = None
-        retryable = isinstance(
-            error,
-            (
-                TimeoutError,
-                ConnectionError,
-                httpx.TimeoutException,
-                httpx.NetworkError,
-            ),
+        return InfrastructureAttempt(
+            **key.model_dump(),
+            model=error.model,
+            stage=error.stage,
+            retryable=error.retryable,
+            error_type=type(error).__name__,
+            detail=error.detail,
+            signature=error.signature,
+            attempt_number=attempt_number,
+            status_code=error.status_code,
+            request_id=error.request_id,
         )
-        detail = str(error)[:2000]
-        signature = f"{type(error).__name__}:{detail}"
-    return FailureAttempt(
-        run_id=run_id,
-        case_id=case.case_id,
-        pair_id=case.pair_id,
-        counterfactual_variant=case.counterfactual_variant,
-        system=system,
-        token_budget=token_budget,
-        repetition=repetition,
-        attempted_model=attempted_model,
-        stage=stage,
-        credential_slot=credential_slot,
-        status_code=status_code,
-        request_id=request_id,
+    detail = str(error)[:2000]
+    retryable = isinstance(
+        error,
+        (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError),
+    )
+    return InfrastructureAttempt(
+        **key.model_dump(),
+        model=model,
+        stage="unknown",
         retryable=retryable,
         error_type=type(error).__name__,
         detail=detail,
-        signature=signature,
+        signature=f"{type(error).__name__}:{detail}",
         attempt_number=attempt_number,
-        wall_time_seconds=wall_time_seconds,
     )
 
 
-async def execute_generation(
+def build_cell_grid(
     *,
-    repo: Path,
-    config: ExperimentConfig,
-    cases: list[Case],
-) -> dict[str, int | float | bool]:
-    if config.require_preflight and not _preflight_passed(repo, config):
-        raise RuntimeError("a passing preflight.json is required before experiment execution")
-    ensure_manifest(repo, config, cases)
-    output = generation_path(repo, config)
-    errors = error_path(repo, config)
-    previous = read_jsonl(output, Generation)
-    previous_attempts = read_jsonl(errors, FailureAttempt)
-    completed = {
-        (row.case_id, row.system, row.token_budget, row.repetition)
-        for row in previous
-        if row.status in {"ok", "budget_exhausted"}
-    }
-    attempt_counts = Counter(
-        (row.case_id, row.system, row.token_budget, row.repetition) for row in previous_attempts
-    )
-    jobs = [
-        (case, system, token_budget, repetition)
+    cases: Sequence[PublicCase],
+    systems: Sequence[SystemName],
+    tiers: Sequence[TierName],
+    repetitions: int,
+) -> tuple[CellKey, ...]:
+    if repetitions < 1:
+        raise ValueError("repetitions must be positive")
+    if len({case.case_id for case in cases}) != len(cases):
+        raise ValueError("case IDs must be unique")
+    if len(set(systems)) != len(systems):
+        raise ValueError("systems must be unique")
+    if len(set(tiers)) != len(tiers):
+        raise ValueError("tiers must be unique")
+    return tuple(
+        CellKey(
+            case_id=case.case_id,
+            system=system,
+            tier=tier,
+            repetition=repetition,
+        )
         for case in cases
-        for system in config.systems
-        for token_budget in config.token_budgets
-        for repetition in range(config.repetitions)
-        if (case.case_id, system, token_budget, repetition) not in completed
-    ]
-    random.Random(config.seed).shuffle(jobs)
-    client = GatewayClient(timeout_seconds=config.request_timeout_seconds)
-    if not client.configured:
-        await client.close()
-        raise RuntimeError(
-            "gateway is not configured; copy .env.example to .env and set the "
-            "gateway endpoint plus credentials"
-        )
+        for repetition in range(repetitions)
+        for tier in tiers
+        for system in systems
+    )
 
-    queue: asyncio.Queue[tuple[Case, str, int, int]] = asyncio.Queue()
-    for job in jobs:
-        queue.put_nowait(job)
-    worker_count = max(
-        1,
-        min(client.maximum_total_concurrency, len(jobs) or 1),
+
+async def execute_cells(
+    *,
+    cases: Sequence[PublicCase],
+    systems: Sequence[SystemName],
+    tiers: Sequence[TierName],
+    repetitions: int,
+    model: str,
+    client: CompletionClient,
+    results_path: Path,
+    attempts_path: Path,
+    max_concurrency: int,
+) -> ExecutionSummary:
+    if max_concurrency < 1:
+        raise ValueError("max_concurrency must be positive")
+    expected_grid = build_cell_grid(
+        cases=cases,
+        systems=systems,
+        tiers=tiers,
+        repetitions=repetitions,
     )
-    started = time.monotonic()
-    deadline = started + config.runtime_hours * 3600
-    circuit_open = asyncio.Event()
-    preflight_created_at = _preflight_created_at(repo, config)
+    previous = read_jsonl(results_path, CellResult)
+    previous_attempts = read_jsonl(attempts_path, InfrastructureAttempt)
+    completed_keys = {_cell_tuple(result) for result in previous}
+    if len(completed_keys) != len(previous):
+        raise ValueError("result log contains duplicate cell keys")
+    grid = tuple(key for key in expected_grid if _cell_tuple(key) not in completed_keys)
+    skipped = len(expected_grid) - len(grid)
+    case_by_id = {case.case_id: case for case in cases}
+    queue: asyncio.Queue[CellKey] = asyncio.Queue()
+    for key in grid:
+        queue.put_nowait(key)
+
+    completed = 0
+    infrastructure_attempts = 0
+    attempt_counts = Counter(_cell_tuple(attempt) for attempt in previous_attempts)
     permanent_signatures = Counter(
-        row.signature
-        for row in previous_attempts
-        if not row.retryable
-        and (
-            preflight_created_at is None
-            or datetime.fromisoformat(row.created_at) >= preflight_created_at
-        )
+        attempt.signature for attempt in previous_attempts if not attempt.retryable
     )
-    if any(count >= config.permanent_error_threshold for count in permanent_signatures.values()):
+    circuit_open = asyncio.Event()
+    if any(count >= 3 for count in permanent_signatures.values()):
         circuit_open.set()
-    counters: dict[str, int | float | bool] = {
-        "completed": 0,
-        "budget_exhausted": 0,
-        "failed_attempts": 0,
-        "skipped": len(completed),
-        "scheduled": len(jobs),
-        "launched": 0,
-        "circuit_open": circuit_open.is_set(),
-    }
+    append_lock = asyncio.Lock()
 
     async def worker() -> None:
-        while not circuit_open.is_set() and time.monotonic() <= deadline - 30:
+        nonlocal completed, infrastructure_attempts
+        while not circuit_open.is_set():
             try:
-                case, system, token_budget, repetition = queue.get_nowait()
+                key = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            cell = (case.case_id, system, token_budget, repetition)
-            run_id = (
-                f"{config.experiment_name}-{case.case_id}-{system}-b{token_budget}-r{repetition}"
-            )
-            counters["launched"] = int(counters["launched"]) + 1
-            case_started = time.monotonic()
             try:
-                result = await run_system(
-                    client,
-                    case=case,
-                    system=system,
-                    token_budget=token_budget,
-                    config=config,
-                    run_id=run_id,
-                    repetition=repetition,
-                )
-                result.wall_time_seconds = time.monotonic() - case_started
-                append_jsonl(output, result)
-                if result.status == "budget_exhausted":
-                    counters["budget_exhausted"] = int(counters["budget_exhausted"]) + 1
+                try:
+                    result = await run_system(
+                        client,
+                        case=case_by_id[key.case_id],
+                        system=key.system,
+                        tier=BUDGET_TIERS[key.tier],
+                        model=model,
+                        repetition=key.repetition,
+                    )
+                except Exception as error:  # noqa: BLE001 - cell infrastructure boundary
+                    cell = _cell_tuple(key)
+                    attempt_counts[cell] += 1
+                    attempt = _infrastructure_attempt(
+                        key=key,
+                        model=model,
+                        error=error,
+                        attempt_number=attempt_counts[cell],
+                    )
+                    async with append_lock:
+                        append_jsonl(attempts_path, attempt)
+                        infrastructure_attempts += 1
+                        if not attempt.retryable:
+                            permanent_signatures[attempt.signature] += 1
+                            if permanent_signatures[attempt.signature] >= 3:
+                                circuit_open.set()
                 else:
-                    counters["completed"] = int(counters["completed"]) + 1
-            except Exception as error:  # noqa: BLE001 - cell isolation boundary
-                attempt_counts[cell] += 1
-                attempt = _failure_attempt(
-                    error=error,
-                    config=config,
-                    case=case,
-                    system=system,
-                    token_budget=token_budget,
-                    repetition=repetition,
-                    run_id=run_id,
-                    attempt_number=attempt_counts[cell],
-                    wall_time_seconds=time.monotonic() - case_started,
-                )
-                append_jsonl(errors, attempt)
-                counters["failed_attempts"] = int(counters["failed_attempts"]) + 1
-                if not attempt.retryable:
-                    permanent_signatures[attempt.signature] += 1
-                    if permanent_signatures[attempt.signature] >= config.permanent_error_threshold:
-                        circuit_open.set()
-                        counters["circuit_open"] = True
+                    async with append_lock:
+                        append_jsonl(results_path, result)
+                        completed += 1
             finally:
                 queue.task_done()
 
-    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-    try:
-        remaining = max(1.0, deadline - time.monotonic())
-        done, pending = await asyncio.wait(workers, timeout=remaining)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
-    finally:
-        await client.close()
+    workers = [
+        asyncio.create_task(worker())
+        for _ in range(min(max_concurrency, len(grid)) if grid else 0)
+    ]
+    if workers:
+        await asyncio.gather(*workers)
+    return ExecutionSummary(
+        scheduled=len(grid),
+        completed=completed,
+        skipped=skipped,
+        infrastructure_attempts=infrastructure_attempts,
+        remaining=len(grid) - completed,
+        circuit_open=circuit_open.is_set(),
+    )
 
-    scored_now = int(counters["completed"]) + int(counters["budget_exhausted"])
-    counters["cancelled_at_deadline"] = queue.qsize() if time.monotonic() > deadline - 30 else 0
-    counters["remaining_cells"] = len(jobs) - scored_now
-    counters["elapsed_seconds"] = round(time.monotonic() - started, 3)
-    record_phase(repo, config, phase="generation", counters=counters)
-    return counters
+
+execute_generation = execute_cells

@@ -8,6 +8,21 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Scale = Literal["ones", "thousand", "million", "billion", "percent"]
+SystemName = Literal["monolith", "verified_search", "unverified_search"]
+TierName = Literal["low", "middle", "high"]
+CellStatus = Literal["ok", "architecture_failure"]
+ExitReason = Literal[
+    "completed",
+    "accepted",
+    "repair_accepted",
+    "plurality_selected",
+    "planner_invalid",
+    "invalid_output",
+    "checker_exhausted",
+    "budget_exhausted",
+    "abstained",
+    "architecture_error",
+]
 
 
 class FrozenModel(BaseModel):
@@ -167,15 +182,15 @@ class MechanismTrace(FrozenModel):
     answer_changed: bool | None = None
     call_events: tuple[CallEvent, ...] = ()
     realized_tokens: int = Field(default=0, ge=0)
-    exit_reason: str
+    exit_reason: ExitReason
 
 
 class CellResult(FrozenModel):
     case_id: str
-    system: str
-    tier: str
+    system: SystemName
+    tier: TierName
     repetition: int = Field(ge=0)
-    status: str
+    status: CellStatus
     candidate: Candidate | None
     trace: MechanismTrace
 

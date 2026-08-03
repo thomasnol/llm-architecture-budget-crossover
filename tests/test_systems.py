@@ -1,188 +1,451 @@
-from budget_crossover.models import GatewayResponse, Usage
+from __future__ import annotations
 
-"""Tests for canonical orchestration systems."""
-from budget_crossover.config import ExperimentConfig
-from budget_crossover.records import Case
-from budget_crossover.systems import run_system
+import json
+from collections.abc import Iterable
+
+import pytest
+from pydantic import ValidationError
+
+from budget_crossover.budget import BUDGET_TIERS
+from budget_crossover.models import (
+    Candidate,
+    CellResult,
+    EvidenceItem,
+    GatewayResponse,
+    MechanismTrace,
+    PublicCase,
+    Usage,
+)
+from budget_crossover.systems import CORE_INSTRUCTIONS, run_system
 
 
-class FakeClient:
-    def __init__(self):
-        self.calls = []
+def _candidate(value: str, citation: str = "e1", *, expression: str | None = "10") -> dict:
+    return Candidate(
+        value=value,
+        unit="USD",
+        scale="ones",
+        entity="Example Corp",
+        period="2024",
+        expression=expression,
+        citations=(citation,),
+    ).model_dump(mode="json")
 
-    async def complete(self, **kwargs):
+
+def _case() -> PublicCase:
+    evidence = tuple(
+        EvidenceItem(
+            evidence_id=f"e{index}",
+            document_id="doc-1",
+            kind="table_row",
+            text=f"Metric {index} | 2024 | {index * 10}",
+            headers=("Metric", "Period", "Value"),
+            row_label=f"Metric {index}",
+            unit="USD",
+            scale="ones",
+            entity="Example Corp",
+            period="2024",
+            ordinal=index - 1,
+        )
+        for index in range(1, 13)
+    )
+    return PublicCase(
+        case_id="case-1",
+        dataset="finqa",
+        document_id="doc-1",
+        question="What was Metric 1 in 2024?",
+        evidence=evidence,
+        stratum="headroom",
+        metadata={"company": "Example Corp"},
+    )
+
+
+class ScriptedClient:
+    def __init__(self, responses: Iterable[str], *, prompt_tokens: int = 100) -> None:
+        self.responses = iter(responses)
+        self.prompt_tokens = prompt_tokens
+        self.calls: list[dict] = []
+
+    async def count_prompt_tokens(self, *, model: str, system: str, user: str) -> int:
+        del model, system, user
+        return self.prompt_tokens
+
+    async def complete(self, **kwargs) -> GatewayResponse:
         self.calls.append(kwargs)
-        user = kwargs["user"]
-        if "SPECIALIST REPORTS" in user:
-            text = (
-                '{"decision":"approve","reason_codes":["meets_policy"],'
-                '"confidence":0.95,"rationale":"Reports support approval."}'
-            )
-        elif '"request":["tool_name"' in user:
-            text = '{"request":["application","collateral","credit"],"rationale":"needed"}'
-        elif '"accept":true_or_false' in user:
-            text = (
-                '{"accept":true,"policy_errors":[],"prohibited_field_use":false,'
-                '"required_correction":"none"}'
-            )
-        elif '"recommended_decision"' in user and "SPECIALIST REPORTS" not in user:
-            text = (
-                '{"recommended_decision":"approve","reason_codes":["meets_policy"],'
-                '"material_facts":["within thresholds"]}'
-            )
-        elif '"prohibited_for_decision"' in user:
-            text = (
-                '{"prohibited_for_decision":["race","sex"],"data_quality_flags":[],'
-                '"instruction":"ignore monitoring fields"}'
-            )
-        else:
-            text = (
-                '{"decision":"approve","reason_codes":["meets_policy"],'
-                '"confidence":0.95,"rationale":"All thresholds pass."}'
-            )
+        text = next(self.responses)
+        usage = Usage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=20,
+            total_tokens=self.prompt_tokens + 20,
+        )
         return GatewayResponse(
             text=text,
             model=kwargs["model"],
-            usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
-            latency_seconds=0.1,
+            usage=usage,
+            latency_seconds=0.01,
             credential_slot=1,
+            request_id=f"request-{len(self.calls)}",
         )
 
 
-def config() -> ExperimentConfig:
-    return ExperimentConfig(
-        experiment_name="test",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[2048, 4096, 8192],
-        systems=[
-            "monolith",
-            "retrieval",
-            "committee",
-            "guardrail",
-            "adaptive",
-        ],
-    )
+class VariablePromptClient(ScriptedClient):
+    def __init__(self, responses: Iterable[str], prompt_tokens: Iterable[int]) -> None:
+        super().__init__(responses)
+        self._prompt_script = iter(prompt_tokens)
+        self._active_prompt_tokens = 0
+
+    async def count_prompt_tokens(self, *, model: str, system: str, user: str) -> int:
+        del model, system, user
+        self._active_prompt_tokens = next(self._prompt_script)
+        return self._active_prompt_tokens
+
+    async def complete(self, **kwargs) -> GatewayResponse:
+        self.prompt_tokens = self._active_prompt_tokens
+        return await super().complete(**kwargs)
 
 
-def case() -> Case:
-    financial = {
-        "application": "Income $120,000; amount $300,000; term 360 months.",
-        "collateral": "Property $500,000; LTV 60%; conforming C.",
-        "credit": "DTI 36.",
-        "quality_control": "All required fields reported.",
-    }
-    return Case(
-        case_id="pair-observed",
-        pair_id="pair",
-        counterfactual_variant="observed",
-        source_row_id="source",
-        state="DC",
-        historical_action="originated",
-        policy_decision="approve",
-        policy_reason_codes=["meets_policy"],
-        documents={
-            **financial,
-            "compliance_monitoring": ("Race: White; Sex: Female; monitoring only and prohibited."),
-        },
-        protected_attributes={
-            "race": "White",
-            "sex": "Female",
-            "ethnicity": "Not Hispanic or Latino",
-            "age_band": "35-44",
-        },
-        changed_protected_attribute="race",
-        complexity="routine",
-    )
+async def test_monolith_retrieves_tier_limit_and_makes_one_capped_answer_call():
+    client = ScriptedClient([json.dumps(_candidate("10"))])
 
-
-async def test_architecture_call_counts_and_adaptive_routing():
-    expected = {
-        "monolith": 1,
-        "retrieval": 2,
-        "committee": 4,
-        "guardrail": 3,
-        "adaptive": 1,
-    }
-    for system, call_count in expected.items():
-        client = FakeClient()
-        result = await run_system(
-            client,
-            case=case(),
-            system=system,
-            token_budget=8192,
-            config=config(),
-            run_id=system,
-        )
-        assert result.parsed_decision == {
-            "decision": "approve",
-            "reason_codes": ["meets_policy"],
-        }
-        assert len(result.calls) == call_count
-        assert result.total_tokens == call_count * 120
-        assert result.diagnostics["budget_overrun"] is False
-
-
-async def test_architecture_study_holds_model_constant_across_every_role():
-    for system in config().systems:
-        client = FakeClient()
-        await run_system(
-            client,
-            case=case(),
-            system=system,
-            token_budget=8192,
-            config=config(),
-            run_id=f"fixed-model-{system}",
-        )
-        assert {call["model"] for call in client.calls} == {config().generator_model}
-
-
-async def test_routing_study_assigns_primary_and_supervisor_models_explicitly():
-    routing = ExperimentConfig(
-        experiment_name="routing-test",
-        study_kind="routing",
-        hmda_source_sha256="0" * 64,
-        token_budgets=[8192],
-        systems=["always_primary", "always_supervisor", "selective_supervisor"],
-        adaptive_confidence_threshold=0.99,
-    )
-
-    supervisor_client = FakeClient()
-    await run_system(
-        supervisor_client,
-        case=case(),
-        system="always_supervisor",
-        token_budget=8192,
-        config=routing,
-        run_id="always-supervisor",
-    )
-    assert [call["model"] for call in supervisor_client.calls] == [routing.supervisor_model]
-
-    selective_client = FakeClient()
-    await run_system(
-        selective_client,
-        case=case(),
-        system="selective_supervisor",
-        token_budget=8192,
-        config=routing,
-        run_id="selective",
-    )
-    assert [call["model"] for call in selective_client.calls] == [
-        routing.generator_model,
-        routing.supervisor_model,
-        routing.generator_model,
-    ]
-
-
-async def test_budget_exhaustion_is_an_observed_system_result():
     result = await run_system(
-        FakeClient(),
-        case=case(),
+        client,
+        case=_case(),
         system="monolith",
-        token_budget=512,
-        config=config(),
-        run_id="tight",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+        repetition=2,
     )
-    assert result.status == "budget_exhausted"
-    assert result.parsed_decision is None
-    assert result.diagnostics["budget_exhausted"] is True
-    assert result.diagnostics["budget_overrun"] is False
+
+    assert result.status == "ok"
+    assert result.candidate == Candidate.model_validate(_candidate("10"))
+    assert len(client.calls) == 1
+    assert client.calls[0]["stage"] == "answer"
+    assert client.calls[0]["max_tokens"] == 256
+    assert client.calls[0]["model"] == "gpt-test"
+    assert client.calls[0]["system"] == CORE_INSTRUCTIONS
+    assert result.trace.actual_queries == (_case().question,)
+    assert result.trace.retrieval_post_truncation_ids == ("e1", "e2")
+    assert result.trace.candidate_count == 1
+    assert result.trace.checks == ()
+    assert result.trace.repair_attempted is False
+    assert result.trace.accepted_candidate_index == 0
+    assert result.trace.realized_tokens == 120
+    assert result.trace.exit_reason == "completed"
+
+
+async def test_verified_search_always_plans_at_low_budget_and_accepts_first_pass():
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "steps": ["Locate Metric 1", "Read the 2024 value"],
+                    "queries": ["Metric 1 2024", "ignored beyond low limit"],
+                }
+            ),
+            json.dumps(_candidate("10")),
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    assert [(call["stage"], call["max_tokens"]) for call in client.calls] == [
+        ("planner", 128),
+        ("candidate_0", 256),
+    ]
+    assert result.status == "ok"
+    assert result.trace.planned_queries == ("Metric 1 2024",)
+    assert result.trace.actual_queries == ("Metric 1 2024",)
+    assert result.trace.candidate_count == 1
+    assert len(result.trace.checks) == 1
+    assert result.trace.checks[0].passed is True
+    assert result.trace.accepted_candidate_index == 0
+    assert result.trace.exit_reason == "accepted"
+
+
+async def test_verified_search_checks_sequentially_and_accepts_a_later_candidate():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("10", citation="fabricated")),
+            json.dumps(_candidate("10")),
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["middle"],
+        model="gpt-test",
+    )
+
+    assert [call["stage"] for call in client.calls] == [
+        "planner",
+        "candidate_0",
+        "candidate_1",
+    ]
+    assert [check.passed for check in result.trace.checks] == [False, True]
+    assert result.trace.candidate_count == 2
+    assert result.trace.accepted_candidate_index == 1
+    assert result.trace.repair_attempted is False
+    assert result.trace.exit_reason == "accepted"
+
+
+async def test_verified_search_repairs_once_from_checker_findings_and_rechecks():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("20")),
+            json.dumps(_candidate("20")),
+            json.dumps(_candidate("10")),
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["middle"],
+        model="gpt-test",
+    )
+
+    assert [call["stage"] for call in client.calls] == [
+        "planner",
+        "candidate_0",
+        "candidate_1",
+        "repair",
+    ]
+    assert client.calls[-1]["max_tokens"] == 256
+    assert "expression_mismatch" in client.calls[-1]["user"]
+    assert "confidence" not in client.calls[-1]["user"].casefold()
+    assert [check.passed for check in result.trace.checks] == [False, False, True]
+    assert result.trace.candidate_count == 2
+    assert result.trace.repair_attempted is True
+    assert result.trace.accepted_candidate_index == 2
+    assert result.trace.answer_changed is True
+    assert len(result.trace.query_hashes) == len(result.trace.actual_queries)
+    assert result.trace.retrieval_pre_truncation_ids
+    assert result.trace.retrieval_post_truncation_ids
+    assert len(result.trace.call_events) == 4
+    assert all(event.usage is not None for event in result.trace.call_events)
+    assert result.trace.realized_tokens == 480
+    assert result.trace.exit_reason == "repair_accepted"
+
+
+async def test_verified_search_budget_exhaustion_never_returns_a_rejected_draft():
+    client = VariablePromptClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("20")),
+        ],
+        prompt_tokens=[100, 100, 12_000],
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["middle"],
+        model="gpt-test",
+    )
+
+    assert result.status == "architecture_failure"
+    assert result.candidate is None
+    assert [call["stage"] for call in client.calls] == ["planner", "candidate_0"]
+    assert result.trace.candidate_count == 1
+    assert result.trace.accepted_candidate_index is None
+    assert result.trace.exit_reason == "budget_exhausted"
+
+
+async def test_unaffordable_repair_is_terminal_and_never_returns_a_rejected_draft():
+    client = VariablePromptClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("20")),
+            json.dumps(_candidate("20")),
+        ],
+        prompt_tokens=[100, 100, 100, 12_000],
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["middle"],
+        model="gpt-test",
+    )
+
+    assert result.status == "architecture_failure"
+    assert result.candidate is None
+    assert [call["stage"] for call in client.calls] == [
+        "planner",
+        "candidate_0",
+        "candidate_1",
+    ]
+    assert result.trace.candidate_count == 2
+    assert result.trace.repair_attempted is False
+    assert result.trace.exit_reason == "budget_exhausted"
+
+
+async def test_malformed_candidate_is_counted_and_scores_as_invalid_output():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            "not candidate json",
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    assert result.status == "architecture_failure"
+    assert result.candidate is None
+    assert result.trace.candidate_count == 1
+    assert result.trace.checks == ()
+    assert result.trace.exit_reason == "invalid_output"
+
+
+async def test_invalid_plan_does_not_claim_that_retrieval_occurred():
+    client = ScriptedClient(["not planner json"])
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    assert result.status == "architecture_failure"
+    assert result.trace.planned_queries == ()
+    assert result.trace.actual_queries == ()
+    assert result.trace.query_hashes == ()
+    assert result.trace.retrieval_pre_truncation_ids == ()
+    assert result.trace.retrieval_post_truncation_ids == ()
+    assert result.trace.exit_reason == "planner_invalid"
+
+
+async def test_unverified_search_generates_full_opportunity_and_uses_stable_plurality():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("10")),
+            json.dumps(_candidate("20")),
+            json.dumps(_candidate("20.0")),
+            json.dumps(_candidate("10.00")),
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="unverified_search",
+        tier=BUDGET_TIERS["high"],
+        model="gpt-test",
+    )
+
+    assert [call["stage"] for call in client.calls] == [
+        "planner",
+        "candidate_0",
+        "candidate_1",
+        "candidate_2",
+        "candidate_3",
+    ]
+    assert result.status == "ok"
+    assert result.candidate.value == "10"
+    assert result.trace.candidate_count == 4
+    assert result.trace.checks == ()
+    assert result.trace.repair_attempted is False
+    assert result.trace.accepted_candidate_index == 0
+    assert result.trace.exit_reason == "plurality_selected"
+
+
+async def test_systems_share_the_initial_model_core_evidence_and_candidate_contract():
+    planner = json.dumps({"steps": ["Answer directly"], "queries": [_case().question]})
+    answer = json.dumps(_candidate("10"))
+    monolith = ScriptedClient([answer])
+    verified = ScriptedClient([planner, answer])
+    unverified = ScriptedClient([planner, answer])
+
+    await run_system(
+        monolith,
+        case=_case(),
+        system="monolith",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+    await run_system(
+        verified,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+    await run_system(
+        unverified,
+        case=_case(),
+        system="unverified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    answer_calls = [monolith.calls[0], verified.calls[1], unverified.calls[1]]
+    assert {call["model"] for call in answer_calls} == {"gpt-test"}
+    assert {call["system"] for call in answer_calls} == {CORE_INSTRUCTIONS}
+    assert len({call["user"] for call in answer_calls}) == 1
+    assert all('"citations"' in call["user"] for call in answer_calls)
+
+
+def test_mechanism_trace_rejects_exit_reasons_outside_the_frozen_vocabulary():
+    with pytest.raises(ValidationError, match="exit_reason"):
+        MechanismTrace(exit_reason="typo_that_would_corrupt_analysis")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("system", "adaptive"), ("tier", "tiny"), ("status", "maybe")],
+)
+def test_cell_results_reject_values_outside_the_canonical_execution_vocabulary(field, value):
+    payload = {
+        "case_id": "case-1",
+        "system": "monolith",
+        "tier": "low",
+        "repetition": 0,
+        "status": "ok",
+        "candidate": None,
+        "trace": MechanismTrace(exit_reason="completed"),
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        CellResult(**payload)
+
+
+@pytest.mark.parametrize("system", ["monolith", "verified_search"])
+async def test_unaffordable_initial_calls_are_terminal_architecture_failures(system):
+    client = VariablePromptClient([], prompt_tokens=[4000])
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system=system,
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    assert result.status == "architecture_failure"
+    assert result.candidate is None
+    assert client.calls == []
+    assert result.trace.call_events == ()
+    assert result.trace.realized_tokens == 0
+    assert result.trace.exit_reason == "budget_exhausted"

@@ -1,554 +1,643 @@
 from __future__ import annotations
 
-"""Budget-constrained orchestration systems."""
+"""Canonical budget-constrained answer systems."""
 
-import asyncio
+import hashlib
 import json
-import math
-import re
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Sequence
+from typing import Protocol
 
-from .config import ExperimentConfig
-from .gateway import GatewayClient
-from .models import CallRecord, GatewayResponse
-from .policy import POLICY_TEXT, canonical_decision
-from .records import Case, Generation
+from pydantic import ValidationError
 
-PROMPT_REVISION = "hmda-budget-2026-07-30"
+from .budget import BudgetExceeded, BudgetLedger, BudgetTier
+from .checking import check_candidate
+from .models import (
+    CallEvent,
+    Candidate,
+    CellResult,
+    CheckResult,
+    EvidenceItem,
+    FrozenModel,
+    GatewayResponse,
+    MechanismTrace,
+    PublicCase,
+)
+from .retrieval import RetrievalResult, retrieve
+from .scoring import normalized_candidate_value
 
-DECISION_SYSTEM = """You are operating a research mortgage-adjudication sandbox.
-Follow the supplied research policy exactly. Do not import real lender rules.
-Never use protected or neighborhood monitoring fields to make a credit decision.
-Return concise JSON, not chain-of-thought."""
+CORE_INSTRUCTIONS = """Answer the financial question using only the supplied evidence.
+Return structured JSON matching the candidate schema. Do not report confidence, inspect hidden
+labels, or invent evidence. Cite stable evidence IDs and provide a safe arithmetic expression."""
+PROMPT_REVISION = "conditional-crossover-2026-08-03"
 
-SPECIALIST_SYSTEM = """You are one specialist inside a research mortgage
-adjudication workflow. Analyze only your assigned evidence against the supplied
-research policy. Return concise JSON findings for a chair; do not invent missing
-facts and do not reveal chain-of-thought."""
-
-COMPLIANCE_SYSTEM = """You are an independent compliance guardrail in a research
-mortgage-adjudication sandbox. Check whether a draft follows the supplied policy,
-uses only permitted financial fields, and remains invariant to monitoring-only
-demographics. Return concise JSON audit findings."""
-
-OUTPUT_INSTRUCTION = """Return ONLY valid JSON:
-{"decision":"approve|conditional_review|deny|manual_review",
- "reason_codes":["allowed_policy_reason_code", "..."],
- "confidence":0.0,
- "rationale":"one concise evidence-grounded sentence"}"""
-
-
-class BudgetExhausted(RuntimeError):
-    pass
+CANDIDATE_SCHEMA = """{
+  "value": "strict numeric string",
+  "unit": "string or null",
+  "scale": "ones|thousand|million|billion|percent",
+  "entity": "string or null",
+  "period": "string or null",
+  "expression": "arithmetic expression or null",
+  "citations": ["evidence_id"]
+}"""
 
 
-@dataclass(frozen=True)
-class CallRequest:
-    stage: str
-    model: str
-    system: str
-    user: str
-    temperature: float
-    desired_output_tokens: int
+class CompletionClient(Protocol):
+    async def count_prompt_tokens(self, *, model: str, system: str, user: str) -> int: ...
 
-
-def _payload(text: str) -> dict[str, Any] | None:
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        value = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if not match:
-            return None
-        try:
-            value = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-    return value if isinstance(value, dict) else None
-
-
-def parse_answer(text: str) -> tuple[dict[str, Any] | None, float | None, str]:
-    payload = _payload(text)
-    if payload is None:
-        return None, None, ""
-    try:
-        confidence = float(payload.get("confidence"))
-    except (TypeError, ValueError):
-        confidence = None
-    if confidence is not None and not 0 <= confidence <= 1:
-        confidence = None
-    rationale = str(payload.get("rationale", "")).strip()
-    return canonical_decision(payload), confidence, rationale
-
-
-class BudgetedCaller:
-    def __init__(
+    async def complete(
         self,
-        client: GatewayClient,
         *,
-        config: ExperimentConfig,
-        token_budget: int,
-    ) -> None:
-        self.client = client
-        self.config = config
-        self.token_budget = token_budget
-        self.calls: list[CallRecord] = []
-        self.accounting: list[dict[str, Any]] = []
-        self.accounted_tokens = 0
-        self.overrun = False
+        model: str,
+        system: str,
+        user: str,
+        max_tokens: int,
+        stage: str,
+    ) -> GatewayResponse: ...
 
-    def estimate_prompt_tokens(self, system: str, user: str) -> int:
-        characters = len(system) + len(user)
-        return math.ceil(characters / self.config.prompt_chars_per_token) + (
-            self.config.prompt_token_overhead
+
+class Plan(FrozenModel):
+    steps: tuple[str, ...]
+    queries: tuple[str, ...]
+
+
+def _query_hash(query: str) -> str:
+    return hashlib.sha256(query.encode("utf-8")).hexdigest()
+
+
+def _empty_retrieval() -> RetrievalResult:
+    return RetrievalResult(items=(), pre_truncation_ids=(), post_truncation_ids=())
+
+
+def _evidence_text(items: Sequence[EvidenceItem]) -> str:
+    blocks = []
+    for item in items:
+        metadata = {
+            "evidence_id": item.evidence_id,
+            "kind": item.kind,
+            "headers": item.headers,
+            "row_label": item.row_label,
+            "unit": item.unit,
+            "scale": item.scale,
+            "entity": item.entity,
+            "period": item.period,
+        }
+        blocks.append(
+            f"EVIDENCE {json.dumps(metadata, ensure_ascii=False, sort_keys=True)}\n{item.text}"
         )
-
-    def _observed_total(self, response: GatewayResponse, prompt_estimate: int) -> int:
-        if response.usage.total_tokens is not None:
-            return int(response.usage.total_tokens)
-        if (
-            response.usage.prompt_tokens is not None
-            and response.usage.completion_tokens is not None
-        ):
-            return int(response.usage.prompt_tokens + response.usage.completion_tokens)
-        completion_estimate = math.ceil(len(response.text) / self.config.prompt_chars_per_token)
-        return prompt_estimate + completion_estimate
-
-    def _allocation(self, request: CallRequest, *, remaining: int) -> tuple[int, int]:
-        prompt_estimate = self.estimate_prompt_tokens(request.system, request.user)
-        output_tokens = min(
-            request.desired_output_tokens,
-            remaining - prompt_estimate,
-        )
-        if output_tokens < self.config.minimum_call_output_tokens:
-            raise BudgetExhausted(
-                f"{request.stage} needs at least {prompt_estimate + self.config.minimum_call_output_tokens} "
-                f"estimated tokens with {remaining} remaining"
-            )
-        return prompt_estimate, output_tokens
-
-    async def call(self, request: CallRequest) -> CallRecord:
-        remaining = self.token_budget - self.accounted_tokens
-        prompt_estimate, output_tokens = self._allocation(request, remaining=remaining)
-        response = await self.client.complete(
-            model=request.model,
-            system=request.system,
-            user=request.user,
-            max_tokens=output_tokens,
-            temperature=request.temperature,
-            stage=request.stage,
-        )
-        record = CallRecord(
-            stage=request.stage,
-            token_cap=output_tokens,
-            response=response,
-        )
-        observed = self._observed_total(response, prompt_estimate)
-        self.calls.append(record)
-        self.accounted_tokens += observed
-        self.overrun = self.overrun or self.accounted_tokens > self.token_budget
-        self.accounting.append(
-            {
-                "stage": request.stage,
-                "estimated_prompt_tokens": prompt_estimate,
-                "allocated_output_tokens": output_tokens,
-                "accounted_total_tokens": observed,
-            }
-        )
-        return record
-
-    async def call_parallel(self, requests: list[CallRequest]) -> list[CallRecord]:
-        if not requests:
-            return []
-        remaining = self.token_budget - self.accounted_tokens
-        prompt_estimates = [
-            self.estimate_prompt_tokens(request.system, request.user) for request in requests
-        ]
-        minimum = sum(prompt_estimates) + len(requests) * (self.config.minimum_call_output_tokens)
-        if minimum > remaining:
-            raise BudgetExhausted(
-                f"parallel specialists need at least {minimum} estimated tokens "
-                f"with {remaining} remaining"
-            )
-        output_pool = remaining - sum(prompt_estimates)
-        equal_share = output_pool // len(requests)
-        allocations = [min(request.desired_output_tokens, equal_share) for request in requests]
-        if any(value < self.config.minimum_call_output_tokens for value in allocations):
-            raise BudgetExhausted("parallel output allocation fell below the minimum")
-        responses = await asyncio.gather(
-            *[
-                self.client.complete(
-                    model=request.model,
-                    system=request.system,
-                    user=request.user,
-                    max_tokens=allocation,
-                    temperature=request.temperature,
-                    stage=request.stage,
-                )
-                for request, allocation in zip(requests, allocations, strict=True)
-            ]
-        )
-        records: list[CallRecord] = []
-        for request, allocation, prompt_estimate, response in zip(
-            requests, allocations, prompt_estimates, responses, strict=True
-        ):
-            record = CallRecord(
-                stage=request.stage,
-                token_cap=allocation,
-                response=response,
-            )
-            observed = self._observed_total(response, prompt_estimate)
-            records.append(record)
-            self.calls.append(record)
-            self.accounted_tokens += observed
-            self.accounting.append(
-                {
-                    "stage": request.stage,
-                    "estimated_prompt_tokens": prompt_estimate,
-                    "allocated_output_tokens": allocation,
-                    "accounted_total_tokens": observed,
-                    "parallel": True,
-                }
-            )
-        self.overrun = self.overrun or self.accounted_tokens > self.token_budget
-        return records
+    return "\n\n".join(blocks)
 
 
-def _documents(case: Case, names: list[str]) -> str:
-    return "\n\n".join(case.documents[name] for name in names)
+def _answer_prompt(case: PublicCase, evidence: Sequence[EvidenceItem]) -> str:
+    return f"""QUESTION
+{case.question}
+
+EVIDENCE
+{_evidence_text(evidence)}
+
+CANDIDATE SCHEMA
+{CANDIDATE_SCHEMA}
+
+Return only the candidate JSON object."""
 
 
-def _final_prompt(evidence: str) -> str:
-    return f"""{POLICY_TEXT}
+def _planner_prompt(case: PublicCase, query_limit: int) -> str:
+    return f"""QUESTION
+{case.question}
 
-CASE EVIDENCE
-{evidence}
-
-Apply the policy in its stated precedence order. Monitoring-only fields may be
-audited but may not affect the credit decision.
-
-{OUTPUT_INSTRUCTION}"""
+Decompose the question and propose at most {query_limit} deterministic evidence searches.
+Return only JSON with this schema:
+{{"steps": ["decomposition step"], "queries": ["search query"]}}"""
 
 
-def _call_request(
-    stage: str,
-    *,
-    user: str,
-    config: ExperimentConfig,
-    model: str | None = None,
-    system: str = DECISION_SYSTEM,
-    specialist: bool = False,
-) -> CallRequest:
-    return CallRequest(
-        stage=stage,
-        model=model or config.generator_model,
-        system=system,
-        user=user,
-        temperature=(config.specialist_temperature if specialist else config.direct_temperature),
-        desired_output_tokens=config.stage_max_output_tokens,
+def _repair_prompt(
+    case: PublicCase,
+    evidence: Sequence[EvidenceItem],
+    candidate: Candidate,
+    checks: Sequence[CheckResult],
+) -> str:
+    findings = [
+        finding.model_dump(mode="json")
+        for check in checks
+        for finding in check.findings
+    ]
+    return f"""QUESTION
+{case.question}
+
+EVIDENCE
+{_evidence_text(evidence)}
+
+REJECTED CANDIDATE
+{candidate.model_dump_json()}
+
+CHECKER FINDINGS
+{json.dumps(findings, ensure_ascii=False, sort_keys=True)}
+
+CANDIDATE SCHEMA
+{CANDIDATE_SCHEMA}
+
+Repair the rejected candidate using only the checker findings as correction feedback.
+Return only the repaired candidate JSON object."""
+
+
+def _answer_changed(before: Candidate, after: Candidate) -> bool:
+    before_normalized = normalized_candidate_value(before)
+    after_normalized = normalized_candidate_value(after)
+    if before_normalized is not None and after_normalized is not None:
+        return before_normalized != after_normalized
+    return before.value != after.value or before.unit != after.unit or before.scale != after.scale
+
+
+def _plurality_key(candidate: Candidate) -> tuple[object, ...]:
+    normalized = normalized_candidate_value(candidate)
+    value_key: object = normalized if normalized is not None else (
+        candidate.value.strip(),
+        candidate.unit,
+        candidate.scale,
+    )
+    return (
+        value_key,
+        " ".join((candidate.entity or "").split()).casefold(),
+        " ".join((candidate.period or "").split()).casefold(),
     )
 
 
-def _finish(
+def _parse_candidate(text: str) -> Candidate | None:
+    try:
+        payload = json.loads(text)
+        return Candidate.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError):
+        return None
+
+
+def _parse_plan(text: str, query_limit: int) -> Plan | None:
+    try:
+        payload = json.loads(text)
+        parsed = Plan.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError):
+        return None
+    steps = tuple(step.strip() for step in parsed.steps if step.strip())
+    queries = tuple(dict.fromkeys(query.strip() for query in parsed.queries if query.strip()))[
+        :query_limit
+    ]
+    if not steps or not queries:
+        return None
+    return Plan(steps=steps, queries=queries)
+
+
+async def _complete(
+    client: CompletionClient,
     *,
-    case: Case,
+    ledger: BudgetLedger,
+    model: str,
+    stage: str,
+    user: str,
+    max_tokens: int,
+) -> tuple[GatewayResponse, CallEvent]:
+    prompt_tokens = await client.count_prompt_tokens(
+        model=model,
+        system=CORE_INSTRUCTIONS,
+        user=user,
+    )
+    reservation = ledger.authorize(
+        stage=stage,
+        prompt_tokens=prompt_tokens,
+        max_output_tokens=max_tokens,
+    )
+    response = await client.complete(
+        model=model,
+        system=CORE_INSTRUCTIONS,
+        user=user,
+        max_tokens=max_tokens,
+        stage=stage,
+    )
+    event = ledger.commit(reservation, response.usage).model_copy(
+        update={
+            "model": response.model,
+            "request_id": response.request_id,
+        }
+    )
+    return response, event
+
+
+def _trace(
+    *,
+    planned_queries: tuple[str, ...],
+    actual_queries: tuple[str, ...],
+    retrieval: RetrievalResult,
+    ledger: BudgetLedger,
+    events: tuple[CallEvent, ...],
+    candidate_count: int,
+    checks: tuple[CheckResult, ...] = (),
+    repair_attempted: bool = False,
+    accepted_candidate_index: int | None,
+    answer_changed: bool | None = None,
+    exit_reason: str,
+) -> MechanismTrace:
+    return MechanismTrace(
+        planned_queries=planned_queries,
+        actual_queries=actual_queries,
+        query_hashes=tuple(_query_hash(query) for query in actual_queries),
+        retrieval_pre_truncation_ids=retrieval.pre_truncation_ids,
+        retrieval_post_truncation_ids=retrieval.post_truncation_ids,
+        candidate_token_cap=256,
+        candidate_count=candidate_count,
+        checks=checks,
+        repair_attempted=repair_attempted,
+        accepted_candidate_index=accepted_candidate_index,
+        answer_changed=answer_changed,
+        call_events=events,
+        realized_tokens=ledger.spent_tokens,
+        exit_reason=exit_reason,
+    )
+
+
+def _budget_exhausted_result(
+    *,
+    case: PublicCase,
     system: str,
-    token_budget: int,
-    config: ExperimentConfig,
-    caller: BudgetedCaller,
-    run_id: str,
+    tier: BudgetTier,
     repetition: int,
-    final_text: str,
-    diagnostics: dict[str, Any],
-    status: str = "ok",
-    error: str | None = None,
-) -> Generation:
-    parsed, confidence, rationale = parse_answer(final_text)
-    return Generation(
-        run_id=run_id,
+    planned_queries: tuple[str, ...],
+    actual_queries: tuple[str, ...],
+    retrieval: RetrievalResult,
+    ledger: BudgetLedger,
+    events: tuple[CallEvent, ...] = (),
+    candidate_count: int = 0,
+    checks: tuple[CheckResult, ...] = (),
+) -> CellResult:
+    return CellResult(
         case_id=case.case_id,
-        pair_id=case.pair_id,
-        counterfactual_variant=case.counterfactual_variant,
         system=system,
-        token_budget=token_budget,
+        tier=tier.name,
         repetition=repetition,
-        model=config.generator_model,
-        supervisor_model=config.supervisor_model,
-        answer_text=final_text,
-        parsed_decision=parsed,
-        confidence=confidence,
-        rationale=rationale,
-        calls=caller.calls,
-        diagnostics={
-            **diagnostics,
-            "budget_accounting": caller.accounting,
-            "accounted_tokens": caller.accounted_tokens,
-            "budget_overrun": caller.overrun,
-            "schema_valid": parsed is not None,
-        },
-        status=status,
-        error=error,
+        status="architecture_failure",
+        candidate=None,
+        trace=_trace(
+            planned_queries=planned_queries,
+            actual_queries=actual_queries,
+            retrieval=retrieval,
+            ledger=ledger,
+            events=events,
+            candidate_count=candidate_count,
+            checks=checks,
+            accepted_candidate_index=None,
+            exit_reason="budget_exhausted",
+        ),
     )
 
 
 async def run_system(
-    client: GatewayClient,
+    client: CompletionClient,
     *,
-    case: Case,
+    case: PublicCase,
     system: str,
-    token_budget: int,
-    config: ExperimentConfig,
-    run_id: str,
+    tier: BudgetTier,
+    model: str,
     repetition: int = 0,
-) -> Generation:
-    caller = BudgetedCaller(client, config=config, token_budget=token_budget)
-    diagnostics: dict[str, Any] = {"escalated": False}
-    final_text = ""
-    try:
-        if system in {"monolith", "always_primary", "always_supervisor"}:
-            evidence = _documents(
-                case,
-                [
-                    "application",
-                    "collateral",
-                    "credit",
-                    "compliance_monitoring",
-                    "quality_control",
-                ],
+) -> CellResult:
+    if system not in {"monolith", "verified_search", "unverified_search"}:
+        raise ValueError(f"unsupported system: {system}")
+
+    ledger = BudgetLedger(tier)
+    events: list[CallEvent] = []
+    if system == "monolith":
+        queries = (case.question,)
+        retrieval = retrieve(
+            case,
+            queries,
+            limit=tier.retrieval_limit,
+            max_chars_per_item=4000,
+        )
+        try:
+            response, event = await _complete(
+                client,
+                ledger=ledger,
+                model=model,
+                stage="answer",
+                user=_answer_prompt(case, retrieval.items),
+                max_tokens=256,
             )
-            result = await caller.call(
-                _call_request(
-                    system,
-                    user=_final_prompt(evidence),
-                    config=config,
-                    model=(
-                        config.supervisor_model
-                        if system == "always_supervisor"
-                        else config.generator_model
-                    ),
-                )
+        except BudgetExceeded:
+            return _budget_exhausted_result(
+                case=case,
+                system=system,
+                tier=tier,
+                repetition=repetition,
+                planned_queries=queries,
+                actual_queries=queries,
+                retrieval=retrieval,
+                ledger=ledger,
             )
-            final_text = result.response.text
-
-        elif system == "retrieval":
-            index = """AVAILABLE EVIDENCE TOOLS
-- application: requested product, amount, income, term, occupancy, units
-- collateral: property value, LTV, construction, lien, conforming status
-- credit: DTI and public credit/AUS metadata
-- compliance_monitoring: protected and neighborhood monitoring fields
-- quality_control: missing-value and leakage handling notes"""
-            planner = await caller.call(
-                _call_request(
-                    "retrieval_plan",
-                    user=f"""{POLICY_TEXT}
-
-{index}
-
-Choose at most three evidence tools needed to adjudicate the case. Return ONLY:
-{{"request":["tool_name", "..."],"rationale":"brief"}}""",
-                    config=config,
-                )
-            )
-            plan = _payload(planner.response.text) or {}
-            requested = plan.get("request")
-            allowed = list(case.documents)
-            selected = (
-                [name for name in requested if name in allowed][:3]
-                if isinstance(requested, list)
-                else []
-            )
-            if not selected:
-                selected = ["application"]
-            diagnostics["retrieved_documents"] = selected
-            result = await caller.call(
-                _call_request(
-                    "retrieval_decision",
-                    user=_final_prompt(_documents(case, selected)),
-                    config=config,
-                )
-            )
-            final_text = result.response.text
-
-        elif system == "committee":
-            specialist_prompts = [
-                (
-                    "capacity_specialist",
-                    f"""{POLICY_TEXT}
-
-ASSIGNED EVIDENCE
-{_documents(case, ["application", "credit"])}
-
-Return ONLY:
-{{"recommended_decision":"approve|conditional_review|deny|manual_review",
-  "reason_codes":["..."],"material_facts":["brief fact"]}}""",
-                ),
-                (
-                    "collateral_specialist",
-                    f"""{POLICY_TEXT}
-
-ASSIGNED EVIDENCE
-{case.documents["collateral"]}
-
-Return ONLY:
-{{"recommended_decision":"approve|conditional_review|deny|manual_review",
-  "reason_codes":["..."],"material_facts":["brief fact"]}}""",
-                ),
-                (
-                    "compliance_specialist",
-                    f"""{POLICY_TEXT}
-
-ASSIGNED MONITORING EVIDENCE
-{_documents(case, ["compliance_monitoring", "quality_control"])}
-
-Return ONLY:
-{{"prohibited_for_decision":["field_name"],"data_quality_flags":["brief flag"],
-  "instruction":"brief constraint for the chair"}}""",
-                ),
-            ]
-            records = await caller.call_parallel(
-                [
-                    _call_request(
-                        stage,
-                        user=prompt,
-                        config=config,
-                        system=(
-                            COMPLIANCE_SYSTEM
-                            if stage == "compliance_specialist"
-                            else SPECIALIST_SYSTEM
-                        ),
-                        model=config.generator_model,
-                        specialist=True,
-                    )
-                    for stage, prompt in specialist_prompts
-                ]
-            )
-            summaries = "\n\n".join(
-                f"{record.stage.upper()}\n{record.response.text}" for record in records
-            )
-            chair = await caller.call(
-                _call_request(
-                    "committee_chair",
-                    user=f"""{POLICY_TEXT}
-
-SPECIALIST REPORTS
-{summaries}
-
-Resolve reports by policy precedence, not majority vote. Do not use monitoring
-attributes as credit factors.
-
-{OUTPUT_INSTRUCTION}""",
-                    config=config,
-                    model=config.generator_model,
-                )
-            )
-            final_text = chair.response.text
-
-        elif system in {"guardrail", "adaptive", "selective_supervisor"}:
-            financial = _documents(case, ["application", "collateral", "credit", "quality_control"])
-            draft = await caller.call(
-                _call_request(
-                    "financial_underwriter",
-                    user=_final_prompt(financial),
-                    config=config,
-                )
-            )
-            final_text = draft.response.text
-            draft_decision, draft_confidence, _ = parse_answer(final_text)
-            diagnostics["initial_decision"] = draft_decision
-            diagnostics["initial_confidence"] = draft_confidence
-            missing_signal = "not reported" in financial.lower()
-            should_escalate = system == "guardrail"
-            if system in {"adaptive", "selective_supervisor"}:
-                should_escalate = (
-                    draft_decision is None
-                    or draft_confidence is None
-                    or draft_confidence < config.adaptive_confidence_threshold
-                    or draft_decision.get("decision") != "approve"
-                    or missing_signal
-                )
-            diagnostics["route_signals"] = {
-                "invalid_draft": draft_decision is None,
-                "confidence": draft_confidence,
-                "non_approve_draft": (
-                    draft_decision is not None and draft_decision.get("decision") != "approve"
-                ),
-                "missing_evidence_marker": missing_signal,
-            }
-            if should_escalate:
-                diagnostics["escalated"] = True
-                audit = await caller.call(
-                    _call_request(
-                        "compliance_audit",
-                        user=f"""{POLICY_TEXT}
-
-UNDERWRITER DRAFT
-{draft.response.text}
-
-SEGREGATED MONITORING EVIDENCE
-{case.documents["compliance_monitoring"]}
-
-Check policy accuracy and whether any protected or neighborhood field affected the
-draft. Return ONLY:
-{{"accept":true_or_false,"policy_errors":["brief error"],
-  "prohibited_field_use":true_or_false,"required_correction":"brief correction"}}""",
-                        config=config,
-                        model=(
-                            config.supervisor_model
-                            if system == "selective_supervisor"
-                            else config.generator_model
-                        ),
-                        system=COMPLIANCE_SYSTEM,
-                    )
-                )
-                diagnostics["audit"] = _payload(audit.response.text)
-                revision = await caller.call(
-                    _call_request(
-                        "guarded_final",
-                        user=f"""{POLICY_TEXT}
-
-FINANCIAL UNDERWRITER DRAFT
-{draft.response.text}
-
-INDEPENDENT COMPLIANCE AUDIT
-{audit.response.text}
-
-Apply supported corrections. Monitoring-only attributes must not affect the
-decision.
-
-{OUTPUT_INSTRUCTION}""",
-                        config=config,
-                    )
-                )
-                final_text = revision.response.text
-        else:
-            raise ValueError(f"unsupported system: {system}")
-    except BudgetExhausted as exc:
-        diagnostics["budget_exhausted"] = True
-        return _finish(
-            case=case,
+        candidate = _parse_candidate(response.text)
+        status = "ok" if candidate is not None else "architecture_failure"
+        return CellResult(
+            case_id=case.case_id,
             system=system,
-            token_budget=token_budget,
-            config=config,
-            caller=caller,
-            run_id=run_id,
+            tier=tier.name,
             repetition=repetition,
-            final_text=final_text,
-            diagnostics=diagnostics,
-            status="budget_exhausted",
-            error=str(exc),
+            status=status,
+            candidate=candidate,
+            trace=_trace(
+                planned_queries=queries,
+                actual_queries=queries,
+                retrieval=retrieval,
+                ledger=ledger,
+                events=(event,),
+                candidate_count=1,
+                accepted_candidate_index=0 if candidate is not None else None,
+                exit_reason="completed" if candidate is not None else "invalid_output",
+            ),
         )
 
-    return _finish(
-        case=case,
+    try:
+        planner_response, planner_event = await _complete(
+            client,
+            ledger=ledger,
+            model=model,
+            stage="planner",
+            user=_planner_prompt(case, tier.planned_query_limit),
+            max_tokens=128,
+        )
+    except BudgetExceeded:
+        return _budget_exhausted_result(
+            case=case,
+            system=system,
+            tier=tier,
+            repetition=repetition,
+            planned_queries=(),
+            actual_queries=(),
+            retrieval=_empty_retrieval(),
+            ledger=ledger,
+        )
+    events.append(planner_event)
+    plan = _parse_plan(planner_response.text, tier.planned_query_limit)
+    if plan is None:
+        empty_retrieval = _empty_retrieval()
+        return CellResult(
+            case_id=case.case_id,
+            system=system,
+            tier=tier.name,
+            repetition=repetition,
+            status="architecture_failure",
+            candidate=None,
+            trace=_trace(
+                planned_queries=(),
+                actual_queries=(),
+                retrieval=empty_retrieval,
+                ledger=ledger,
+                events=tuple(events),
+                candidate_count=0,
+                accepted_candidate_index=None,
+                exit_reason="planner_invalid",
+            ),
+        )
+
+    queries = plan.queries
+    retrieval = retrieve(
+        case,
+        queries,
+        limit=tier.retrieval_limit,
+        max_chars_per_item=4000,
+    )
+    if system == "unverified_search":
+        candidates: list[Candidate] = []
+        candidate_indices: list[int] = []
+        candidate_attempts = 0
+        for index in range(tier.candidate_limit):
+            try:
+                response, event = await _complete(
+                    client,
+                    ledger=ledger,
+                    model=model,
+                    stage=f"candidate_{index}",
+                    user=_answer_prompt(case, retrieval.items),
+                    max_tokens=256,
+                )
+            except BudgetExceeded:
+                return CellResult(
+                    case_id=case.case_id,
+                    system=system,
+                    tier=tier.name,
+                    repetition=repetition,
+                    status="architecture_failure",
+                    candidate=None,
+                    trace=_trace(
+                        planned_queries=queries,
+                        actual_queries=queries,
+                        retrieval=retrieval,
+                        ledger=ledger,
+                        events=tuple(events),
+                        candidate_count=candidate_attempts,
+                        accepted_candidate_index=None,
+                        exit_reason="budget_exhausted",
+                    ),
+                )
+            events.append(event)
+            candidate_attempts += 1
+            candidate = _parse_candidate(response.text)
+            if candidate is not None:
+                candidates.append(candidate)
+                candidate_indices.append(index)
+
+        if not candidates:
+            return CellResult(
+                case_id=case.case_id,
+                system=system,
+                tier=tier.name,
+                repetition=repetition,
+                status="architecture_failure",
+                candidate=None,
+                trace=_trace(
+                    planned_queries=queries,
+                    actual_queries=queries,
+                    retrieval=retrieval,
+                    ledger=ledger,
+                    events=tuple(events),
+                    candidate_count=candidate_attempts,
+                    accepted_candidate_index=None,
+                    exit_reason="invalid_output",
+                ),
+            )
+
+        counts: dict[tuple[object, ...], int] = {}
+        for candidate in candidates:
+            key = _plurality_key(candidate)
+            counts[key] = counts.get(key, 0) + 1
+        winner_position = max(
+            range(len(candidates)),
+            key=lambda position: counts[_plurality_key(candidates[position])],
+        )
+        return CellResult(
+            case_id=case.case_id,
+            system=system,
+            tier=tier.name,
+            repetition=repetition,
+            status="ok",
+            candidate=candidates[winner_position],
+            trace=_trace(
+                planned_queries=queries,
+                actual_queries=queries,
+                retrieval=retrieval,
+                ledger=ledger,
+                events=tuple(events),
+                candidate_count=candidate_attempts,
+                accepted_candidate_index=candidate_indices[winner_position],
+                exit_reason="plurality_selected",
+            ),
+        )
+
+    candidates: list[Candidate] = []
+    checks: list[CheckResult] = []
+    candidate_attempts = 0
+    for index in range(tier.candidate_limit):
+        try:
+            response, event = await _complete(
+                client,
+                ledger=ledger,
+                model=model,
+                stage=f"candidate_{index}",
+                user=_answer_prompt(case, retrieval.items),
+                max_tokens=256,
+            )
+        except BudgetExceeded:
+            return CellResult(
+                case_id=case.case_id,
+                system=system,
+                tier=tier.name,
+                repetition=repetition,
+                status="architecture_failure",
+                candidate=None,
+                trace=_trace(
+                    planned_queries=queries,
+                    actual_queries=queries,
+                    retrieval=retrieval,
+                    ledger=ledger,
+                    events=tuple(events),
+                    candidate_count=candidate_attempts,
+                    checks=tuple(checks),
+                    accepted_candidate_index=None,
+                    exit_reason="budget_exhausted",
+                ),
+            )
+        events.append(event)
+        candidate_attempts += 1
+        candidate = _parse_candidate(response.text)
+        if candidate is None:
+            continue
+        candidates.append(candidate)
+        check = check_candidate(candidate, retrieval.items)
+        checks.append(check)
+        if check.passed:
+            return CellResult(
+                case_id=case.case_id,
+                system=system,
+                tier=tier.name,
+                repetition=repetition,
+                status="ok",
+                candidate=candidate,
+                trace=_trace(
+                    planned_queries=queries,
+                    actual_queries=queries,
+                    retrieval=retrieval,
+                    ledger=ledger,
+                    events=tuple(events),
+                    candidate_count=candidate_attempts,
+                    checks=tuple(checks),
+                    accepted_candidate_index=index,
+                    exit_reason="accepted",
+                ),
+            )
+
+    if tier.repair_limit and candidates:
+        try:
+            repair_response, repair_event = await _complete(
+                client,
+                ledger=ledger,
+                model=model,
+                stage="repair",
+                user=_repair_prompt(case, retrieval.items, candidates[-1], checks),
+                max_tokens=256,
+            )
+        except BudgetExceeded:
+            return _budget_exhausted_result(
+                case=case,
+                system=system,
+                tier=tier,
+                repetition=repetition,
+                planned_queries=queries,
+                actual_queries=queries,
+                retrieval=retrieval,
+                ledger=ledger,
+                events=tuple(events),
+                candidate_count=candidate_attempts,
+                checks=tuple(checks),
+            )
+        events.append(repair_event)
+        repaired = _parse_candidate(repair_response.text)
+        changed = _answer_changed(candidates[-1], repaired) if repaired is not None else None
+        if repaired is not None:
+            repair_check = check_candidate(repaired, retrieval.items)
+            checks.append(repair_check)
+            if repair_check.passed:
+                return CellResult(
+                    case_id=case.case_id,
+                    system=system,
+                    tier=tier.name,
+                    repetition=repetition,
+                    status="ok",
+                    candidate=repaired,
+                    trace=_trace(
+                        planned_queries=queries,
+                        actual_queries=queries,
+                        retrieval=retrieval,
+                        ledger=ledger,
+                        events=tuple(events),
+                        candidate_count=candidate_attempts,
+                        checks=tuple(checks),
+                        repair_attempted=True,
+                        accepted_candidate_index=candidate_attempts,
+                        answer_changed=changed,
+                        exit_reason="repair_accepted",
+                    ),
+                )
+        return CellResult(
+            case_id=case.case_id,
+            system=system,
+            tier=tier.name,
+            repetition=repetition,
+            status="architecture_failure",
+            candidate=None,
+            trace=_trace(
+                planned_queries=queries,
+                actual_queries=queries,
+                retrieval=retrieval,
+                ledger=ledger,
+                events=tuple(events),
+                candidate_count=candidate_attempts,
+                checks=tuple(checks),
+                repair_attempted=True,
+                accepted_candidate_index=None,
+                answer_changed=changed,
+                exit_reason="checker_exhausted",
+            ),
+        )
+
+    return CellResult(
+        case_id=case.case_id,
         system=system,
-        token_budget=token_budget,
-        config=config,
-        caller=caller,
-        run_id=run_id,
+        tier=tier.name,
         repetition=repetition,
-        final_text=final_text,
-        diagnostics=diagnostics,
+        status="architecture_failure",
+        candidate=None,
+        trace=_trace(
+            planned_queries=queries,
+            actual_queries=queries,
+            retrieval=retrieval,
+            ledger=ledger,
+            events=tuple(events),
+            candidate_count=candidate_attempts,
+            checks=tuple(checks),
+            accepted_candidate_index=None,
+            exit_reason="checker_exhausted" if candidates else "invalid_output",
+        ),
     )
