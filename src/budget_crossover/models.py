@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -11,6 +12,18 @@ Scale = Literal["ones", "thousand", "million", "billion", "percent"]
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep  # Validation reconstructs the complete immutable object graph.
+        values = self.model_dump(mode="python", round_trip=True)
+        if update:
+            values.update(update)
+        return type(self).model_validate(values)
 
 
 class FrozenDict(dict[str, Any]):
@@ -37,26 +50,6 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def _contains_hidden_label_key(value: Any) -> bool:
-    forbidden = {
-        "answer",
-        "gold_answer",
-        "gold_derivation",
-        "gold_support_ids",
-        "hidden_label",
-        "label",
-        "source_lineage",
-    }
-    if isinstance(value, dict):
-        return any(
-            str(key).casefold() in forbidden or _contains_hidden_label_key(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return any(_contains_hidden_label_key(item) for item in value)
-    return False
-
-
 class EvidenceItem(FrozenModel):
     evidence_id: str
     document_id: str
@@ -72,6 +65,16 @@ class EvidenceItem(FrozenModel):
     ordinal: int = Field(ge=0)
 
 
+class DescriptiveMetadata(FrozenModel):
+    company: str | None = None
+    title: str | None = None
+    section: str | None = None
+    language: str | None = None
+    filing_type: str | None = None
+    industry: str | None = None
+    tags: tuple[str, ...] = ()
+
+
 class PublicCase(FrozenModel):
     case_id: str
     dataset: str
@@ -79,17 +82,10 @@ class PublicCase(FrozenModel):
     question: str
     evidence: tuple[EvidenceItem, ...]
     stratum: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("metadata", mode="after")
-    @classmethod
-    def freeze_metadata(cls, value: dict[str, Any]) -> FrozenDict:
-        return _freeze(value)
+    metadata: DescriptiveMetadata = Field(default_factory=DescriptiveMetadata)
 
     @model_validator(mode="after")
     def validate_public_boundary(self) -> PublicCase:
-        if _contains_hidden_label_key(self.metadata):
-            raise ValueError("public metadata contains a hidden-label field")
         evidence_ids = [item.evidence_id for item in self.evidence]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("evidence_id values must be unique within a public case")

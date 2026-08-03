@@ -96,3 +96,44 @@ def test_checker_rejects_unsafe_ast_nodes_instead_of_executing_them(expression):
 
     assert result.passed is False
     assert "unsafe_expression" in {finding.code for finding in result.findings}
+
+
+@pytest.mark.parametrize(
+    ("evidence_text", "expression", "value", "expected_pass", "expected_code"),
+    [
+        ("Reported loss | -40", "40", "40", False, "unsupported_operand"),
+        ("Reported loss | -40", "-40", "-40", True, None),
+        ("Reported ratio | .5", ".5", ".5", True, None),
+    ],
+)
+def test_checker_operand_provenance_preserves_signs_and_leading_decimals(
+    evidence_text,
+    expression,
+    value,
+    expected_pass,
+    expected_code,
+):
+    evidence = EvidenceItem(
+        evidence_id="operand",
+        document_id="doc-1",
+        kind="table_row",
+        text=evidence_text,
+        ordinal=0,
+    )
+    candidate = Candidate(
+        value=value,
+        unit=None,
+        scale="ones",
+        entity=None,
+        period=None,
+        expression=expression,
+        citations=("operand",),
+    )
+
+    result = check_candidate(candidate, (evidence,))
+
+    assert result.passed is expected_pass
+    if expected_code is not None:
+        assert expected_code in {finding.code for finding in result.findings}
+    else:
+        assert result.findings == ()

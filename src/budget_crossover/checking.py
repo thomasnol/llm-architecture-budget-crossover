@@ -6,10 +6,9 @@ from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 
 from .models import Candidate, CheckFinding, CheckResult, EvidenceItem
-from .scoring import normalize_unit, normalized_candidate_value
+from .scoring import extract_strict_numeric_values, normalize_unit, normalized_candidate_value
 
 _EXPRESSION_NUMBER = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
-_EVIDENCE_NUMBER = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?")
 _SCALE_FACTORS = {
     "ones": Decimal(1),
     "thousand": Decimal(1000),
@@ -49,7 +48,12 @@ def _evaluate(expression: str) -> tuple[Decimal, tuple[Decimal, ...]]:
             return value
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             value = visit(node.operand)
-            return value if isinstance(node.op, ast.UAdd) else -value
+            if isinstance(node.op, ast.USub):
+                signed = value.copy_negate()
+                if isinstance(node.operand, ast.Constant):
+                    operands[-1] = signed
+                return signed
+            return value
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
             left = visit(node.left)
             right = visit(node.right)
@@ -68,14 +72,9 @@ def _evaluate(expression: str) -> tuple[Decimal, tuple[Decimal, ...]]:
 
 
 def _evidence_numbers(items: Sequence[EvidenceItem]) -> frozenset[Decimal]:
-    values: set[Decimal] = set()
-    for item in items:
-        for match in _EVIDENCE_NUMBER.finditer(item.text):
-            try:
-                values.add(Decimal(match.group(0).replace(",", "")))
-            except InvalidOperation:
-                continue
-    return frozenset(values)
+    return frozenset(
+        value for item in items for value in extract_strict_numeric_values(item.text)
+    )
 
 
 def _normalized_text(value: str) -> str:
@@ -131,7 +130,7 @@ def check_candidate(
 
     if evaluated is not None:
         supported = _evidence_numbers(cited)
-        unsupported = tuple(str(value) for value in operands if abs(value) not in supported)
+        unsupported = tuple(str(value) for value in operands if value not in supported)
         if unsupported:
             findings.append(
                 _finding(

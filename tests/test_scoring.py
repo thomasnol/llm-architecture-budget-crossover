@@ -83,6 +83,17 @@ def test_scoring_never_extracts_first_or_last_number_from_prose(value):
     assert result.reason == "invalid_candidate_value"
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["-$-42", "--42", "+-42", "$-42", "($-42)", "-($42)", "$$42", "(42)-"],
+)
+def test_scoring_rejects_double_or_misplaced_sign_and_currency_conventions(value):
+    result = score_candidate(_candidate(value, unit="USD"), _answer("-42", unit="USD"))
+
+    assert result.correct is False
+    assert result.reason == "invalid_candidate_value"
+
+
 def test_scoring_uses_decimal_tolerances_and_enforces_specified_compatibility():
     answer = _answer(
         "100",
@@ -118,6 +129,23 @@ def test_scoring_uses_decimal_tolerances_and_enforces_specified_compatibility():
         _candidate("100", unit="USD", entity="Example Corp", period="2023"),
         answer,
     ).reason == "period_mismatch"
+
+
+@pytest.mark.parametrize("scale", ["ones", "billion"])
+def test_zero_tolerance_scoring_does_not_collapse_distinct_29_digit_values(scale):
+    candidate_digits = "12345678901234567890123456789"
+    answer_digits = "12345678901234567890123456788"
+
+    result = score_candidate(
+        _candidate(candidate_digits, scale=scale),
+        _answer(answer_digits, scale=scale),
+    )
+
+    exponent = "" if scale == "ones" else "e9"
+    assert result.candidate_value == Decimal(f"{candidate_digits}{exponent}")
+    assert result.gold_value == Decimal(f"{answer_digits}{exponent}")
+    assert result.correct is False
+    assert result.reason == "outside_tolerance"
 
 
 def test_gold_oracle_serialization_requires_a_matching_hidden_label_join():

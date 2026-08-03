@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 from .models import AnswerSpec, Candidate, FrozenModel, HiddenLabel, PublicCase
 
-_NUMBER = re.compile(
-    r"^(?P<number>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)$"
+_UNSIGNED_NUMBER = r"(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)"
+_STRICT_NUMERIC = re.compile(
+    rf"^(?:"
+    rf"\((?P<parentheses_currency>[$€£])?(?P<parentheses_number>{_UNSIGNED_NUMBER})"
+    rf"(?P<parentheses_percent>%)?\)"
+    rf"|(?P<sign>[+-])?(?P<currency>[$€£])?(?P<number>{_UNSIGNED_NUMBER})(?P<percent>%)?"
+    rf")$"
 )
-_SCALE_FACTORS = {
-    "ones": Decimal(1),
-    "thousand": Decimal(1000),
-    "million": Decimal(1000000),
-    "billion": Decimal(1000000000),
-    "percent": Decimal("0.01"),
+_EMBEDDED_NUMERIC = re.compile(
+    rf"(?<![\w.,$€£%+-])"
+    rf"(?:\((?:[$€£])?{_UNSIGNED_NUMBER}%?\)|[+-]?(?:[$€£])?{_UNSIGNED_NUMBER}%?)"
+    rf"(?![\w.,%])"
+)
+_SCALE_EXPONENTS = {
+    "ones": 0,
+    "thousand": 3,
+    "million": 6,
+    "billion": 9,
+    "percent": -2,
 }
 _CURRENCY_UNITS = {"$": "usd", "€": "eur", "£": "gbp"}
 _UNIT_ALIASES = {
@@ -57,40 +67,43 @@ def _parse_numeric(value: str) -> tuple[Decimal, str | None, bool] | None:
     raw = value.strip()
     if not raw or any(character.isspace() for character in raw):
         return None
-
-    negative_parentheses = raw.startswith("(") and raw.endswith(")")
-    if negative_parentheses:
-        raw = raw[1:-1]
-    elif "(" in raw or ")" in raw:
-        return None
-
-    sign = Decimal(-1) if negative_parentheses else Decimal(1)
-    if raw[:1] in {"+", "-"}:
-        if raw[0] == "-":
-            sign *= -1
-        raw = raw[1:]
-
-    currency = None
-    if raw[:1] in _CURRENCY_UNITS:
-        currency = _CURRENCY_UNITS[raw[0]]
-        raw = raw[1:]
-        if raw[:1] in {"+", "-"}:
-            if raw[0] == "-":
-                sign *= -1
-            raw = raw[1:]
-
-    is_percent = raw.endswith("%")
-    if is_percent:
-        raw = raw[:-1]
-
-    match = _NUMBER.fullmatch(raw)
+    match = _STRICT_NUMERIC.fullmatch(raw)
     if match is None:
         return None
+    parenthesized = match.group("parentheses_number") is not None
+    number = match.group("parentheses_number") or match.group("number")
+    currency_symbol = match.group("parentheses_currency") or match.group("currency")
+    currency = _CURRENCY_UNITS.get(currency_symbol) if currency_symbol else None
+    is_percent = bool(match.group("parentheses_percent") or match.group("percent"))
+    if currency is not None and is_percent:
+        return None
     try:
-        parsed = Decimal(match.group("number").replace(",", "")) * sign
+        parsed = Decimal(number.replace(",", ""))
     except InvalidOperation:
         return None
+    if parenthesized or match.group("sign") == "-":
+        parsed = parsed.copy_negate()
     return parsed, currency, is_percent
+
+
+def extract_strict_numeric_values(text: str) -> tuple[Decimal, ...]:
+    values: list[Decimal] = []
+    for match in _EMBEDDED_NUMERIC.finditer(text):
+        parsed = _parse_numeric(match.group(0))
+        if parsed is not None:
+            values.append(parsed[0])
+    return tuple(values)
+
+
+def _scale_decimal(value: Decimal, scale: str) -> Decimal:
+    parts = value.as_tuple()
+    return Decimal((parts.sign, parts.digits, parts.exponent + _SCALE_EXPONENTS[scale]))
+
+
+def _comparison_precision(*values: Decimal) -> int:
+    digit_count = sum(len(value.as_tuple().digits) for value in values)
+    exponent_span = sum(abs(value.as_tuple().exponent) for value in values)
+    return max(50, digit_count + exponent_span + 10)
 
 
 def normalized_candidate_value(candidate: Candidate) -> tuple[Decimal, str | None] | None:
@@ -109,14 +122,14 @@ def normalized_candidate_value(candidate: Candidate) -> tuple[Decimal, str | Non
         if candidate.scale not in {"ones", "percent"}:
             return None
         unit = "percent"
-        factor = _SCALE_FACTORS["percent"]
+        scale = "percent"
     else:
-        factor = _SCALE_FACTORS[candidate.scale]
-    return value * factor, unit
+        scale = candidate.scale
+    return _scale_decimal(value, scale), unit
 
 
 def normalized_answer_value(answer: AnswerSpec) -> Decimal:
-    return answer.value * _SCALE_FACTORS[answer.scale]
+    return _scale_decimal(answer.value, answer.scale)
 
 
 def score_candidate(candidate: Candidate, answer: AnswerSpec) -> ScoringResult:
@@ -160,15 +173,23 @@ def score_candidate(candidate: Candidate, answer: AnswerSpec) -> ScoringResult:
             reason="period_mismatch",
         )
 
-    difference = abs(candidate_value - gold_value)
-    absolute_tolerance = answer.absolute_tolerance * _SCALE_FACTORS[answer.scale]
-    relative_tolerance = answer.relative_tolerance * abs(gold_value)
-    tolerance = max(absolute_tolerance, relative_tolerance)
+    absolute_tolerance = _scale_decimal(answer.absolute_tolerance, answer.scale)
+    with localcontext() as context:
+        context.prec = _comparison_precision(
+            candidate_value,
+            gold_value,
+            absolute_tolerance,
+            answer.relative_tolerance,
+        )
+        difference = abs(candidate_value - gold_value)
+        relative_tolerance = answer.relative_tolerance * abs(gold_value)
+        tolerance = max(absolute_tolerance, relative_tolerance)
+        correct = difference <= tolerance
     return ScoringResult(
-        correct=difference <= tolerance,
+        correct=correct,
         candidate_value=candidate_value,
         gold_value=gold_value,
-        reason="within_tolerance" if difference <= tolerance else "outside_tolerance",
+        reason="within_tolerance" if correct else "outside_tolerance",
     )
 
 

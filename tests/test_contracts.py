@@ -68,16 +68,16 @@ def test_public_and_hidden_contracts_are_strict_immutable_and_separate():
     )
 
     assert public.evidence == (evidence,)
-    assert public.metadata["tags"] == ("reported",)
+    assert public.metadata.tags == ("reported",)
     assert not hasattr(public, "answer")
     assert label.answer.value == Decimal("1.2")
     assert candidate.citations == ("doc-1:row-2",)
     with pytest.raises(ValidationError):
         public.question = "mutated"
-    with pytest.raises(TypeError):
-        public.metadata["company"] = "mutated"
+    with pytest.raises(ValidationError):
+        public.metadata.company = "mutated"
     with pytest.raises(AttributeError):
-        public.metadata["tags"].append("mutated")
+        public.metadata.tags.append("mutated")
     with pytest.raises(ValidationError):
         Candidate(
             value="1",
@@ -171,7 +171,7 @@ def test_public_case_rejects_label_metadata_and_unstable_evidence_identity():
         ordinal=0,
     )
 
-    with pytest.raises(ValidationError, match="hidden-label"):
+    with pytest.raises(ValidationError, match="extra_forbidden"):
         PublicCase(
             case_id="case-1",
             dataset="finqa",
@@ -199,6 +199,33 @@ def test_public_case_rejects_label_metadata_and_unstable_evidence_identity():
             evidence=(item,),
             stratum="headroom",
         )
+
+
+def test_public_metadata_is_typed_allowlisted_and_copy_updates_revalidate():
+    public = PublicCase(
+        case_id="case-1",
+        dataset="finqa",
+        document_id="doc-1",
+        question="Question?",
+        evidence=(),
+        stratum="headroom",
+        metadata={"company": "Example Corp", "tags": ["annual", "reported"]},
+    )
+
+    assert public.metadata.company == "Example Corp"
+    assert public.metadata.tags == ("annual", "reported")
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        PublicCase(
+            case_id="case-2",
+            dataset="finqa",
+            document_id="doc-2",
+            question="Question?",
+            evidence=(),
+            stratum="headroom",
+            metadata={"reference_answer": "42", "target": {"value": "42"}},
+        )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        public.model_copy(update={"metadata": {"reference_answer": "42"}})
 
 
 def test_run_manifest_maps_are_deeply_immutable():
