@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from budget_crossover.diagnostics import (
+    FinanceComplexCase,
     FinanceComplexCountDiscrepancy,
     FinanceComplexSnapshot,
     adapt_financecomplex_snapshot,
@@ -106,6 +107,63 @@ def test_financecomplex_filters_deduplicates_and_enforces_expected_count(tmp_pat
     ) == captured.value.report
 
 
+def test_financecomplex_rejects_operands_supported_only_by_distractor_documents(
+    tmp_path: Path,
+):
+    distractor_only = _record("distractor-only")
+    distractor_only["documents"][0]["text"] = "Revenue was 8 and expense was 3."
+    distractor_only["documents"][1]["text"] = "Reference narrative without figures."
+
+    with pytest.raises(FinanceComplexCountDiscrepancy) as captured:
+        adapt_financecomplex_snapshot(
+            _snapshot(tmp_path, [distractor_only]),
+            output_dir=tmp_path / "distractor-only",
+            expected_count=1,
+        )
+
+    assert captured.value.report["observed_count"] == 0
+    assert captured.value.report["rejections"] == {"missing_evidence": 1}
+
+
+def test_lineage_audit_and_oracle_export_reject_support_outside_references(tmp_path: Path):
+    adapted = adapt_financecomplex_snapshot(
+        _snapshot(tmp_path, [_record("case-1")]),
+        output_dir=tmp_path / "diagnostic",
+        expected_count=1,
+    )
+    case = adapted.cases[0]
+    distractor_id = case.public.evidence[0].evidence_id
+    reference_id = case.public.evidence[1].evidence_id
+    outside_reference = FinanceComplexCase(
+        public=case.public,
+        hidden=case.hidden.model_copy(update={"gold_support_ids": (distractor_id,)}),
+        lineage=case.lineage,
+    )
+    unsupported_reference = FinanceComplexCase(
+        public=case.public.model_copy(
+            update={
+                "evidence": (
+                    case.public.evidence[0].model_copy(
+                        update={"text": "Revenue was 8 and expense was 3."}
+                    ),
+                    case.public.evidence[1].model_copy(
+                        update={"text": "Reference narrative without figures."}
+                    ),
+                )
+            }
+        ),
+        hidden=case.hidden.model_copy(update={"gold_support_ids": (reference_id,)}),
+        lineage=case.lineage,
+    )
+
+    audit = audit_evidence_lineage_and_leakage((unsupported_reference,))
+
+    assert audit["reference_document_linkage_rate"] == 0.0
+    assert audit["pass"] is False
+    with pytest.raises(ValueError, match="declared reference"):
+        export_oracle_evidence_cases((outside_reference,), tmp_path / "invalid-oracle.jsonl")
+
+
 def test_scorer_lineage_leakage_and_oracle_evidence_boundaries(tmp_path: Path):
     adapted = adapt_financecomplex_snapshot(
         _snapshot(tmp_path, [_record("case-1")]),
@@ -129,9 +187,13 @@ def test_scorer_lineage_leakage_and_oracle_evidence_boundaries(tmp_path: Path):
         "total": 1,
         "gold_correct": 1,
         "gold_correct_rate": 1.0,
-        "adversarial_total": 2,
-        "adversarial_rejected": 2,
+        "adversarial_total": 3,
+        "adversarial_rejected": 3,
         "adversarial_rejection_rate": 1.0,
+        "adversarial_by_field": {
+            "scale": {"total": 1, "rejected": 1},
+            "value": {"total": 2, "rejected": 2},
+        },
         "pass": True,
     }
     assert audit["reference_document_linkage_rate"] == 1.0
@@ -144,6 +206,36 @@ def test_scorer_lineage_leakage_and_oracle_evidence_boundaries(tmp_path: Path):
     assert "answer" not in payload
     assert "gold_derivation" not in payload
     assert "gold_support_ids" not in payload
+
+
+def test_scorer_oracle_perturbs_every_specified_answer_field(tmp_path: Path):
+    record = _record("typed-label")
+    record.update(
+        {
+            "unit": "USD",
+            "scale": "million",
+            "entity": "Acme Corp",
+            "period": "2024",
+        }
+    )
+    adapted = adapt_financecomplex_snapshot(
+        _snapshot(tmp_path, [record]),
+        output_dir=tmp_path / "typed-label",
+        expected_count=1,
+    )
+
+    scorer = scorer_oracle_boundary(adapted.cases)
+
+    assert scorer["adversarial_by_field"] == {
+        "entity": {"total": 1, "rejected": 1},
+        "period": {"total": 1, "rejected": 1},
+        "scale": {"total": 1, "rejected": 1},
+        "unit": {"total": 1, "rejected": 1},
+        "value": {"total": 2, "rejected": 2},
+    }
+    assert scorer["adversarial_total"] == 6
+    assert scorer["adversarial_rejected"] == 6
+    assert scorer["pass"] is True
 
 
 def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_path: Path):
@@ -164,23 +256,86 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
         adapted.cases,
         reference_queries={case.public.case_id: ("revenue expense",)},
         planned_queries={case.public.case_id: ("unmatched",)},
-        production_results={case.public.case_id: production},
-        limit=1,
+        production_results={
+            tier: {case.public.case_id: production}
+            for tier in ("low", "middle", "high")
+        },
+        tier_limits={"low": 1, "middle": 1, "high": 1},
         max_chars_per_item=1000,
     )
 
     assert ladders["reference"] == {
-        "pre_truncation_recall": 1.0,
-        "post_truncation_recall": 1.0,
+        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 1.0}
+        for tier in ("low", "middle", "high")
     }
     assert ladders["planned"] == {
-        "pre_truncation_recall": 1.0,
-        "post_truncation_recall": 0.0,
+        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 0.0}
+        for tier in ("low", "middle", "high")
     }
     assert ladders["production"] == {
-        "pre_truncation_recall": 1.0,
-        "post_truncation_recall": 1.0,
+        tier: {"pre_truncation_recall": 1.0, "post_truncation_recall": 1.0}
+        for tier in ("low", "middle", "high")
     }
+
+
+def test_retrieval_ladders_require_exact_case_and_tier_coverage(tmp_path: Path):
+    adapted = adapt_financecomplex_snapshot(
+        _snapshot(tmp_path, [_record("case-1")]),
+        output_dir=tmp_path / "diagnostic",
+        expected_count=1,
+    )
+    case = adapted.cases[0]
+    case_id = case.public.case_id
+    result = retrieve(case.public, ("revenue",), limit=1, max_chars_per_item=1000)
+    queries = {case_id: ("revenue",)}
+    tiers = {tier: {case_id: result} for tier in ("low", "middle", "high")}
+    limits = {"low": 1, "middle": 1, "high": 1}
+
+    with pytest.raises(ValueError, match="reference query case coverage"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries={},
+            planned_queries=queries,
+            production_results=tiers,
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+    with pytest.raises(ValueError, match="planned query case coverage"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries | {"extra": ("extra",)},
+            production_results=tiers,
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+    with pytest.raises(ValueError, match="production tier coverage"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_results={tier: tiers[tier] for tier in ("low", "middle")},
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+    with pytest.raises(ValueError, match="production tier coverage"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_results=tiers | {"ultra": {case_id: result}},
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+    with pytest.raises(ValueError, match="high production case coverage"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_results=tiers | {"high": {}},
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
 
 
 @pytest.mark.parametrize(
@@ -202,8 +357,10 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
             {
                 "retrieval": {
                     "production": {
-                        "pre_truncation_recall": 1.0,
-                        "post_truncation_recall": 0.94,
+                        "high": {
+                            "pre_truncation_recall": 1.0,
+                            "post_truncation_recall": 0.94,
+                        }
                     }
                 }
             },
@@ -227,8 +384,10 @@ def test_boundary_report_attributes_each_failure_without_confirmation_pooling(
         "oracle": {"pass": True},
         "retrieval": {
             "production": {
-                "pre_truncation_recall": 1.0,
-                "post_truncation_recall": 0.95,
+                "high": {
+                    "pre_truncation_recall": 1.0,
+                    "post_truncation_recall": 0.95,
+                }
             }
         },
         "orchestration": {"pass": True},
@@ -261,8 +420,18 @@ def test_boundary_run_gate_uses_the_preregistered_thresholds():
         oracle_evidence_model={"pass": True},
         retrieval={
             "production": {
-                "pre_truncation_recall": 1.0,
-                "post_truncation_recall": 0.95,
+                "low": {
+                    "pre_truncation_recall": 1.0,
+                    "post_truncation_recall": 0.0,
+                },
+                "middle": {
+                    "pre_truncation_recall": 1.0,
+                    "post_truncation_recall": 0.0,
+                },
+                "high": {
+                    "pre_truncation_recall": 1.0,
+                    "post_truncation_recall": 0.95,
+                },
             }
         },
         orchestration={"pass": True},

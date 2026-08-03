@@ -229,6 +229,32 @@ def test_adapters_record_specific_rejections_instead_of_relaxing_eligibility(tmp
     assert all(rejection.detail is None for rejection in adapted.rejections)
 
 
+def test_finqa_validates_support_keys_and_rejects_ambiguous_text_fallback(tmp_path: Path):
+    mismatched = _finqa_headroom("support-mismatch")
+    mismatched["qa"]["gold_inds"]["table_1"] = "Beta | 2"
+    ambiguous = _finqa_headroom("support-ambiguous")
+    ambiguous["table"].append(["Alpha", "10"])
+    ambiguous["qa"]["gold_inds"] = {
+        "unknown_key": "Alpha | 10",
+        "table_2": "Beta | 2",
+        "table_3": "Gamma | 4",
+    }
+    source = _snapshot(
+        tmp_path,
+        "finqa",
+        "support-validation.json",
+        [mismatched, ambiguous],
+    )
+
+    adapted = adapt_primary_snapshots((source,), seed=3)
+
+    assert adapted.cases == ()
+    assert {row.reason for row in adapted.rejections} == {
+        "support_annotation_mismatch",
+        "ambiguous_support_annotation",
+    }
+
+
 def test_tatqa_selects_one_question_per_document_deterministically(tmp_path: Path):
     questions = [
         {
@@ -283,15 +309,20 @@ def test_tatqa_accepts_count_questions_with_executable_evidence_backed_derivatio
         questions=[
             {
                 "uid": "count-q",
-                "question": "How many reported entries plus one?",
+                "question": "How many reported countable items were there?",
                 "answer": "2",
-                "derivation": "1 + 1",
+                "derivation": "",
                 "answer_type": "count",
                 "scale": "",
+                "facts": ["Reported countable alpha item.", "Reported countable beta item."],
             }
         ],
     )
-    count["table"]["table"] = [["Metric", "Value"], ["Reported entries", "1"]]
+    count["table"]["table"] = [["Metric", "Value"]]
+    count["paragraphs"] = [
+        {"uid": "alpha", "order": 1, "text": "Reported countable alpha item."},
+        {"uid": "beta", "order": 2, "text": "Reported countable beta item."},
+    ]
     source = _snapshot(tmp_path, "tatqa", "count.json", [count])
 
     adapted = adapt_primary_snapshots((source,), seed=4)
@@ -299,6 +330,97 @@ def test_tatqa_accepts_count_questions_with_executable_evidence_backed_derivatio
     assert len(adapted.cases) == 1
     assert adapted.cases[0].public.stratum == "easy_control"
     assert adapted.cases[0].public.metadata.tags == ("count",)
+    assert adapted.cases[0].hidden.gold_derivation == (
+        'count("tatqa:tatqa-count:paragraph:alpha", '
+        '"tatqa:tatqa-count:paragraph:beta")'
+    )
+    assert adapted.cases[0].hidden.gold_support_ids == (
+        "tatqa:tatqa-count:paragraph:alpha",
+        "tatqa:tatqa-count:paragraph:beta",
+    )
+
+
+def test_tatqa_count_rejects_missing_or_ambiguous_counted_evidence(tmp_path: Path):
+    missing = _tatqa_easy(
+        "count-missing",
+        questions=[
+            {
+                "uid": "missing-q",
+                "question": "How many countable facts?",
+                "answer": "1",
+                "derivation": "",
+                "answer_type": "count",
+                "scale": "",
+                "facts": ["Absent fact."],
+            }
+        ],
+    )
+    ambiguous = _tatqa_easy(
+        "count-ambiguous",
+        questions=[
+            {
+                "uid": "ambiguous-q",
+                "question": "How many repeated facts?",
+                "answer": "1",
+                "derivation": "",
+                "answer_type": "count",
+                "scale": "",
+                "facts": ["Repeated fact."],
+            }
+        ],
+    )
+    ambiguous["paragraphs"] = [
+        {"uid": "first", "order": 1, "text": "Repeated fact."},
+        {"uid": "second", "order": 2, "text": "Repeated fact."},
+    ]
+    source = _snapshot(tmp_path, "tatqa", "invalid-counts.json", [missing, ambiguous])
+
+    adapted = adapt_primary_snapshots((source,), seed=4)
+
+    assert adapted.cases == ()
+    assert {row.reason for row in adapted.rejections} == {
+        "missing_counted_evidence",
+        "ambiguous_counted_evidence",
+    }
+
+
+def test_tatqa_count_uses_n_minus_one_operations_for_headroom_strata(tmp_path: Path):
+    count = _tatqa_easy(
+        "count-headroom",
+        questions=[
+            {
+                "uid": "count-headroom-q",
+                "question": "How many reported countable items were there?",
+                "answer": "3",
+                "derivation": "",
+                "answer_type": "count",
+                "scale": "",
+                "facts": ["Alpha item.", "Beta item.", "Gamma item."],
+            }
+        ],
+    )
+    count["table"]["table"] = [["Metric", "Value"]]
+    count["paragraphs"] = [
+        {
+            "uid": "overview",
+            "order": 1,
+            "text": "How many reported countable items overview.",
+        },
+        {
+            "uid": "supplement",
+            "order": 2,
+            "text": "Reported countable items supplemental discussion.",
+        },
+        {"uid": "alpha", "order": 3, "text": "Alpha item."},
+        {"uid": "beta", "order": 4, "text": "Beta item."},
+        {"uid": "gamma", "order": 5, "text": "Gamma item."},
+    ]
+    source = _snapshot(tmp_path, "tatqa", "count-headroom.json", [count])
+
+    adapted = adapt_primary_snapshots((source,), seed=4)
+
+    assert len(adapted.cases) == 1
+    assert adapted.cases[0].public.stratum == "headroom"
 
 
 def test_tatqa_rejects_ambiguous_operand_locations_instead_of_guessing(tmp_path: Path):
@@ -369,11 +491,13 @@ def test_preparation_emits_exact_balanced_disjoint_splits_without_public_labels(
 
 
 def test_preparation_aborts_with_machine_readable_shortfalls(tmp_path: Path):
+    invalid = _finqa_headroom("finqa-invalid")
+    invalid["qa"]["program"] = "exp(2, 3)"
     finqa = _snapshot(
         tmp_path,
         "finqa",
         "finqa-short.json",
-        [_finqa_headroom("finqa-hard")],
+        [_finqa_headroom("finqa-hard"), invalid],
     )
     tatqa = _snapshot(
         tmp_path,
@@ -401,6 +525,32 @@ def test_preparation_aborts_with_machine_readable_shortfalls(tmp_path: Path):
     assert json.loads((output / "preparation_discrepancy.json").read_text()) == (
         captured.value.report
     )
+    rejections = [
+        json.loads(line)
+        for line in (output / "rejections.jsonl").read_text().splitlines()
+    ]
+    profile = json.loads((output / "profile.json").read_text())
+    hashes = json.loads((output / "hashes.json").read_text())
+    assert [row["reason"] for row in rejections] == ["unsupported_operation"]
+    assert all(row["detail"] is None for row in rejections)
+    assert profile["status"] == "aborted"
+    assert profile["reason"] == "quota_shortfall"
+    assert profile["shortfalls"] == captured.value.report["shortfalls"]
+    assert profile["rejections"] == {"unsupported_operation": 1}
+    assert profile["document_disjoint"] is True
+    assert set(hashes["artifact_hashes"]) == {
+        "preparation_discrepancy.json",
+        "profile.json",
+        "rejections.jsonl",
+    }
+    assert all(
+        hashlib.sha256((output / filename).read_bytes()).hexdigest() == digest
+        for filename, digest in hashes["artifact_hashes"].items()
+    )
+    public_diagnostics = json.dumps({"rejections": rejections, "profile": profile})
+    assert "gold_derivation" not in public_diagnostics
+    assert "gold_support_ids" not in public_diagnostics
+    assert '"answer"' not in public_diagnostics
 
 
 def test_snapshot_checksum_changes_require_explicit_repinning(tmp_path: Path):
@@ -421,3 +571,30 @@ def test_snapshot_checksum_changes_require_explicit_repinning(tmp_path: Path):
     changed = adapt_primary_snapshots((repinned,), seed=1)
     assert changed.source_hashes != original.source_hashes
     assert changed.cases[0].public.metadata.title == "Changed pinned source"
+
+
+def test_source_identifiers_distinguish_same_basenames_and_join_lineage(tmp_path: Path):
+    snapshots = []
+    for index in range(2):
+        directory = tmp_path / f"source-{index}"
+        directory.mkdir()
+        path = directory / "train.json"
+        path.write_text(
+            json.dumps([_finqa_headroom(f"same-name-{index}")], sort_keys=True),
+            encoding="utf-8",
+        )
+        snapshots.append(
+            DatasetSnapshot(
+                dataset="finqa",
+                path=path,
+                expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        )
+
+    adapted = adapt_primary_snapshots(tuple(snapshots), seed=8)
+
+    assert len(adapted.source_hashes) == 2
+    assert all(key.startswith("finqa:train.json:") for key in adapted.source_hashes)
+    assert {case.hidden.source_lineage[0] for case in adapted.cases} == set(
+        adapted.source_hashes
+    )

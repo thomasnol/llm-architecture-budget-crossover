@@ -36,7 +36,7 @@ CANDIDATE_SCHEMA = """{
   "scale": "ones|thousand|million|billion|percent",
   "entity": "string or null",
   "period": "string or null",
-  "expression": "arithmetic expression or null",
+  "expression": "arithmetic expression, count(\"evidence-id\", ...), or null",
   "citations": ["evidence_id"]
 }"""
 

@@ -192,6 +192,7 @@ async def test_planner_system_instructions_do_not_conflict_with_its_plan_schema(
     assert '"queries"' in planner["user"]
     assert '"citations"' not in planner["user"]
     assert '"citations"' in candidate["user"]
+    assert 'count(\"evidence-id\"' in candidate["user"]
 
 
 async def test_verified_search_checks_sequentially_and_accepts_a_later_candidate():

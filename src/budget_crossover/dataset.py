@@ -63,6 +63,10 @@ class DatasetSnapshot:
         if _SHA256.fullmatch(self.expected_sha256) is None:
             raise ValueError("expected_sha256 must be a lowercase SHA-256 digest")
 
+    @property
+    def source_id(self) -> str:
+        return f"{self.dataset}:{self.path.name}:{self.expected_sha256[:16]}"
+
 
 @dataclass(frozen=True)
 class AdaptedCase:
@@ -598,14 +602,20 @@ def _adapt_finqa_question(
     support: list[EvidenceItem] = []
     for source_key, annotated_text in gold_inds.items():
         item = aliases.get(str(source_key))
+        normalized_annotation = _canonical_text(annotated_text)
+        if item is not None and _canonical_text(item.text) != normalized_annotation:
+            raise DerivationError("support_annotation_mismatch")
         if item is None:
-            normalized_annotation = _canonical_text(annotated_text)
-            item = next(
-                (value for value in evidence if _canonical_text(value.text) == normalized_annotation),
-                None,
-            )
-        if item is None:
-            raise DerivationError("missing_evidence", f"unknown FinQA support {source_key}")
+            matches = [
+                value
+                for value in evidence
+                if _canonical_text(value.text) == normalized_annotation
+            ]
+            if not matches:
+                raise DerivationError("missing_evidence")
+            if len(matches) > 1:
+                raise DerivationError("ambiguous_support_annotation")
+            item = matches[0]
         if item not in support:
             support.append(item)
     _locate_operands(derivation.operands, support, reject_ambiguous=False)
@@ -628,6 +638,41 @@ def _tatqa_questions(row: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     return tuple(value for value in payload if isinstance(value, dict))
 
 
+def _execute_tatqa_count(
+    question: Mapping[str, Any], evidence: Sequence[EvidenceItem]
+) -> tuple[DerivationResult, tuple[str, ...]]:
+    facts = question.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise DerivationError("missing_counted_evidence")
+    support_ids: list[str] = []
+    for fact in facts:
+        normalized_fact = _canonical_text(fact)
+        matches = [
+            item.evidence_id
+            for item in evidence
+            if _canonical_text(item.text) == normalized_fact
+        ]
+        if not matches:
+            raise DerivationError("missing_counted_evidence")
+        if len(matches) > 1 or matches[0] in support_ids:
+            raise DerivationError("ambiguous_counted_evidence")
+        support_ids.append(matches[0])
+    answer = _answer_spec(question)
+    count = Decimal(len(support_ids))
+    if answer.scale != "ones" or answer.value != count or answer.value != answer.value.to_integral():
+        raise DerivationError("count_answer_mismatch")
+    expression = f"count({', '.join(json.dumps(value) for value in support_ids)})"
+    return (
+        DerivationResult(
+            value=count,
+            expression=expression,
+            operands=(),
+            operation_count=max(1, len(support_ids) - 1),
+        ),
+        tuple(support_ids),
+    )
+
+
 def _adapt_tatqa_question(
     *,
     source_name: str,
@@ -639,9 +684,12 @@ def _adapt_tatqa_question(
     answer_type = _canonical_text(question.get("answer_type", ""))
     if answer_type not in {"arithmetic", "count"}:
         raise DerivationError("unsupported_question_type")
-    derivation = execute_safe_derivation(str(question.get("derivation", "")))
     evidence = _tatqa_evidence(document_id, row)
-    support_ids = _locate_operands(derivation.operands, evidence)
+    if answer_type == "count":
+        derivation, support_ids = _execute_tatqa_count(question, evidence)
+    else:
+        derivation = execute_safe_derivation(str(question.get("derivation", "")))
+        support_ids = _locate_operands(derivation.operands, evidence)
     return _make_case(
         dataset="tatqa",
         source_name=source_name,
@@ -668,7 +716,7 @@ def _rejection(
 ) -> RejectionRecord:
     return RejectionRecord(
         dataset=snapshot.dataset,
-        source=snapshot.path.name,
+        source=snapshot.source_id,
         document_id=document_id,
         question_id=_question_id(question) if question is not None else None,
         reason=error.reason,
@@ -695,7 +743,7 @@ def adapt_primary_snapshots(
                 f"source snapshot checksum mismatch for {snapshot.path}: "
                 f"expected {snapshot.expected_sha256}, observed {observed_hash}"
             )
-        source_hashes[f"{snapshot.dataset}:{snapshot.path.name}"] = observed_hash
+        source_hashes[snapshot.source_id] = observed_hash
         for row in _source_rows(snapshot.path):
             document_id = _document_id(snapshot.dataset, row)
             fingerprint = _document_fingerprint(snapshot.dataset, row)
@@ -721,14 +769,14 @@ def adapt_primary_snapshots(
                 try:
                     if snapshot.dataset == "finqa":
                         adapted = _adapt_finqa_question(
-                            source_name=snapshot.path.name,
+                            source_name=snapshot.source_id,
                             document_id=document_id,
                             row=row,
                             question=question,
                         )
                     else:
                         adapted = _adapt_tatqa_question(
-                            source_name=snapshot.path.name,
+                            source_name=snapshot.source_id,
                             document_id=document_id,
                             row=row,
                             question=question,
@@ -747,7 +795,7 @@ def adapt_primary_snapshots(
                 rejections.append(
                     RejectionRecord(
                         dataset=snapshot.dataset,
-                        source=snapshot.path.name,
+                        source=snapshot.source_id,
                         document_id=document_id,
                         question_id=unselected.hidden.source_lineage[-1],
                         reason="one_question_per_document",
@@ -867,6 +915,9 @@ def prepare_primary_datasets(
         if observed[(dataset, stratum)] < required
     }
     if shortfalls:
+        rejection_counts = dict(
+            sorted(Counter(row.reason for row in adapted.rejections).items())
+        )
         report = {
             "status": "aborted",
             "reason": "quota_shortfall",
@@ -877,9 +928,46 @@ def prepare_primary_datasets(
                 for stratum in ("headroom", "easy_control")
             },
             "shortfalls": dict(sorted(shortfalls.items())),
+            "rejections": rejection_counts,
             "source_hashes": dict(adapted.source_hashes),
         }
-        _write_json(output_dir / "preparation_discrepancy.json", report)
+        profile = {
+            **report,
+            "schema_version": 1,
+            "seed": seed,
+            "document_disjoint": len(
+                {case.public.document_id for case in adapted.cases}
+            )
+            == len(adapted.cases),
+            "lineage": [
+                {
+                    "case_id": case.public.case_id,
+                    "dataset": case.public.dataset,
+                    "source": case.hidden.source_lineage[0],
+                    "document_id": case.public.document_id,
+                    "question_id": case.hidden.source_lineage[-1],
+                    "stratum": case.public.stratum,
+                }
+                for case in adapted.cases
+            ],
+        }
+        rejection_path = output_dir / "rejections.jsonl"
+        profile_path = output_dir / "profile.json"
+        discrepancy_path = output_dir / "preparation_discrepancy.json"
+        _write_jsonl(rejection_path, adapted.rejections)
+        _write_json(profile_path, profile)
+        _write_json(discrepancy_path, report)
+        artifact_hashes = {
+            str(path.relative_to(output_dir)): sha256_file(path)
+            for path in (discrepancy_path, profile_path, rejection_path)
+        }
+        _write_json(
+            output_dir / "hashes.json",
+            {
+                "source_hashes": dict(adapted.source_hashes),
+                "artifact_hashes": dict(sorted(artifact_hashes.items())),
+            },
+        )
         raise PreparationAbort(report)
 
     selected = _split_cases(adapted.cases, quotas, seed)

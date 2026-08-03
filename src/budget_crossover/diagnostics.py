@@ -205,7 +205,10 @@ def _adapt_record(snapshot: FinanceComplexSnapshot, row: Mapping[str, Any]) -> F
         for index, (document_id, text) in enumerate(documents)
     )
     derivation = execute_safe_derivation(str(row.get("derivation", "")))
-    support_ids = _locate_operands(derivation.operands, evidence)
+    reference_evidence = tuple(
+        item for item in evidence if item.table_id in set(reference_ids)
+    )
+    support_ids = _locate_operands(derivation.operands, reference_evidence)
     answer = _answer_spec(row)
     if derivation.value != answer.value:
         raise DerivationError("program_answer_mismatch")
@@ -321,6 +324,17 @@ def scorer_oracle_boundary(cases: Sequence[FinanceComplexCase]) -> dict[str, Any
     gold_correct = 0
     adversarial_rejected = 0
     adversarial_total = 0
+    adversarial_by_field: dict[str, dict[str, int]] = {}
+
+    def record(field: str, rejected: bool) -> None:
+        nonlocal adversarial_rejected, adversarial_total
+        counts = adversarial_by_field.setdefault(field, {"total": 0, "rejected": 0})
+        counts["total"] += 1
+        adversarial_total += 1
+        if rejected:
+            counts["rejected"] += 1
+            adversarial_rejected += 1
+
     for case in cases:
         oracle = serialize_gold_oracle(case.public, case.hidden)
         if score_candidate(oracle, case.hidden.answer).correct:
@@ -330,10 +344,21 @@ def scorer_oracle_boundary(cases: Sequence[FinanceComplexCase]) -> dict[str, Any
             case.hidden.answer.value + delta,
             case.hidden.answer.value - delta,
         ):
-            adversarial_total += 1
             adversarial = oracle.model_copy(update={"value": format(value, "f")})
-            if not score_candidate(adversarial, case.hidden.answer).correct:
-                adversarial_rejected += 1
+            record("value", not score_candidate(adversarial, case.hidden.answer).correct)
+        alternate_scale = "thousand" if oracle.scale == "ones" else "ones"
+        adversarial = oracle.model_copy(update={"scale": alternate_scale})
+        record("scale", not score_candidate(adversarial, case.hidden.answer).correct)
+        if oracle.unit is not None:
+            alternate_unit = "EUR" if oracle.unit.casefold() != "eur" else "USD"
+            adversarial = oracle.model_copy(update={"unit": alternate_unit})
+            record("unit", not score_candidate(adversarial, case.hidden.answer).correct)
+        if oracle.entity is not None:
+            adversarial = oracle.model_copy(update={"entity": "__adversarial_entity__"})
+            record("entity", not score_candidate(adversarial, case.hidden.answer).correct)
+        if oracle.period is not None:
+            adversarial = oracle.model_copy(update={"period": "__adversarial_period__"})
+            record("period", not score_candidate(adversarial, case.hidden.answer).correct)
     total = len(cases)
     gold_rate = gold_correct / total if total else 0.0
     adversarial_rate = (
@@ -346,6 +371,7 @@ def scorer_oracle_boundary(cases: Sequence[FinanceComplexCase]) -> dict[str, Any
         "adversarial_total": adversarial_total,
         "adversarial_rejected": adversarial_rejected,
         "adversarial_rejection_rate": adversarial_rate,
+        "adversarial_by_field": dict(sorted(adversarial_by_field.items())),
         "pass": bool(total) and gold_rate == 1.0 and adversarial_rate == 1.0,
     }
 
@@ -377,8 +403,28 @@ def audit_evidence_lineage_and_leakage(
     linked = 0
     missing_links: dict[str, list[str]] = {}
     for case in cases:
+        by_id = {item.evidence_id: item for item in case.public.evidence}
         observed = {item.table_id for item in case.public.evidence if item.table_id is not None}
-        missing = sorted(set(case.lineage.reference_document_ids) - observed)
+        references = set(case.lineage.reference_document_ids)
+        missing = sorted(references - observed)
+        reference_evidence = tuple(
+            item for item in case.public.evidence if item.table_id in references
+        )
+        invalid_support = [
+            evidence_id
+            for evidence_id in case.hidden.gold_support_ids
+            if evidence_id not in by_id or by_id[evidence_id].table_id not in references
+        ]
+        if invalid_support:
+            missing.extend(f"support:{evidence_id}" for evidence_id in invalid_support)
+        try:
+            derivation = execute_safe_derivation(case.hidden.gold_derivation)
+            located_support = _locate_operands(derivation.operands, reference_evidence)
+        except DerivationError:
+            missing.append("required_operand_support")
+        else:
+            if not set(located_support).issubset(case.hidden.gold_support_ids):
+                missing.append("required_operand_support")
         if missing:
             missing_links[case.public.case_id] = missing
         else:
@@ -413,6 +459,17 @@ def export_oracle_evidence_cases(
         missing = set(case.hidden.gold_support_ids) - set(by_id)
         if missing:
             raise ValueError(f"oracle evidence support IDs are missing: {sorted(missing)}")
+        references = set(case.lineage.reference_document_ids)
+        outside_references = [
+            evidence_id
+            for evidence_id in case.hidden.gold_support_ids
+            if by_id[evidence_id].table_id not in references
+        ]
+        if outside_references:
+            raise ValueError(
+                "oracle evidence must come from declared reference documents: "
+                f"{outside_references}"
+            )
         evidence = tuple(by_id[evidence_id] for evidence_id in case.hidden.gold_support_ids)
         exported.append(case.public.model_copy(update={"evidence": evidence}))
     _write_jsonl(path, tuple(exported))
@@ -443,45 +500,59 @@ def retrieval_ladder_boundary(
     *,
     reference_queries: Mapping[str, Sequence[str]],
     planned_queries: Mapping[str, Sequence[str]],
-    production_results: Mapping[str, RetrievalResult],
-    limit: int,
+    production_results: Mapping[str, Mapping[str, RetrievalResult]],
+    tier_limits: Mapping[str, int],
     max_chars_per_item: int,
-) -> dict[str, dict[str, float]]:
-    reference_results = {
-        case.public.case_id: retrieve(
-            case.public,
-            reference_queries.get(case.public.case_id, ()),
-            limit=limit,
-            max_chars_per_item=max_chars_per_item,
-        )
-        for case in cases
+) -> dict[str, dict[str, dict[str, float]]]:
+    case_ids = {case.public.case_id for case in cases}
+    tiers = {"low", "middle", "high"}
+    if set(reference_queries) != case_ids:
+        raise ValueError("reference query case coverage must match diagnostic cases exactly")
+    if set(planned_queries) != case_ids:
+        raise ValueError("planned query case coverage must match diagnostic cases exactly")
+    if set(production_results) != tiers:
+        raise ValueError("production tier coverage must be exactly low, middle, and high")
+    if set(tier_limits) != tiers or any(value < 1 for value in tier_limits.values()):
+        raise ValueError("tier limits must define positive low, middle, and high limits")
+    for tier in sorted(tiers):
+        if set(production_results[tier]) != case_ids:
+            raise ValueError(f"{tier} production case coverage must match cases exactly")
+
+    query_ladders: dict[str, dict[str, dict[str, RetrievalResult]]] = {
+        "reference": {},
+        "planned": {},
     }
-    planned_results = {
-        case.public.case_id: retrieve(
-            case.public,
-            planned_queries.get(case.public.case_id, ()),
-            limit=limit,
-            max_chars_per_item=max_chars_per_item,
-        )
-        for case in cases
-    }
-    if set(production_results) != {case.public.case_id for case in cases}:
-        raise ValueError("production retrieval results must cover every diagnostic case exactly")
-    ladders = {
-        "reference": reference_results,
-        "planned": planned_results,
+    for ladder_name, queries in (
+        ("reference", reference_queries),
+        ("planned", planned_queries),
+    ):
+        for tier in sorted(tiers):
+            query_ladders[ladder_name][tier] = {
+                case.public.case_id: retrieve(
+                    case.public,
+                    queries[case.public.case_id],
+                    limit=tier_limits[tier],
+                    max_chars_per_item=max_chars_per_item,
+                )
+                for case in cases
+            }
+    ladders: dict[str, Mapping[str, Mapping[str, RetrievalResult]]] = {
+        **query_ladders,
         "production": production_results,
     }
     return {
         name: {
-            "pre_truncation_recall": _reference_recall(
-                cases, results, "pre_truncation_ids"
-            ),
-            "post_truncation_recall": _reference_recall(
-                cases, results, "post_truncation_ids"
-            ),
+            tier: {
+                "pre_truncation_recall": _reference_recall(
+                    cases, results, "pre_truncation_ids"
+                ),
+                "post_truncation_recall": _reference_recall(
+                    cases, results, "post_truncation_ids"
+                ),
+            }
+            for tier, results in tier_results.items()
         }
-        for name, results in ladders.items()
+        for name, tier_results in ladders.items()
     }
 
 
@@ -495,7 +566,9 @@ def build_financecomplex_boundary_report(
     output_path: Path | None = None,
 ) -> dict[str, Any]:
     production_recall = float(
-        retrieval.get("production", {}).get("post_truncation_recall", 0.0)
+        retrieval.get("production", {})
+        .get("high", {})
+        .get("post_truncation_recall", 0.0)
     )
     failures: list[str] = []
     if float(scorer.get("gold_correct_rate", 0.0)) != 1.0 or not scorer.get("pass", False):

@@ -26,6 +26,32 @@ class _DivisionByZero(ValueError):
     pass
 
 
+def _count_evidence_ids(expression: str) -> tuple[str, ...] | None:
+    if not expression.lstrip().startswith("count"):
+        return None
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise _UnsafeExpression from error
+    body = tree.body
+    if (
+        not isinstance(body, ast.Call)
+        or not isinstance(body.func, ast.Name)
+        or body.func.id != "count"
+        or body.keywords
+        or not body.args
+        or any(
+            not isinstance(argument, ast.Constant) or not isinstance(argument.value, str)
+            for argument in body.args
+        )
+    ):
+        raise _UnsafeExpression
+    evidence_ids = tuple(argument.value for argument in body.args)
+    if len(evidence_ids) != len(set(evidence_ids)) or any(not value for value in evidence_ids):
+        raise _UnsafeExpression
+    return evidence_ids
+
+
 def _evaluate(expression: str) -> tuple[Decimal, tuple[Decimal, ...]]:
     try:
         tree = ast.parse(expression, mode="eval")
@@ -118,15 +144,29 @@ def check_candidate(
 
     evaluated: Decimal | None = None
     operands: tuple[Decimal, ...] = ()
+    count_evidence_ids: tuple[str, ...] | None = None
     if candidate.expression is None or not candidate.expression.strip():
         findings.append(_finding("missing_expression", "Candidate has no arithmetic expression."))
     else:
         try:
-            evaluated, operands = _evaluate(candidate.expression)
+            count_evidence_ids = _count_evidence_ids(candidate.expression)
+            if count_evidence_ids is None:
+                evaluated, operands = _evaluate(candidate.expression)
+            else:
+                evaluated = Decimal(len(count_evidence_ids))
         except _DivisionByZero:
             findings.append(_finding("division_by_zero", "Expression divides by zero."))
         except _UnsafeExpression:
             findings.append(_finding("unsafe_expression", "Expression contains unsafe syntax."))
+
+    if count_evidence_ids is not None and set(count_evidence_ids) != set(candidate.citations):
+        findings.append(
+            _finding(
+                "count_evidence_mismatch",
+                "Count expression evidence must match candidate citations exactly.",
+                count_evidence_ids,
+            )
+        )
 
     if evaluated is not None:
         supported = _evidence_numbers(cited)

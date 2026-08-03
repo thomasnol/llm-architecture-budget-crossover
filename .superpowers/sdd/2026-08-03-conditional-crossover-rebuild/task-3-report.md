@@ -210,3 +210,225 @@ $ git diff --check
 - Program/answer agreement is deliberately conservative and exact in displayed units. Unexpected
   source formatting, ambiguous operand locations, or rounded derivations reject and surface as a
   quota/count discrepancy rather than being normalized heuristically or silently admitted.
+
+## Fix round 1: critical and important independent-review findings
+
+Base commit: `eee6bccfe5c5208ce291ac1c53caf268dbaeb126`.
+
+### Changes
+
+- Implemented explicit TAT-QA count semantics. A count question now requires a nonempty `facts`
+  list whose normalized exact text uniquely identifies each counted evidence item. Missing and
+  ambiguous facts reject; the annotated answer must be an integer equal to the number of unique
+  cited items. The canonical derivation is strict `count("evidence-id", ...)`, and the documented
+  aggregation-operation count is `max(1, n - 1)`, so two facts can be `easy_control` while three or
+  more can satisfy `headroom` only through the same frozen-retrieval rank rule.
+- Added narrow checker and candidate-prompt support for strict count expressions. The checker
+  parses only a `count` call containing unique string evidence IDs, requires the expression IDs to
+  match citations exactly, and compares the resulting count with the strict numeric candidate.
+- Restricted FinanceComplex operand localization to declared reference-document evidence. The
+  lineage audit independently re-executes the hidden derivation and verifies its operands inside
+  references; oracle-evidence export refuses support IDs sourced from distractors.
+- Made retrieval ladders explicitly low/middle/high. Reference and planned queries require exact
+  case coverage, production requires exactly all three known tiers and exact case coverage within
+  every tier, tier limits must be exact and positive, and the report preserves pre/post recall for
+  every ladder/tier. The system-run gate now reads only high-tier production post-truncation recall.
+- Before a quota-shortfall abort, primary preparation now emits the categorical rejection ledger,
+  an aborted diagnostic lineage/profile, the discrepancy report, and source/artifact hashes.
+  Sidecars remain free of answers, programs, operands, and support annotations.
+- FinQA recognized `gold_inds` keys now require normalized exact agreement with annotated text.
+  Unknown-key exact-text fallback rejects zero matches and ambiguous duplicate matches.
+- Scorer-oracle diagnostics now add wrong scale for every case and wrong unit, entity, and period
+  whenever specified, in addition to two numeric perturbations. Per-field totals/rejections are
+  emitted and the boundary passes only when every adversary is rejected.
+- Fixed same-basename source-hash collisions with a stable content-qualified source identifier,
+  reused consistently by source hashes, rejection rows, and hidden lineage.
+
+### RED/GREEN evidence
+
+#### Explicit count semantics and checker
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_dataset.py::test_tatqa_accepts_count_questions_with_executable_evidence_backed_derivations \
+  tests/test_dataset.py::test_tatqa_count_rejects_missing_or_ambiguous_counted_evidence \
+  tests/test_checking.py::test_checker_validates_explicit_counted_evidence_without_numeric_operands
+FFF                                                                      [100%]
+3 failed in 0.16s
+```
+
+The candidate prompt then received its own RED because it still described arithmetic only:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_systems.py::test_planner_system_instructions_do_not_conflict_with_its_plan_schema
+F                                                                        [100%]
+1 failed in 0.15s
+```
+
+GREEN:
+
+```text
+$ .venv/bin/pytest -q <count-dataset-checker-prompt-slice>
+....                                                                     [100%]
+4 passed in 0.11s
+```
+
+The separate three-fact fixture also passed and proves the `n - 1` headroom rule.
+
+#### FinQA support annotation validation
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_dataset.py::test_finqa_validates_support_keys_and_rejects_ambiguous_text_fallback
+F                                                                        [100%]
+E assert (AdaptedCase(...), AdaptedCase(...)) == ()
+1 failed in 0.15s
+```
+
+GREEN with existing adapter regressions:
+
+```text
+...                                                                      [100%]
+3 passed in 0.11s
+```
+
+#### FinanceComplex reference-only support
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_diagnostics.py::test_financecomplex_rejects_operands_supported_only_by_distractor_documents \
+  tests/test_diagnostics.py::test_lineage_audit_and_oracle_export_reject_support_outside_references
+FF                                                                       [100%]
+2 failed in 0.15s
+```
+
+After restricting preparation/export, a stronger audit mutation (declared reference exists but
+lacks required operands while a distractor contains them) was observed RED:
+
+```text
+E assert 1.0 == 0.0
+1 failed, 1 passed in 0.17s
+```
+
+GREEN with scorer/lineage regressions:
+
+```text
+...                                                                      [100%]
+3 passed in 0.11s
+..                                                                       [100%]
+2 passed in 0.12s
+```
+
+#### Field-wise scorer adversaries
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_diagnostics.py::test_scorer_lineage_leakage_and_oracle_evidence_boundaries \
+  tests/test_diagnostics.py::test_scorer_oracle_perturbs_every_specified_answer_field
+FF                                                                       [100%]
+2 failed in 0.15s
+```
+
+GREEN:
+
+```text
+..                                                                       [100%]
+2 passed in 0.11s
+```
+
+#### Tiered retrieval and exact coverage
+
+RED:
+
+```text
+$ .venv/bin/pytest -q <tiered-ladder-and-boundary-slice>
+FFF....F                                                                 [100%]
+4 failed, 4 passed in 0.18s
+```
+
+Failures were the missing `tier_limits` API, the old un-tiered production structure, and the gate
+reading the old un-tiered recall field. GREEN:
+
+```text
+........                                                                 [100%]
+8 passed in 0.12s
+```
+
+This includes missing reference coverage, extra planned coverage, low/middle-only production,
+unknown production tier, missing high-tier case, 0.94 high-tier failure, and 0.95 high-tier pass.
+
+#### Quota-abort diagnostic artifacts
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_dataset.py::test_preparation_aborts_with_machine_readable_shortfalls
+F                                                                        [100%]
+FileNotFoundError: .../rejections.jsonl
+1 failed in 0.17s
+```
+
+GREEN with the successful preparation regression:
+
+```text
+..                                                                       [100%]
+2 passed in 0.11s
+```
+
+#### Content-qualified source identifiers
+
+RED:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_dataset.py::test_source_identifiers_distinguish_same_basenames_and_join_lineage
+F                                                                        [100%]
+E assert 1 == 2
+1 failed in 0.15s
+```
+
+GREEN with checksum repinning regression:
+
+```text
+..                                                                       [100%]
+2 passed in 0.12s
+```
+
+### Fix-round final verification
+
+```text
+$ .venv/bin/pytest -q tests/test_dataset.py tests/test_diagnostics.py \
+  tests/test_checking.py tests/test_systems.py
+......................................................................   [100%]
+70 passed in 0.22s
+
+$ .venv/bin/pytest -q
+........................................................................ [ 48%]
+........................................................................ [ 96%]
+.....                                                                    [100%]
+149 passed in 4.22s
+
+$ .venv/bin/ruff check .
+All checks passed!
+
+$ git diff --check
+# no output; exit 0
+```
+
+### Fix-round concern
+
+No real pinned TAT-QA snapshot is present locally. Explicit count support therefore uses the
+actual-like empty arithmetic derivation plus an exact `facts` evidence list in synthetic fixtures.
+If the acquired pinned snapshot uses a different count-support field, schema characterization must
+map that field to the same exact-evidence contract; questions without explicit counted evidence
+will reject rather than be inferred heuristically.

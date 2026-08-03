@@ -137,3 +137,37 @@ def test_checker_operand_provenance_preserves_signs_and_leading_decimals(
         assert expected_code in {finding.code for finding in result.findings}
     else:
         assert result.findings == ()
+
+
+def test_checker_validates_explicit_counted_evidence_without_numeric_operands():
+    evidence = (
+        EvidenceItem(
+            evidence_id="alpha",
+            document_id="doc-1",
+            kind="text",
+            text="Reported countable alpha item.",
+            ordinal=0,
+        ),
+        EvidenceItem(
+            evidence_id="beta",
+            document_id="doc-1",
+            kind="text",
+            text="Reported countable beta item.",
+            ordinal=1,
+        ),
+    )
+    valid = Candidate(
+        value="2",
+        unit=None,
+        scale="ones",
+        entity=None,
+        period=None,
+        expression='count("alpha", "beta")',
+        citations=("alpha", "beta"),
+    )
+    mismatched = valid.model_copy(update={"citations": ("alpha",)})
+
+    assert check_candidate(valid, evidence).passed is True
+    result = check_candidate(mismatched, evidence)
+    assert result.passed is False
+    assert "count_evidence_mismatch" in {finding.code for finding in result.findings}
