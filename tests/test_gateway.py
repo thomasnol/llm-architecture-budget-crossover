@@ -6,8 +6,11 @@ import pytest
 from budget_crossover.gateway import (
     CubicConcurrencyLimiter,
     GatewayClient,
+    GatewayCompletionClient,
     GatewayRequestError,
+    PromptTokenCount,
 )
+from budget_crossover.models import GatewayResponse, Usage
 
 
 @pytest.mark.asyncio
@@ -29,7 +32,7 @@ async def test_cubic_limiter_grows_then_multiplicatively_decreases():
 
 
 @pytest.mark.asyncio
-async def test_model_allowlists_match_the_two_gateway_credentials(monkeypatch):
+async def test_default_model_allowlists_expose_only_the_exact_canonical_model(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
     monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
     monkeypatch.setenv("LLM_GATEWAY_TOKEN_URL", "https://gateway.test/oauth/token")
@@ -47,13 +50,10 @@ async def test_model_allowlists_match_the_two_gateway_credentials(monkeypatch):
         assert client.maximum_total_concurrency == 18
         assert client.slots[0].limiter.limit == 4
         assert client.slots[0].limiter.max_concurrency == 9
-        assert client.slots[0].supports("claude-opus-4-6")
-        assert client.slots[0].supports("claude-sonnet-4-6")
-        assert not client.slots[1].supports("claude-sonnet-4-6")
-        assert all(slot.supports("gpt-5.4") for slot in client.slots)
         assert all(slot.supports("gpt-5.4-mini") for slot in client.slots)
-        assert all(slot.supports("gpt-5.4-nano") for slot in client.slots)
-        assert (await client._slot("claude-opus-4-6")).index == 1
+        assert not any(slot.supports("gpt-5.4") for slot in client.slots)
+        assert not any(slot.supports("gpt-5.4-nano") for slot in client.slots)
+        assert not any(slot.supports("claude-sonnet-4-6") for slot in client.slots)
         with pytest.raises(RuntimeError, match="no configured credential"):
             await client._slot("unknown-model")
     finally:
@@ -131,6 +131,45 @@ async def test_oauth_pair_and_usage_payload_work_end_to_end(monkeypatch):
     assert first.usage.total_tokens == 118
     assert first.concurrency_window is not None
     assert second.concurrency_window >= first.concurrency_window
+
+
+@pytest.mark.asyncio
+async def test_gateway_derives_total_without_mutating_frozen_usage(monkeypatch):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.test/v1")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY_1", "api-key")
+    monkeypatch.setenv("LLM_GATEWAY_MODELS_1", "gpt-5.4-mini")
+    for name in (
+        "LLM_GATEWAY_API_KEY_2",
+        "LLM_GATEWAY_CLIENT_ID_2",
+        "LLM_GATEWAY_CLIENT_SECRET_2",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "gpt-5.4-mini",
+                "choices": [{"message": {"content": "42"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 2},
+            },
+        )
+
+    client = GatewayClient()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await client.complete(
+            model="gpt-5.4-mini",
+            system="system",
+            user="case",
+            max_tokens=64,
+        )
+    finally:
+        await client.close()
+
+    assert response.usage.total_tokens == 13
+    assert response.usage.authoritative_total == 13
 
 
 @pytest.mark.asyncio
@@ -266,3 +305,90 @@ async def test_transport_failure_remains_retryable_after_gateway_retries(
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+class _Tokenizer:
+    tokenizer_id = "tokenizer-v1"
+    tokenizer_sha256 = "b" * 64
+
+    async def count(self, *, model: str, system: str, user: str) -> PromptTokenCount:
+        assert (model, system, user) == ("gpt-5.4-mini", "system", "user")
+        return PromptTokenCount(
+            model=model,
+            prompt_tokens=17,
+            tokenizer_id=self.tokenizer_id,
+            tokenizer_sha256=self.tokenizer_sha256,
+        )
+
+
+class _Gateway:
+    async def complete(self, **kwargs) -> GatewayResponse:
+        return GatewayResponse(
+            text='{"status":"ok"}',
+            model=kwargs.pop("resolved_model", "gpt-5.4-mini"),
+            usage=Usage(prompt_tokens=17, completion_tokens=4, total_tokens=21),
+            latency_seconds=0.01,
+            credential_slot=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_completion_adapter_uses_exact_tokenizer_and_authoritative_gateway_usage():
+    adapter = GatewayCompletionClient(
+        gateway=_Gateway(),
+        tokenizer=_Tokenizer(),
+        model="gpt-5.4-mini",
+        tokenizer_id="tokenizer-v1",
+        tokenizer_sha256="b" * 64,
+    )
+
+    count = await adapter.count_prompt_tokens(
+        model="gpt-5.4-mini", system="system", user="user"
+    )
+    response = await adapter.complete(
+        model="gpt-5.4-mini",
+        system="system",
+        user="user",
+        max_tokens=32,
+        stage="preflight",
+    )
+
+    assert count == 17
+    assert response.usage.authoritative_total == 21
+    assert response.model == "gpt-5.4-mini"
+
+
+@pytest.mark.asyncio
+async def test_completion_adapter_refuses_any_requested_or_resolved_model_substitution():
+    adapter = GatewayCompletionClient(
+        gateway=_Gateway(),
+        tokenizer=_Tokenizer(),
+        model="gpt-5.4-mini",
+        tokenizer_id="tokenizer-v1",
+        tokenizer_sha256="b" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="model substitution"):
+        await adapter.count_prompt_tokens(model="gpt-5.4", system="system", user="user")
+
+    class SubstitutingGateway(_Gateway):
+        async def complete(self, **kwargs) -> GatewayResponse:
+            response = await super().complete(**kwargs)
+            response.model = "gpt-5.4-mini-fallback"
+            return response
+
+    substituting = GatewayCompletionClient(
+        gateway=SubstitutingGateway(),
+        tokenizer=_Tokenizer(),
+        model="gpt-5.4-mini",
+        tokenizer_id="tokenizer-v1",
+        tokenizer_sha256="b" * 64,
+    )
+    with pytest.raises(RuntimeError, match="resolved model"):
+        await substituting.complete(
+            model="gpt-5.4-mini",
+            system="system",
+            user="user",
+            max_tokens=32,
+            stage="preflight",
+        )

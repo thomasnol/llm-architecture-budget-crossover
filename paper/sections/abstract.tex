@@ -1,20 +1,18 @@
 \begin{abstract}
-Agent workflows are often compared by call count or a loose completion limit.
-Neither measure answers the practical question: which architecture makes the
-best decision when every prompt and completion must fit inside the same budget?
-This paper defines a controlled experiment in mortgage adjudication using the
-official 2024 Home Mortgage Disclosure Act data. We convert predecision
-application fields into a transparent research policy with four outcomes:
-approve, conditional review, deny, and manual review. Historical lender action
-remains a descriptive outcome, not ground truth. Each application also receives
-a counterfactual twin that changes one monitoring-only demographic field while
-holding the financial evidence and policy label fixed. The primary study holds
-GPT-5.4-mini fixed while comparing a monolith, plan-and-retrieve, a specialist
-committee, a fixed compliance guardrail, and adaptive guarded routing at four
-candidate total-token budgets selected through a preregistered calibration
-stage. A separate ablation studies selective escalation to Claude Sonnet 4.6.
-The primary unit is the source application, and success
-requires a correct decision on both twins. This artifact freezes the dataset,
-prompts, gateway preflight, budget accounting, metrics, and analysis before the external gateway
-run. It reports no model-performance result yet.
+Extra inference structure can help a language model search, verify, and revise,
+but those actions also consume the budget they are meant to use well. This
+protocol preregisters a conditional test: verified search should be worse than a
+one-call monolith at a low token budget and better at a high token budget. The
+primary datasets are FinQA and TAT-QA, prepared from pinned local snapshots with
+one selected question per source document, hidden labels, executable gold
+derivations, and document-disjoint splits. The systems are a monolith, verified
+search, and an exploratory unverified-search ablation, all using exactly
+\texttt{gpt-5.4-mini}. Low, middle, and high tiers provide action-backed limits
+on retrieval, planning, candidates, repair, and total authoritative prompt plus
+completion tokens. Confirmation is an intersection-union test requiring both a
+negative low-tier paired effect and a positive high-tier paired effect; equality
+is never a crossover. FinanceComplexQA remains exploratory behind scorer,
+lineage, leakage, oracle-evidence, retrieval, and orchestration boundaries. This
+is a protocol-only artifact. No empirical conclusion is available, and the
+hypothesis is currently neither supported nor cleanly falsified.
 \end{abstract}

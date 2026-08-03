@@ -1,130 +1,125 @@
-# Token-budgeted agent orchestration for mortgage adjudication
+# When Extra Inference Structure Pays
 
-This repository evaluates how orchestration architecture changes the reliability
-and efficiency of LLM mortgage adjudication when the entire trajectory shares a
-case-level token budget.
+This repository implements a preregistered test of token-budget crossovers in
+financial reasoning. The confirmatory question is conditional: is verified
+search worse than a one-call monolith at low budget, but better at high budget?
 
-Official 2024 Home Mortgage Disclosure Act data from CFPB/FFIEC seed realistic
-applications. Historical lender action is observational and is never the correct
-answer. A transparent research-only policy produces reproducible approve,
-conditional-review, deny, and manual-review labels from predecision financial
-fields. Each application has a counterfactual twin that changes exactly one
-monitoring-only protected attribute.
+Scientific status: no empirical conclusion is available. No complete validated
+gateway run exists for the rebuilt protocol. The hypothesis is currently
+neither supported nor cleanly falsified. FinanceComplexQA is exploratory only.
+Historical repository runs and the deterministic offline fixture are not model
+evidence.
 
-This is an evaluation sandbox, not lending advice, a production credit policy,
-or evidence that a historical lender decision was correct.
+## Canonical design
 
-## Studies
+The primary data are pinned local FinQA and TAT-QA snapshots. Preparation is
+offline and deterministic after acquisition. It enforces one selected question
+per source document/context, executable gold derivations, operand provenance,
+hidden labels, outcome-independent strata, exact quotas, and document-disjoint
+splits.
 
-The primary architecture study holds the model fixed at GPT-5.4-mini:
+The systems are exactly:
 
-- full-context monolith;
-- plan-and-retrieve;
-- specialist committee;
-- fixed underwriter-plus-compliance guardrail;
-- adaptive guarded routing.
+- `monolith` - one direct answer call;
+- `verified_search` - mandatory planning, deterministic retrieval, label-blind
+  checking, and at most one allowed repair;
+- `unverified_search` - an exploratory no-checker ablation with stable
+  plurality selection.
 
-The separate routing study compares an always-primary monolith, an
-always-supervisor monolith, and selective escalation from GPT-5.4-mini to Claude
-Sonnet 4.6. This avoids attributing model-quality differences to architecture.
-
-The staged design is:
-
-1. gateway preflight on every model and eligible credential;
-2. high-budget calibration and four-budget recommendation;
-3. a 48-case pilot;
-4. a disjoint 384-case main architecture study with one repetition.
-
-The main grid contains 7,680 cells: 384 cases × five architectures × four
-budgets × one repetition.
+All systems use exactly `gpt-5.4-mini`. There is no fallback model. The hard
+resource intervention is authoritative prompt plus completion usage over the
+whole cell. Low, middle, and high tiers cap tokens at 4,096, 12,288, and 32,768
+and also freeze retrieval, planned-query, candidate, and repair opportunities.
 
 ## Setup
 
 ```bash
 uv sync --extra dev
 cp .env.example .env
-# Fill in the endpoint and two OAuth credential pairs.
-
-uv run python scripts/download_hmda.py
 uv run pytest -q
 uv run ruff check src tests
+```
+
+Place separately acquired, pinned snapshots at the configured paths and set
+their SHA-256 environment values. Preparation never downloads data.
+
+The gateway must provide both completion and exact chat-tokenizer endpoints.
+Preflight requires:
+
+- requested and response-resolved model exactly `gpt-5.4-mini`;
+- strict JSON with no extra keys;
+- authoritative prompt and completion usage;
+- a frozen tokenizer ID and SHA-256;
+- exact equality between pre-call tokenizer count and gateway prompt usage.
+
+If exact tokenizer support is unavailable, preflight fails closed. Character
+estimates and model substitution are prohibited.
+
+## Linear workflow
+
+Run these commands in order with the same configuration:
+
+```bash
+uv run budget-crossover prepare --config configs/main.yaml
+uv run budget-crossover diagnose-finance-complex --config configs/main.yaml
+uv run budget-crossover preflight --config configs/main.yaml
+uv run budget-crossover develop --config configs/main.yaml
+uv run budget-crossover pilot --config configs/main.yaml
+uv run budget-crossover gate --config configs/main.yaml
+uv run budget-crossover run --config configs/main.yaml
+uv run budget-crossover validate --config configs/main.yaml
+uv run budget-crossover analyze --config configs/main.yaml
+uv run budget-crossover build-paper --config configs/main.yaml
+```
+
+The pilot gate is non-overridable. Every downstream command verifies upstream
+hashes. The immutable run manifest binds resolved configuration, exact case and
+document inventory, the exact expected cell grid, sources, prepared artifacts,
+prompts, system/checker/retriever/code versions, dependency lock, exact
+model/deployment/tokenizer, retry and failure policy, secret-free credential
+patterns, clean Git commit, preflight, and pilot gate. Mutable progress belongs
+only in `run_state.json`.
+
+## Offline verification
+
+```bash
 uv run python scripts/smoke_pipeline.py
 ```
 
-The downloader verifies the official CSV schema and the frozen SHA-256 digest.
-Downloaded data, processed cases, gateway transcripts, and generated results are
-ignored by Git.
+The smoke workflow uses a deterministic completion client and an exact fictional
+byte tokenizer. It runs all ten stages and is permanently marked
+`NON_EMPIRICAL_OFFLINE_FIXTURE`. Tests prove that incomplete grids, failed
+gates, changed hashes, scripted results, and protocol violations cannot produce
+empirical prose.
 
-## Staged execution
+## Inference and reporting
 
-```bash
-# Prepare cases without making model calls.
-uv run budget-crossover prepare --config configs/pilot.yaml
-uv run budget-crossover prepare --config configs/main.yaml
+Confirmation is an intersection-union test: the low-tier paired difference must
+be strictly negative and pass its one-sided exact McNemar test, while the
+high-tier difference must be strictly positive and pass its test. Equality is
+never a crossover. The analysis retains non-crossing bootstrap replicates and
+reports no-crossing mass, conditional crossing intervals, SESOI interpretations,
+domain estimates, failures, mechanism traces, and resource-specific Pareto
+probabilities.
 
-# Verify each actual payload/model/credential path.
-uv run budget-crossover preflight --config configs/calibration.yaml
-
-# Run high-budget calibration, then inspect its recommendation.
-uv run budget-crossover pilot --config configs/calibration.yaml
-uv run budget-crossover calibrate --config configs/calibration.yaml
-
-# After accepting the frozen budgets, preflight and run the pilot.
-uv run budget-crossover preflight --config configs/pilot.yaml
-uv run budget-crossover pilot --config configs/pilot.yaml
-uv run budget-crossover status --config configs/pilot.yaml
-uv run budget-crossover validate \
-  --config configs/pilot.yaml \
-  --no-require-pilot-gate
-uv run budget-crossover analyze --config configs/pilot.yaml
-
-# The main run is blocked unless the complete pilot passes.
-uv run budget-crossover preflight --config configs/main.yaml
-uv run budget-crossover run --config configs/main.yaml
-uv run budget-crossover status --config configs/main.yaml
-uv run budget-crossover validate --config configs/main.yaml
-uv run budget-crossover analyze --config configs/main.yaml
-
-# Separate model-routing ablation.
-uv run budget-crossover preflight --config configs/routing_pilot.yaml
-uv run budget-crossover pilot --config configs/routing_pilot.yaml
-```
-
-Normal analysis rejects missing or duplicate grid cells. `analyze --diagnostic`
-is available for operational investigation; all figures it creates are
-watermarked `INCOMPLETE DIAGNOSTIC` and are not paper evidence.
-
-## Reliability and accounting
-
-Gateway-reported `prompt_tokens`, `completion_tokens`, and `total_tokens` are
-authoritative. A manifest freezes cases, prompts, code, configuration, resolved
-deployments, non-secret gateway protocol settings, the dependency lock, and Git
-state.
-
-Failures are checkpointed separately from scored outcomes. The runner:
-
-- retries only transient transport, rate-limit, and selected server errors;
-- reports completed decisions, budget-exhausted abstentions, error attempts,
-  and unresolved failed cells separately;
-- records sanitized status, response detail, model, stage, credential slot, and
-  request ID;
-- stops after three equivalent permanent failures;
-- uses a bounded worker pool;
-- maintains one CUBIC concurrency window per credential.
-
-Raise `LLM_GATEWAY_CONCURRENCY_PER_KEY` to increase the ceiling. Credential pair
-1 supports GPT and Claude deployments; pair 2 supports GPT deployments only.
+FinanceComplexQA must pass scorer, lineage, leakage, oracle-evidence, retrieval,
+and orchestration boundaries before exploratory system execution. It is never
+pooled into confirmation.
 
 ## Paper
 
 ```bash
 uv run python paper/build_paper.py
 cd paper
-latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=build main.tex
+latexmk -pdf -interaction=nonstopmode -halt-on-error \
+  -jobname=when-extra-inference-structure-pays-protocol \
+  -outdir=../output/pdf main.tex
 ```
 
-Until a complete validated main run exists, the approximately five-page LaTeX
-artifact remains a registered protocol and makes no empirical model-performance
-claims. The operator guide is [experiments/RUNBOOK.md](experiments/RUNBOOK.md);
-remaining paper work is tracked in
-[experiments/REMAINING_WORK.md](experiments/REMAINING_WORK.md).
+The final protocol PDF is written to `output/pdf/`. Until a complete validated,
+hash-matching gateway manifest exists, the generated results section explicitly
+says no empirical conclusion is available.
+
+See [experiments/PREREGISTRATION.md](experiments/PREREGISTRATION.md),
+[experiments/RUNBOOK.md](experiments/RUNBOOK.md), and
+[docs/HISTORICAL_AUDIT.md](docs/HISTORICAL_AUDIT.md).

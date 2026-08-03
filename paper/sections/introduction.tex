@@ -1,80 +1,41 @@
-\section{Introduction}
+\section{Question and Conditional Hypothesis}
 
-Mortgage adjudication looks simple only after the decision has been made. Before
-that point, an underwriter must connect income, debt capacity, collateral,
-product rules, missing data, and compliance constraints. A useful AI workflow
-must do the same work without quietly spending an unlimited number of tokens.
-This makes mortgage review a strong test for agent orchestration: the evidence
-is structured, the policy has precedence, and a compliance failure can matter
-even when the final label happens to be correct.
+Test-time computation is useful only when its mechanism earns the resources it
+consumes. Planning can improve evidence selection, a checker can reject an
+unsupported calculation, and repair can recover a valid answer. Yet every added
+prompt repeats instructions and evidence, every candidate reserves completion
+space, and coordination can crowd out the very search it was intended to
+improve. Prior work shows that additional test-time compute can help, but that
+its best allocation depends on task difficulty \citep{snell2024testtime}.
+Self-correction is also unreliable without an informative external signal
+\citep{kamoi2024selfcorrection}. These observations motivate a conditional
+rather than universal claim about agent structure.
 
-Our research question is direct: under a fixed case-level token budget, which
-orchestration architecture produces the best joint profile of policy accuracy,
-counterfactual invariance, token use, and latency? The intervention is the
-architecture and the nominal total-token budget. The primary outcome is stricter
-than ordinary row accuracy. Both variants of the same application must receive
-the correct policy decision. The experiment therefore penalizes a system that is
-accurate on the observed record but changes its answer when a monitoring-only
-attribute changes.
+Let $D_b$ be the paired accuracy difference
+\texttt{verified\_search} minus \texttt{monolith} at budget tier $b$. The
+confirmatory hypothesis is
+\begin{equation}
+H_1: D_{\mathrm{low}}<0 \quad\text{and}\quad D_{\mathrm{high}}>0.
+\label{eq:hypothesis}
+\end{equation}
+The low-budget component asks whether coordination overhead hurts when resources
+are scarce. The high-budget component asks whether planned retrieval and
+label-blind verification help once their mandatory actions fit. Both directional
+components must pass. A positive high-tier effect alone is a threshold benefit,
+not a crossover. A zero difference at any endpoint is not a crossing.
 
-Recent test-time scaling work shows that extra inference compute can help, but
-the best allocation depends on problem difficulty \citep{snell2024testtime}.
-That result does not imply that more agents are better. Multi-stage systems
-repeat policy text, transmit summaries, and reserve output for later calls.
-Under a hard budget, coordination can crowd out evidence. Research on
-self-correction also warns that prompted feedback is unreliable unless the
-feedback source has useful information or an external check
-\citep{kamoi2024selfcorrection}. Our compliance agent therefore receives
-segregated monitoring evidence and a fixed policy; it does not simply ask the
-underwriter to ``think again.''
+The design separates three questions that are often conflated. First, does extra
+inference structure change correctness under a hard resource intervention?
+Second, does the intervention actually change realized actions and token use?
+Third, does any observed gain dominate simpler alternatives on tokens, cost, or
+latency? The confirmatory estimand addresses the first question for FinQA and
+TAT-QA. Mechanism and resource tables address the second. Resource-specific
+Pareto estimates address the third. FinanceComplexQA is reported separately as
+an exploratory diagnostic domain.
 
-Cost-aware cascades and routers show that model selection can improve a
-quality--cost frontier \citep{chen2023frugalgpt,ong2024routellm}. That is a
-different intervention from orchestration. We therefore hold the model fixed in
-the primary architecture study and evaluate weak-to-strong escalation in a
-separate ablation. We also report accuracy jointly with realized tokens and
-coverage, following the Pareto-oriented evaluation advocated by recent
-agent-leaderboard work \citep{ma2026hal}.
-
-HMDA is useful here because it contains real mortgage application, property, and
-monitoring fields. The public files are privacy modified and remain the most
-comprehensive public source on mortgage market activity
-\citep{ffiec2024hmda}. We do not use lender action as the correct underwriting
-answer. Action taken reflects institution policy, missing information, applicant
-behavior, and other facts that HMDA does not expose. Treating it as normative
-truth would reward imitation of historical decisions. We instead use a small,
-deterministic policy as a research instrument and report historical concordance
-only as a secondary description.
-
-The contribution is an experiment, not a proposed lending policy. It makes four
-choices explicit. First, every architecture pays for prompt and completion
-tokens across all internal calls. Second, the primary comparison holds the model
-fixed while a separate routing ablation tests selective Claude escalation.
-Third, counterfactual twins test a narrow invariance property without claiming
-to measure market discrimination or legal compliance. Fourth, the full grid,
-including malformed outputs and budget exhaustion, is retained. These choices
-make a negative result useful: if a committee spends more and performs no better,
-the experiment will show it.
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-  node distance=0.45cm,
-  box/.style={draw=navy, rounded corners=2pt, fill=lightblue, align=center,
-              minimum width=2.45cm, minimum height=0.72cm, font=\scriptsize},
-  arrow/.style={-{Latex[length=2mm]}, thick, draw=teal}
-]
-\node[box] (hmda) {Official 2024 HMDA\\predecision fields};
-\node[box, right=of hmda] (oracle) {Transparent policy\\and leakage filters};
-\node[box, right=of oracle] (twins) {Observed and\\counterfactual twins};
-\node[box, right=of twins] (grid) {5 systems $\times$\\4 token budgets};
-\node[box, right=of grid] (analysis) {Paired accuracy,\\invariance, cost};
-\draw[arrow] (hmda) -- (oracle);
-\draw[arrow] (oracle) -- (twins);
-\draw[arrow] (twins) -- (grid);
-\draw[arrow] (grid) -- (analysis);
-\end{tikzpicture}
-\caption{The frozen experiment separates source data, normative research labels,
-workflow execution, and paired analysis.}
-\label{fig:pipeline}
-\end{figure}
+\begin{statusbox}
+\textbf{Scientific status at freeze.} No complete validated main run is present.
+Repository tests and the deterministic offline fixture establish software
+behavior only. The current hypothesis is neither supported nor cleanly
+falsified.
+\end{statusbox}

@@ -1,54 +1,43 @@
-\section{Limitations and Remaining Work}
+\section{Interpretation Rules and Limitations}
 
-The study is intentionally narrow. Its policy omits credit-score values because
-public HMDA does not provide them. It also omits assets, reserves, document
-verification, institution overlays, and many legal details. Accuracy therefore
-means fidelity to Equation~\ref{eq:policy}, not creditworthiness and not the
-quality of a real lender's decision. The four selected jurisdictions improve
-auditability but do not represent the national mortgage market. Historical
-action remains useful for descriptive comparison only.
+The generated conclusion is determined by the frozen labels, not by editorial
+preference. \nolinkurl{strict_crossover_confirmed} means both directional exact
+tests passed after endpoint reversal. \nolinkurl{threshold_benefit_only} means
+high-budget superiority passed but the low endpoint did not establish harm.
+\nolinkurl{low_budget_harm_only} establishes only the low component.
+\nolinkurl{endpoint_reversal_not_confirmed} describes point estimates with
+insufficient directional evidence. \nolinkurl{no_directional_pattern} supports
+neither conditional component. Non-significance is not equivalence, a
+conditional crossing interval is not an unconditional interval, and equality
+is never relabeled as a crossover.
 
-The counterfactual probe has the same boundary. It can reveal direct sensitivity
-to one changed monitoring field inside this prompt. It cannot reveal structural
-disparity, proxy use in unobserved data, or a causal effect in real lending.
-Likewise, a compliance agent may improve policy fidelity while adding latency,
-or it may repeat the first agent's mistake. The fixed-model primary study and
-separate routing ablation keep those alternatives distinguishable.
+The primary datasets are financial question-answering benchmarks, not a census
+of deployed financial work. The document filters improve lineage and
+independence but change the target population. Gold derivations can be
+executable while still reflecting annotation choices. The checker is
+label-blind, so it can reject unsupported arithmetic but cannot guarantee a
+correct interpretation. All systems use the same model; correlated errors are
+therefore expected and are part of the architecture estimand.
 
-No live gateway result appears in this protocol. After the external run, the
-remaining work is to inspect case-level failures, regenerate the evidence-gated
-results section, write the final abstract, compare findings with prior work,
-state whether the confirmatory claim passed or failed, and conduct a citation
-and consistency review. Null results and failed operating points will remain in
-the paper.
+The hard budget measures gateway-reported prompt and completion tokens. Tool
+calls, CPU time, wall time, latency, and cost are separate telemetry rather than
+hidden additions to the token intervention. Exact tokenizer availability is a
+deployment prerequisite. If the gateway cannot provide the frozen tokenizer
+identity and prompt count, the experiment stops instead of estimating tokens
+from characters.
 
-\subsection{Threats to Validity}
+FinanceComplexQA remains exploratory until every boundary passes. Even then,
+its scorer, source structure, and retrieval behavior differ from the primary
+datasets, so it is not confirmation evidence. The deterministic offline fixture
+is also not evidence: it exists to prove that incomplete grids, failed gates,
+hash mismatches, scripted responses, and protocol violations cannot generate
+empirical prose.
 
-Three design risks remain even after the controls. First, the routing ablation
-combines model selection with extra calls; its conclusion therefore concerns a
-deployable composite policy, not a pure architecture effect. The primary study
-holds the model fixed. Second, adaptive routing uses a
-self-reported confidence value. Confidence is a routing signal, not a calibrated
-probability. We therefore report escalation behavior and performance by route
-instead of treating 0.90 as evidence that an answer is 90\% likely to be correct.
-Third, the prompt estimator is conservative but approximate. Only the gateway's
-usage object determines realized token cost.
+\section{Current Conclusion}
 
-The main sample has 192 independent applications. Power depends on the number of
-applications where adaptive and monolithic systems disagree, which cannot be
-known before the run. The analysis reports an observed-discordance minimum
-detectable effect, and a non-significant comparison will not be called
-equivalence. Finally, exact internal model deployments may not be available to
-outside researchers. The repository preserves model IDs, response-reported
-models, credential slot, prompts, token usage, source hashes, and all outputs so
-that the execution can still be audited and repeated inside the same gateway.
-
-\section{\hspace{0.15em}Conclusion}
-
-This design tests a practical claim: orchestration should earn its extra calls.
-HMDA supplies realistic mortgage records, a transparent sandbox supplies
-auditable labels, and protected-attribute twins supply a controlled invariance
-check. Five workflows then compete under the same total-token ledger. The code,
-data checksum, prompts, pilot gates, metrics, and figures are frozen before model
-execution. The next step is empirical, not editorial: run the complete grid,
-validate it, and let the measured trade-off determine the conclusion.
+No empirical conclusion is available in this protocol-only build. Historical
+repository outputs do not satisfy the present estimand or artifact gates. The
+conditional hypothesis is currently neither supported nor cleanly falsified.
+The next valid conclusion, including a null or negative conclusion, must come
+from a complete validated manifest whose preflight and pilot-gate hashes match
+and whose exact expected grid contains authoritative protocol-valid usage.

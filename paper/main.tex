@@ -1,9 +1,8 @@
 \documentclass[10pt]{article}
 \usepackage[utf8]{inputenc}
-\usepackage[margin=0.72in]{geometry}
+\usepackage[margin=0.76in]{geometry}
 \usepackage{setspace}
 \usepackage{amsmath}
-\usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{tabularx}
 \usepackage{array}
@@ -11,33 +10,29 @@
 \usepackage[dvipsnames]{xcolor}
 \usepackage{natbib}
 \usepackage{hyperref}
-\usepackage{tikz}
 \usepackage{fancyhdr}
-\usetikzlibrary{arrows.meta,positioning,fit}
 
 \setstretch{1.04}
-\setlength{\parindent}{1.1em}
+\setlength{\parindent}{1.05em}
 \setlength{\parskip}{0pt}
 \setlength{\textfloatsep}{7pt plus 2pt minus 2pt}
 \setlength{\floatsep}{6pt plus 2pt minus 2pt}
-\setlength{\intextsep}{6pt plus 2pt minus 2pt}
 \definecolor{navy}{HTML}{17324D}
 \definecolor{teal}{HTML}{1B7F79}
 \definecolor{lightblue}{HTML}{EEF3F6}
-\definecolor{muted}{HTML}{5F6B76}
 
 \hypersetup{
   colorlinks=true,
   linkcolor=navy,
   citecolor=teal,
   urlcolor=teal,
-  pdftitle={Token Budgets Change the Value of Agent Orchestration in Mortgage Adjudication},
+  pdftitle={When Extra Inference Structure Pays: A Preregistered Test of Token-Budget Crossovers in Financial Reasoning},
   pdfauthor={Thomas Nolasque}
 }
 
 \pagestyle{fancy}
 \fancyhf{}
-\lhead{\footnotesize Token-Budgeted Mortgage Adjudication}
+\lhead{\footnotesize When Extra Inference Structure Pays}
 \rhead{\footnotesize Preregistered protocol}
 \rfoot{\footnotesize \thepage}
 \renewcommand{\headrulewidth}{0.3pt}
@@ -45,20 +40,17 @@
 \newenvironment{statusbox}
   {\begin{quote}\small\color{navy}\hrule\medskip}
   {\medskip\hrule\end{quote}}
-
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
-\newcommand{\systemnode}[2][]{%
-  \node[draw=navy, rounded corners=2pt, fill=lightblue, align=center,
-        minimum height=0.62cm, font=\scriptsize, #1] {#2};}
 
-\title{\textbf{\color{navy}Token Budgets Change the Value of Agent Orchestration\\
-in Mortgage Adjudication}}
+\title{\textbf{\color{navy}When Extra Inference Structure Pays:\\
+A Preregistered Test of Token-Budget Crossovers\\
+in Financial Reasoning}}
 \author{Thomas Nolasque}
 \date{}
 
 \begin{document}
 \maketitle
-\vspace{-1.3em}
+\vspace{-1.25em}
 
 \input{sections/abstract}
 \input{sections/introduction}
@@ -67,8 +59,9 @@ in Mortgage Adjudication}}
 \IfFileExists{generated/results_section.tex}
   {\input{generated/results_section}}
   {\section{Results Status}
-   No validated external run is available. Run
-   \texttt{python paper/build\_paper.py} before compiling.}
+   \begin{statusbox}
+   \textbf{Protocol-only build.} No empirical conclusion is available.
+   \end{statusbox}}
 \input{sections/discussion}
 
 \bibliographystyle{plainnat}

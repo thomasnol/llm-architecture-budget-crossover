@@ -1,46 +1,57 @@
-experiment_name: main
-seed: 20260729
-hmda_year: 2024
-hmda_states:
-  - DC
-  - ND
-  - VT
-  - WY
-hmda_raw_filename: hmda_2024_dc_nd_vt_wy.csv
-hmda_source_sha256: ed1f933f5b3487310c8364aebba8cb8b82d3f9870ff744648899e62baceaf4f5
-base_application_count: 192
-exclude_pilot_applications: true
-pilot_base_application_count: 24
-pilot_experiment_name: pilot
-token_budgets:
-  - 4096
-  - 6144
-  - 8192
-  - 12288
+experiment_name: canonical-main
+execution_mode: gateway
+seed: 20260803
+finqa_snapshot:
+  path: data/raw/finqa.json
+  sha256: ${FINQA_SOURCE_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}
+tatqa_snapshot:
+  path: data/raw/tatqa.json
+  sha256: ${TATQA_SOURCE_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}
+finance_complex_snapshot:
+  path: data/raw/financecomplexqa.json
+  sha256: ${FINANCE_COMPLEX_SOURCE_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}
+prepared_data_dir: data/processed/canonical
+run_root: experiments/runs
+development_fit_path: experiments/inputs/development_fit.jsonl
+pilot_gate_metrics_path: experiments/inputs/pilot_gate_metrics.json
 systems:
   - monolith
-  - retrieval
-  - committee
-  - guardrail
-  - adaptive
-generator_model: ${GATEWAY_MODEL_PRIMARY:-gpt-5.4-mini}
-supervisor_model: ${GATEWAY_MODEL_SUPERVISOR:-claude-sonnet-4-6}
-stage_max_output_tokens: 256
-minimum_call_output_tokens: 64
-prompt_chars_per_token: 2.5
-prompt_token_overhead: 64
-direct_temperature: 0.0
-specialist_temperature: 0.0
-adaptive_confidence_threshold: 0.90
-request_timeout_seconds: 180
-runtime_hours: 6.0
-bootstrap_replicates: 5000
-minimum_high_budget_schema_validity: 0.95
-maximum_budget_overrun_rate: 0.01
-sesoi_accuracy_difference: 0.05
-# Populate only with approved internal prices. Token and latency metrics remain
-# primary when no price schedule is supplied.
-model_prices_per_million: {}
+  - verified_search
+  - unverified_search
+confirmatory_systems:
+  - monolith
+  - verified_search
+tiers:
+  - low
+  - middle
+  - high
+model: gpt-5.4-mini
+deployment: gpt-5.4-mini
+tokenizer_id: ${GATEWAY_TOKENIZER_ID:-gateway:gpt-5.4-mini:chat}
+tokenizer_sha256: ${GATEWAY_TOKENIZER_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}
+default_sample_cap: 1000
+development_cases: 100
+operational_pilot_cases: 60
+main_cases: 1000
+easy_reserve_cases: 100
 repetitions: 1
-require_preflight: true
-permanent_error_threshold: 3
+scoring_absolute_tolerance: 0.000001
+scoring_relative_tolerance: 0.000001
+failure_semantics:
+  invalid_output: score_incorrect
+  refusal: score_incorrect
+  architecture_tool_failure: score_incorrect
+  budget_exhaustion: score_incorrect
+  abstention: score_incorrect
+  architecture_failure: score_incorrect
+  infrastructure_failure: matched_block
+  equality_is_crossover: false
+retry_policy:
+  max_attempts: 5
+  initial_backoff_seconds: 0.75
+  maximum_backoff_seconds: 20.0
+  permanent_error_circuit_breaker: 3
+request_timeout_seconds: 180
+max_concurrency: 4
+expected_finance_complex_cases: 113
+bootstrap_replicates: 5000

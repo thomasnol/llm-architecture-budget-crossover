@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 
-# Downloaded source data can be recreated with scripts/download_hmda.py.
+# Pinned source snapshots are acquired separately from deterministic preparation.
 data/raw/*
 !data/raw/.gitkeep
 data/processed/*
@@ -23,3 +23,11 @@ paper/build/
 paper/generated/
 paper/*.aux
 paper/*.log
+output/pdf/*.aux
+output/pdf/*.bbl
+output/pdf/*.blg
+output/pdf/*.fdb_latexmk
+output/pdf/*.fls
+output/pdf/*.log
+output/pdf/*.out
+output/pdf/*.pdf

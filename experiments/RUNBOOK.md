@@ -1,125 +1,89 @@
 # Canonical experiment operator runbook
 
-## 1. Environment
+## 1. Freeze prerequisites
 
-Copy `.env.example` to `.env` and supply both OAuth pairs. Pair 1 must support
-GPT-5.4, GPT-5.4-mini, GPT-5.4-nano, Claude Opus 4.6, and Claude Sonnet 4.6.
-Pair 2 must support only the three GPT deployments.
+Work from a clean commit. Acquire FinQA, TAT-QA, and FinanceComplexQA snapshots
+separately, place them at the configured local paths, and set their exact
+SHA-256 values. Preparation itself is offline.
 
-`LLM_GATEWAY_CONCURRENCY_PER_KEY` is the hard ceiling for each credential.
-Each credential begins with a CUBIC window of at most four, increases on
-successful completions, and multiplicatively decreases on congestion.
-
-Never commit `.env`, gateway responses outside the run directory, or credentials.
-
-## 2. Software and data checks
+Configure the completion gateway and an exact chat-tokenizer endpoint. Set the
+frozen tokenizer ID and SHA-256. Do not use a character estimator, alternate
+tokenizer, or fallback model. The only allowed model and response-resolved
+deployment is `gpt-5.4-mini`.
 
 ```bash
 uv sync --extra dev
 uv run pytest -q
 uv run ruff check src tests
-uv run python scripts/download_hmda.py
 uv run python scripts/smoke_pipeline.py
-uv run budget-crossover prepare --config configs/pilot.yaml
+```
+
+The smoke workflow must end with `validated_empirical_results: false`. It is
+software verification only.
+
+## 2. Execute the linear workflow
+
+Run each command once its predecessor passes:
+
+```bash
 uv run budget-crossover prepare --config configs/main.yaml
-uv run budget-crossover validate \
-  --config configs/main.yaml \
-  --no-require-generations \
-  --no-require-pilot-gate
-```
-
-The main and pilot source-row sets must be disjoint. Do not proceed if the
-dataset digest, counterfactual validation, or leakage checks fail.
-
-## 3. Gateway preflight
-
-Run preflight separately for every experiment configuration:
-
-```bash
-uv run budget-crossover preflight --config configs/calibration.yaml
-```
-
-Preflight makes one real completion for every configured model on every eligible
-credential. Inspect `experiments/runs/calibration/preflight.json`. All checks
-must report complete prompt, completion, and total-token usage.
-
-An HTTP 400 is permanent. Read its sanitized response detail and correct the
-payload or deployment configuration before continuing. The batch runner will
-not operate without a passing preflight report.
-
-## 4. Calibration
-
-```bash
-uv run budget-crossover pilot --config configs/calibration.yaml
-uv run budget-crossover status --config configs/calibration.yaml
-uv run budget-crossover validate \
-  --config configs/calibration.yaml \
-  --no-require-pilot-gate
-uv run budget-crossover calibrate --config configs/calibration.yaml
-```
-
-Record the four-budget recommendation from
-`experiments/runs/calibration/calibration.json`. If it differs materially from
-the frozen pilot/main budgets, update both configurations on a new branch,
-rerun tests and the offline smoke, and restart calibration. Never edit a
-configuration inside an existing run.
-
-## 5. Pilot
-
-```bash
-uv run budget-crossover preflight --config configs/pilot.yaml
-uv run budget-crossover pilot --config configs/pilot.yaml
-uv run budget-crossover status --config configs/pilot.yaml
-uv run budget-crossover validate \
-  --config configs/pilot.yaml \
-  --no-require-pilot-gate
-uv run budget-crossover analyze --config configs/pilot.yaml
-```
-
-The pilot must have a complete unique grid, a passing preflight, complete usage
-accounting, acceptable schema validity, and no unresolved infrastructure cells.
-Diagnostic analysis is not sufficient to pass the pilot gate.
-
-## 6. Main architecture study
-
-Start from a clean commit. Do not change prompts, configurations, code, gateway
-protocol settings, or deployment IDs while a run is active.
-
-```bash
+uv run budget-crossover diagnose-finance-complex --config configs/main.yaml
 uv run budget-crossover preflight --config configs/main.yaml
+uv run budget-crossover develop --config configs/main.yaml
+uv run budget-crossover pilot --config configs/main.yaml
+uv run budget-crossover gate --config configs/main.yaml
 uv run budget-crossover run --config configs/main.yaml
-uv run budget-crossover status --config configs/main.yaml
 uv run budget-crossover validate --config configs/main.yaml
 uv run budget-crossover analyze --config configs/main.yaml
+uv run budget-crossover build-paper --config configs/main.yaml
 ```
 
-The runner is resumable. Successful and resource-abstention cells are skipped;
-transient failures are retried on the next invocation. Three equivalent
-permanent failures open the circuit before the remaining queue is launched.
+There is no override. A failed preflight, FinanceComplex count discrepancy,
+calibration mismatch, incomplete pilot, failed gate, changed hash, dirty Git
+state, incomplete main grid, non-authoritative usage, or protocol violation must
+be resolved by a new versioned protocol/run, not by editing an artifact.
 
-## 7. Routing ablation
+## 3. Inspect artifacts at each boundary
 
-```bash
-uv run budget-crossover preflight --config configs/routing_pilot.yaml
-uv run budget-crossover pilot --config configs/routing_pilot.yaml
-uv run budget-crossover status --config configs/routing_pilot.yaml
-uv run budget-crossover validate \
-  --config configs/routing_pilot.yaml \
-  --no-require-pilot-gate
-uv run budget-crossover analyze --config configs/routing_pilot.yaml
-```
+- `prepare`: public and hidden stores are separate, quotas exact, documents
+  disjoint, lineage complete, rejection ledger explicit.
+- `diagnose-finance-complex`: role is exploratory only; failure attribution and
+  the 113-case count are visible.
+- `preflight`: exact model/deployment/tokenizer, strict JSON, usage, and count
+  consistency all pass.
+- `develop`: no accuracy or outcome field is present; ceilings freeze before
+  pilot.
+- `pilot`: expected CellKey grid is complete and unique.
+- `gate`: every preregistered component is present; `override_allowed` is false.
+- `run`: `run_manifest.json` is immutable and `run_state.json` contains only
+  mutable progress.
+- `validate`: grid, usage, hashes, and protocol all pass.
+- `analyze`: all eight table interfaces exist and FinanceComplex remains
+  separate.
+- `build-paper`: empirical prose is enabled only if manifest, gate, validation,
+  and analysis hashes agree.
 
-Keep routing conclusions separate from the fixed-model architecture estimand.
+## 4. Resume behavior
 
-## 8. Paper gate
+Generation JSONL is append-only. Terminal expected keys are skipped on resume;
+infrastructure attempts remain separate. Three equivalent permanent failures
+open the circuit. Never delete a difficult cell or copy a scripted completion
+into a gateway run. If immutable input changes, create a new experiment name and
+run directory.
+
+## 5. Paper verification
 
 ```bash
 uv run python paper/build_paper.py
 cd paper
-latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=build main.tex
+latexmk -pdf -interaction=nonstopmode -halt-on-error \
+  -jobname=when-extra-inference-structure-pays-protocol \
+  -outdir=../output/pdf main.tex
+pdftoppm -png ../output/pdf/when-extra-inference-structure-pays-protocol.pdf \
+  ../tmp/pdfs/when-extra-inference-structure-pays-protocol
 ```
 
-The builder incorporates empirical results only when validation required the
-complete main grid and the analysis reports no missing, extra, or duplicate
-cells. Inspect case-level errors and paired comparisons before interpreting
-aggregate results.
+Render and inspect every page for clipping, overlap, broken tables, missing
+glyphs, citations, headers, footers, and page numbering. Check extracted text
+for the exact title and the appropriate empirical/protocol status. Do not
+release a PDF with unresolved LaTeX overflow warnings.

@@ -1,246 +1,262 @@
-# Preregistration: HMDA architecture--budget policy sandbox
+# Preregistration: token-budget crossovers in financial reasoning
 
-Initially frozen: 2026-07-29, before any canonical study model call. The gateway was not
-configured at freeze time. Repository tests and deterministic data preparation
-are not model evaluations.
+Frozen protocol date: 2026-08-03. No canonical empirical main run was available
+at freeze. Repository tests and deterministic offline execution are not model
+evaluations.
 
-## Research question
+Paper title: **When Extra Inference Structure Pays: A Preregistered Test of
+Token-Budget Crossovers in Financial Reasoning**.
 
-When an entire mortgage-adjudication workflow is constrained by a case-level
-total-token budget, which orchestration architecture produces the best joint
-profile of policy accuracy, counterfactual compliance invariance, token use, and
-latency?
+## 1. Confirmatory question and hypothesis
 
-The primary study compares five architectures at four nominal budgets while
-holding the underlying model fixed. A separate routing ablation compares
-always-primary, always-supervisor, and selective escalation. It does not assume that
-more calls help, that a complex architecture is universally superior, or that a
-larger completion ceiling is consumed compute.
+The primary comparison holds the underlying model fixed and asks whether the
+value of verified inference structure changes with a hard case-level token
+budget.
 
-## Dataset decision
+For each independent source document and tier, define the paired binary
+difference as correctness of `verified_search` minus correctness of `monolith`.
+The conditional hypothesis requires both:
 
-The study selects HMDA (dataset option C), using the official CFPB/FFIEC source rather
-than a Kaggle mirror.
+1. low tier: `verified_search - monolith < 0`;
+2. high tier: `verified_search - monolith > 0`.
 
-Home Credit and Lending Club were rejected as the primary adjudication source
-because their labels are post-credit performance among observed or funded loans.
-Default and charge-off are useful risk outcomes, but neither is the correct label
-for whether an application should have been approved at decision time. Home
-Credit remains attractive for future relational-evidence work; Lending Club
-remains attractive for future tool-selection work.
+Each component must pass its preregistered one-sided exact McNemar test at
+alpha .05. This is an intersection-union test; there is no multiplicity discount
+for requiring both components. Equality is not a crossover. High-tier
+superiority without low-tier harm is `threshold_benefit_only`, not confirmation.
 
-HMDA contains actual mortgage applications and action taken, plus loan, property,
-income, and monitoring-demographic fields. Actual action is not normative truth:
-it reflects institution policy, applicant behavior, data availability, and
-selection. The experiment therefore retains action taken only for descriptive
-concordance and never supplies it to a model.
+The five-point SESOI is the design alternative for power and interpretation. It
+is not automatically a proven margin. The hypothesis may fail at either or both
+endpoints. Non-significance is not equivalence.
 
-## Source and frozen cohort
+## 2. Primary data and lineage
 
-- Source endpoint:
-  `https://ffiec.cfpb.gov/v2/data-browser-api/view/csv?states=DC,ND,VT,WY&years=2024&actions_taken=1,3`
-- Dataset vintage: 2024 Data Browser export served on 2026-07-29. The endpoint
-  may reflect official resubmissions; the recorded SHA-256 freezes the exact
-  bytes used by this study.
-- Frozen source SHA-256:
-  `ed1f933f5b3487310c8364aebba8cb8b82d3f9870ff744648899e62baceaf4f5`.
-- Geography: District of Columbia, North Dakota, Vermont, and Wyoming.
-- Historical actions retained in the source cohort: originated (1) and denied
-  (3).
-- Product scope: conventional loan; home purchase; first lien; not reverse;
-  closed end; not primarily business/commercial; site built; owner occupied; one
-  to four units.
+Primary data are pinned local snapshots of FinQA and TAT-QA. Acquisition is
+separate from preparation; preparation makes no network request.
 
-The resulting eligible cohort contains 15,181 source applications. The sample is
-balanced first across the four research-policy decisions and then across states
-as capacity allows.
+Eligibility requires:
 
-The 24-application pilot produces 48 cases. The disjoint 192-application main
-sample produces 384 cases. Each source application is the independent unit.
+- numeric arithmetic or count question supported by a safely executable gold
+  program/derivation;
+- agreement between executed derivation and annotated answer;
+- every operand located in public table/text evidence;
+- unambiguous unit and scale;
+- unique source document/context;
+- no unsupported operation or executable syntax.
 
-## Transparent research policy
+At most one case is selected per source document/context. Public cases contain
+only case ID, dataset, document ID, question, public evidence, stratum, and
+descriptive metadata. Hidden labels contain a typed answer specification, gold
+derivation, gold support IDs, and source lineage. Labels join only after
+generation.
 
-The policy is an evaluation oracle, not a real mortgage policy:
+`headroom` requires at least two derivation operations and at least one required
+item ranked 3-12 by the frozen baseline retriever. `easy_control` requires one
+operation with all required evidence in the first two results.
 
-1. Manual review if income, property value, LTV, or DTI is not reported.
-2. Deny if DTI is at least 50%, LTV exceeds 100%, or term exceeds 360 months.
-3. Conditional review if DTI is 43–49%, LTV exceeds 90% through 100%, or the
-   application is nonconforming.
-4. Approve otherwise.
+Document-disjoint balanced splits are:
 
-The oracle emits the controlling decision and every applicable reason code at
-that decision level. Rule precedence and parsing are deterministic and unit
-tested. Race, ethnicity, sex, age band, tract minority share, and tract income
-fields are monitoring-only and cannot affect the oracle.
+- development: 100;
+- operational pilot: 60;
+- hard main: up to 1,000;
+- easy reserve: 100.
 
-HMDA does not expose the applicant's credit-score value in the public file.
-The study does not impute one and makes no claim to reproduce a production
-mortgage credit model.
+Preparation aborts on checksum mismatch, quota shortfall, eligibility shortfall,
+document overlap, or public-label leakage. It never relaxes a quota silently.
 
-## Counterfactual compliance probe
+## 3. Systems
 
-Every sampled application produces two case packets:
+All calls use exactly `gpt-5.4-mini`, the same core instructions, evidence
+format, candidate schema, and deterministic retriever. Model or deployment
+substitution is prohibited.
 
-- observed monitoring attributes;
-- a counterfactual variant changing exactly one of race, sex, or ethnicity.
+### Monolith
 
-The financial documents, quality notes, policy, and gold label are byte-identical
-within a pair. The counterfactual test is metamorphic: a compliant system should
-produce the same policy decision because the changed field is prohibited from the
-research decision.
+- query is the question;
+- retrieves exactly the tier evidence limit;
+- one answer call, maximum 256 output tokens;
+- no checker and no revision.
 
-This probe tests individual workflow invariance under a controlled input change.
-It is not an estimate of population disparity, disparate treatment in actual
-lending, causal discrimination, or legal compliance.
+### Verified search
 
-## Evidence exposed to systems
+- mandatory planner, maximum 128 output tokens;
+- up to the tier planned-query count;
+- deterministic union retrieval;
+- sequential candidates, each maximum 256 output tokens;
+- every candidate receives a label-blind provenance/arithmetic check;
+- first passing candidate is accepted;
+- if all candidates fail, middle/high may make at most one 256-token repair
+  using checker findings only, then recheck;
+- no confidence routing and no unapproved draft fallback.
 
-Each case has five documents:
+### Unverified search (exploratory)
 
-1. application intake;
-2. collateral review;
-3. credit and capacity;
-4. segregated compliance monitoring;
-5. data-quality notes.
+- same planner, retrieval, and candidate opportunity;
+- generates every affordable candidate;
+- never receives checker feedback;
+- normalized plurality with stable candidate-order tie break.
 
-Historical action, denial reasons, interest rate, rate spread, fees, purchaser
-type, and other post-decision fields are withheld. The compliance-monitoring
-document explicitly states that its fields cannot affect the research decision.
+Each result records planned/actual queries and hashes, retrieval IDs before and
+after truncation, candidate opportunities, checks, repair, accepted index,
+answer change, call usage, realized total, and frozen exit reason.
 
-## Systems
+## 4. Scoring and failure semantics
 
-Every primary architecture stage uses `gpt-5.4-mini`; architecture is therefore
-the manipulated factor. The separate routing ablation uses
-`claude-sonnet-4-6` only for the always-supervisor baseline and selective
-escalation.
+Scoring parses only the strict candidate schema. It does not extract a first or
+last number from prose. Decimal scoring normalizes signs, parentheses,
+currencies, percent, ones, thousand, million, and billion; checks unit, entity,
+and period when specified; and uses frozen absolute/relative tolerances no
+looser than 0.000001.
 
-1. **Monolithic full-context**: one call receives policy and all five documents.
-2. **Plan-and-retrieve**: a planning call selects at most three evidence tools;
-   a second call adjudicates from only the returned documents.
-3. **Specialist committee**: capacity, collateral, and compliance specialists run
-   concurrently; a chair resolves their reports by policy precedence.
-4. **Underwriter plus compliance guardrail**: a financial underwriter cannot see
-   monitoring demographics; an independent compliance agent audits the draft;
-   a finalizer applies supported corrections.
-5. **Adaptive guarded routing**: a financial underwriter is accepted when it
-   emits a valid approve decision with confidence at least 0.90 and no missing
-   evidence marker. All other drafts route through compliance audit and
-   finalization.
+Invalid output, refusal, architecture-caused tool failure, budget exhaustion,
+and abstention score incorrect under intention-to-treat. Infrastructure failure
+is not scored and triggers whole matched-block handling. No architecture failure
+is silently dropped.
 
-All primary-stage temperatures are zero. The main study repeats every cell twice
-and clusters both repetitions with their source application.
+## 5. Resource intervention
 
-## Token intervention
+Hard budget is the sum of authoritative prompt and completion usage over all
+calls in the cell. Tool calls, CPU time, wall time, latency, and dollar cost are
+separate telemetry.
 
-The independent resource variable is a case-level nominal **total-token budget**.
-A high-budget calibration run proposes four pooled realized-cost quantiles,
-constrained so the lowest primary budget is feasible for every fixed
-architecture. The frozen candidates are 4,096, 6,144, 8,192, and 12,288 tokens,
-covering input plus output across every internal call.
+Frozen initial tiers:
 
-Before each call, the controller conservatively estimates prompt tokens as
-`ceil(characters / 2.5) + 64`, then allocates no more than the remaining budget
-to output. A call is not issued if fewer than 64 output tokens remain after the
-estimate. Concurrent specialist calls are admitted only when the remaining
-budget can fund all three estimated prompts and minimum outputs.
+| Tier | Tokens | Retrieval | Queries | Candidates | Repairs |
+|---|---:|---:|---:|---:|---:|
+| low | 4,096 | 2 | 1 | 1 | 0 |
+| middle | 12,288 | 6 | 2 | 2 | 1 |
+| high | 32,768 | 12 | 4 | 4 | 1 |
 
-Gateway-reported prompt, completion, and total tokens are authoritative after a
-call. A system never receives an extra retry because it exhausted its budget.
-Budget exhaustion is an observed operational result. An actual overrun is
-reported, retained, and disqualifies that operating point from the
-budget-feasible frontier; it is never hidden by post hoc relabeling.
+Before a call, the ledger receives an exact tokenizer count for the full chat
+prompt and reserves maximum output. It refuses unaffordable calls. Authoritative
+usage releases unused reservation. Missing/negative usage, prompt mismatch,
+output-reservation overrun, and hard-cap overrun are protocol failures.
 
-## Outcomes
+Development can advance a tier ceiling only through 8,192, 16,384, 24,576,
+32,768, 49,152, and 65,536 when more than 1% of development cases cannot fit
+mandatory prompts/actions. Correctness and architecture differences are
+unavailable during this selection. Ceilings freeze before pilot.
 
-Primary outcome:
+## 6. Exact gateway preflight
 
-- application-level paired success: both counterfactual variants have the correct
-  policy decision.
+Preflight must establish all of:
 
-Secondary outcomes:
+- requested model is exactly `gpt-5.4-mini`;
+- response-resolved model is exactly `gpt-5.4-mini`;
+- completion is valid strict JSON with exactly `{"status":"ok"}`;
+- prompt and completion usage are authoritative and total is their sum;
+- exact tokenizer ID and SHA-256 match configuration;
+- exact pre-call prompt count equals gateway prompt usage.
 
-- per-case policy-decision accuracy;
-- exact decision-plus-reason-code accuracy;
-- counterfactual decision flip rate and full-policy consistency;
-- grid coverage, completed-decision accuracy, and intention-to-treat accuracy;
-- schema validity and budget-exhaustion rate;
-- prompt, completion, and total tokens;
-- call count, wall time, and summed API latency;
-- optional estimated dollar cost only when approved internal prices are supplied;
-- accuracy by routine, threshold, and exception complexity;
-- descriptive concordance with historical action, explicitly not correctness.
+Missing local tokenizer support does not authorize an estimator. The configured
+gateway tokenizer endpoint must supply the exact frozen tokenizer contract.
+Failure stops execution.
 
-The flip-rate denominator contains only pair-repetitions with two valid
-decisions. Pair-decision coverage is reported beside the flip rate; abstention,
-schema failure, and infrastructure failure are not relabeled as demographic
-decision changes.
+## 7. Operational pilot gate
 
-## Confirmatory hypothesis
+The pilot gate is non-overridable. It reports every component and passes only if
+all are true:
 
-Within each nominal budget, adaptive guarded routing will improve
-application-level paired success over monolithic full-context by at least five
-percentage points. Four exact paired McNemar tests are Holm-adjusted across the
-budgets. Support at a budget requires:
+- complete exact grid and unique paired cells;
+- authoritative usage for every observed cell;
+- zero label leakage and budget overruns;
+- schema validity at least 99%;
+- unresolved external matched blocks at most 1%;
+- exact expected mechanism counts;
+- all low-tier cases feasible;
+- median verified-search token growth at least 20% from low to middle and middle
+  to high;
+- easy monolith accuracy at least 90%;
+- hard monolith accuracy between 30% and 85%;
+- checker specificity at least 95%;
+- checker sensitivity at least 60%;
+- correct-to-wrong repair at most 5%;
+- at least 20% of checker-detected wrong first drafts corrected.
 
-- point difference at least +0.05;
-- paired bootstrap 95% interval excluding zero;
-- Holm-adjusted p-value below 0.05;
-- budget-overrun rate at or below 1%;
-- the adaptive operating point is not dominated on decision accuracy and realized
-  total tokens within that nominal budget.
+Any failed component blocks main execution. There is no `--force` path.
 
-The hypothesis may fail at all budgets. A crossover is reported only if the sign
-of the paired difference changes across adjacent tested budgets with uncertainty
-consistent with a change. Otherwise, the paper reports discrete operating-point
-comparisons and does not invent a continuous threshold.
+## 8. Blinded power and allocation
 
-All non-adaptive systems, reason-code accuracy, complexity interactions,
-historical concordance, and architecture rankings are secondary or exploratory.
+Internal-pilot sizing uses low/high paired discordance with architecture identity
+and direction masked. Exact one-sided McNemar power targets 90% for a five-point
+alternative. Repetitions do not increase independent N.
 
-## Inference
+- required hard N <= 900: allocate 900 hard plus 100 easy;
+- required hard N 901-1,000: allocate required hard and reduce easy so total is
+  1,000;
+- required hard N > 1,000: stop underpowered without unblinding.
 
-- Source application, not counterfactual row, is the independent unit.
-- Accuracy intervals use application-cluster bootstrap resampling.
-- Paired system comparisons use the same application pairs.
-- McNemar cells use binary success on both twins.
-- The approximate 80%-power minimum detectable paired difference is reported
-  from observed discordance; no underpowered null is described as equivalence.
-- Pareto frontiers are descriptive and use realized mean total tokens.
-- Missing or malformed decisions are incorrect. Execution failures are reported
-  separately and must be resolved at the operational level, not by
-  selectively deleting hard cases.
+## 9. Confirmatory inference
 
-## Pilot gates
+Intention-to-treat scoring includes all architecture outcomes; whole unresolved
+external matched blocks are excluded. The independent unit is source document
+or context.
 
-The main run is blocked unless:
+For low and high endpoints report:
 
-- every source and counterfactual validation check passes;
-- every model/eligible-credential completion preflight passes;
-- the unique generation grid is complete with no unresolved infrastructure cell;
-- every high-budget system has at least 95% schema validity;
-- no operating point has more than 1% actual budget overrun;
-- at least one budget exhibits accuracy disagreement across architectures.
+- paired accuracy difference;
+- improved and regressed discordant cells;
+- one-sided exact McNemar p-value;
+- one-sided bound in the tested direction;
+- two-sided document-cluster bootstrap interval;
+- five-point SESOI interpretation.
 
-A failed gate requires a documented, versioned operational change and a new
-pilot. `--force` requires a written audit reason and does not retroactively make
-the preregistered confirmatory claim valid.
+Strict crossover confirmation requires observed endpoint reversal plus rejection
+of both directional tests. A transition is estimated only after endpoint
+reversal.
 
-## Reproducibility and stopping
+The case/document cluster bootstrap carries every system and tier together.
+Non-crossing replicates are retained. Report crossing support, non-crossing mass,
+conditional crossing interval, and a confidence set including no crossing when
+applicable. Exploratory families use Holm or simultaneous cluster bands.
+Pareto dominance probabilities are resource-specific for tokens, cost, and
+latency.
 
-The first model call freezes a manifest containing expanded configuration, case
-hash, HMDA checksum, prompt revision, source hash, primary and supervisor model
-IDs, resolved deployments, dependency-lock hash, non-secret gateway protocol
-settings, seed, Git commit, and dirty-worktree flag. Checkpointed JSONL makes runs
-resumable; immutable-input changes block resume. Scored generations and
-retryable execution errors are stored separately.
+## 10. FinanceComplexQA exploratory boundary
 
-Pilot runtime is capped at 1.5 hours. Main runtime is capped at 6 hours, leaving
-contingency inside an eight-hour execution window. Deadline cancellation and
-missing cells are reported and are not scored as model errors.
+Use only the pinned Pro/English/Numerical-Comparison subset, deduplicated by
+canonical question/document identity, with expected count 113. Exclude overall,
+evaluation, alternate-language, and alternate-scene duplicates. Preserve
+reference-document lineage.
 
-## Interpretation boundary
+Boundaries:
 
-This study evaluates whether LLM orchestration can execute a disclosed research
-policy under resource and information-governance constraints. It does not
-validate a production credit policy, determine creditworthiness, provide lending
-advice, estimate market discrimination, or replace a fair-lending review.
+1. scorer gold round-trip and adversarial perturbation;
+2. reference lineage and leakage audit;
+3. oracle-evidence export/model input;
+4. reference, planned-query, and production retrieval ladders with pre/post
+   truncation recall.
+
+Exploratory system execution requires 100% scorer correctness, 100% reference
+linkage, zero leakage, and at least 95% high-tier reference-document recall.
+Failure is attributed to scorer, lineage/leakage, model with oracle evidence,
+retrieval, or orchestration. FinanceComplexQA is never pooled into confirmation.
+
+## 11. Immutable artifact chain
+
+The main manifest freezes:
+
+- resolved configuration and exact source/artifact hashes;
+- exact case IDs, document IDs, strata, and expected CellKey grid;
+- prompts and system/checker/retriever/code version hashes;
+- exact model, deployment, tokenizer ID/hash;
+- retry and failure policy;
+- secret-free credential patterns and gateway protocol;
+- dependency lock and clean Git commit;
+- preflight and pilot-gate hashes.
+
+Mutable counters belong only in `run_state.json`. Every downstream stage verifies
+upstream hashes before parsing. Empirical paper prose additionally requires a
+complete unique validated grid, authoritative usage, zero protocol violations,
+matching manifest/gate hashes, and non-scripted gateway provenance.
+
+## 12. Reporting and current status
+
+Frozen table interfaces cover lineage/rejections, diagnostic boundaries,
+resource manipulation, mechanisms, paired effects, failures, domain estimates,
+and Pareto status. All denominators and failed cells remain visible.
+
+Protocol-only paper output must say no empirical conclusion is available.
+Empirical prose can be generated only from a complete validated manifest whose
+gate hashes match. At freeze, no such run exists. The hypothesis is currently
+neither supported nor cleanly falsified.

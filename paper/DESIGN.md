@@ -12,11 +12,12 @@
 - Required structure: standalone abstract; explicit research question; related
   work synthesized by concept; reproducible method; objective results gate;
   limitations; conclusion with no new claims.
-- Tables: use only for architecture comparisons and empirical operating points.
-- Figures: the study pipeline and shared-budget architecture diagram are
-  protocol figures. Validated analysis produces PNG and PDF versions of
-  accuracy, coverage, invariance, accuracy-token, and optional accuracy-cost
-  plots. Tables include protected-attribute flip slices.
+- Tables: expose the eight frozen result interfaces: lineage/rejections,
+  FinanceComplex diagnostic boundaries, resource manipulation, mechanisms,
+  paired effects, failures, domain estimates, and Pareto status.
+- Figures: protocol figures may explain the workflow and shared-budget systems.
+  Empirical figures may be generated only from a complete validated main run
+  whose immutable manifest and pilot-gate hashes verify.
 - Citation rule: every external factual or methodological claim uses a verified
   primary or official source. The generated results section never creates a
   citation.

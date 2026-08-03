@@ -1,92 +1,100 @@
-\section{Data and Method}
+\section{Data, Information Boundaries, and Systems}
 
-\subsection{Frozen HMDA Cohort}
+\subsection{Primary Datasets and Lineage}
 
-We use the official CFPB/FFIEC Data Browser rather than a Kaggle mirror. The
-frozen source contains 2024 applications from the District of Columbia, North
-Dakota, Vermont, and Wyoming with historical action 1 (originated) or 3
-(denied). We restrict the cohort to conventional, first-lien, closed-end,
-consumer home-purchase applications for owner-occupied, site-built properties
-with one to four units. The resulting 15,181 eligible records are sufficient for
-balanced sampling while keeping the source small enough to audit. The source
-file, schema, endpoint, and SHA-256 digest are frozen in configuration.
+FinQA pairs financial-report questions with text, tables, and executable
+reasoning programs \citep{chen2021finqa}. TAT-QA similarly combines tabular and
+textual financial evidence with arithmetic and counting questions
+\citep{zhu2021tatqa}. Preparation consumes pinned local source snapshots; network
+acquisition is a separate explicit operation. The adapter verifies each snapshot
+hash, safely executes the annotated derivation, locates every operand in public
+evidence, and rejects unsupported operations, ambiguous scales, missing support,
+duplicate documents, or answer-program disagreements.
 
-The pilot samples 24 applications. The main study samples 192 disjoint
-applications, balanced to 48 per research-policy outcome and 48 per state. Each
-application produces two cases, giving 48 pilot and 384 main cases. We withhold
-historical action, denial reasons, rate spread, pricing, fees, and other
-post-decision fields from every prompt. HMDA does not publish the applicant's
-credit-score value, so we do not invent or impute one.
+At most one question is selected from each source document or context. A
+\texttt{headroom} case requires at least two derivation operations and at least
+one required item ranked 3--12 by the frozen baseline retriever. An
+\texttt{easy\_control} case uses one operation and places all required evidence
+in the first two results. Splits are deterministic and document-disjoint: 100
+development cases, 60 operational-pilot cases, up to 1,000 balanced hard main
+cases, and 100 balanced easy reserves. Quota or eligibility shortfalls abort
+preparation rather than silently changing the cohort.
 
-\subsection{Transparent Policy Oracle}
+Public cases contain only the question, evidence corpus, outcome-independent
+stratum, document identity, and descriptive metadata. Hidden labels contain the
+typed answer, executable gold derivation, support IDs, and source lineage. The
+two stores join only after generation. Numeric scoring parses the strict
+candidate schema; it never extracts the first or last number from prose. It uses
+decimal arithmetic, explicit unit and scale normalization, entity and period
+compatibility, and frozen absolute and relative tolerances.
 
-Let $x$ contain annual income, property value, loan-to-value ratio (LTV),
-debt-to-income ratio (DTI), term, and conforming status. The research decision is
-the first satisfied branch:
-\begin{equation}
-y(x)=
-\begin{cases}
-\text{manual review}, & \text{if a required financial field is missing},\\
-\text{deny}, & \text{if DTI}\geq 50\%,\ \text{LTV}>100\%,\ \text{or term}>360,\\
-\text{conditional review}, & \text{if DTI}\in[43,49]\%,\\
- & \quad \text{LTV}\in(90,100]\%,\ \text{or nonconforming},\\
-\text{approve}, & \text{otherwise}.
-\end{cases}
-\label{eq:policy}
-\end{equation}
-The oracle emits the decision and every applicable reason at the controlling
-level. Unit tests cover boundaries and rule precedence. This policy is
-deliberately small. It creates interpretable ground truth for workflow
-evaluation; it is not a production credit model or lending recommendation.
+\subsection{Systems and Mechanisms}
 
-Race, ethnicity, sex, age band, tract minority share, and tract income measures
-live in a separate compliance-monitoring document. The sandbox prevents these
-fields from affecting the decision, consistent with the experiment's narrow
-control objective and with Regulation B restrictions on using protected
-characteristics in credit evaluation \citep{cfpb2026regb}. Legal obligations
-are broader and fact dependent, so the experiment does not certify compliance.
-
-\subsection{Counterfactual Pairs}
-
-For each application, we change exactly one reported race, sex, or ethnicity
-field and leave every financial document byte-identical. The policy label also
-remains fixed. This is a metamorphic test: when an input that the sandbox
-prohibits changes, the decision should not change. Similar behavioral testing
-checks model capabilities through controlled input perturbations rather than
-internal explanations \citep{ribeiro2020checklist}.
-
-The pair does not estimate counterfactual fairness in the causal sense. It also
-does not measure approval-rate disparity in the HMDA population. It answers a
-smaller engineering question: did this workflow use a field that its supplied
-policy explicitly excluded?
-
-\subsection{Architectures}
+Every system uses the same core instructions, evidence serialization, strict
+candidate schema, exact model, and deterministic retriever. The manipulated
+factor is inference structure.
 
 \begin{table}[H]
 \centering
 \small
-\caption{Primary systems. Every role uses GPT-5.4-mini so architecture is the
-manipulated factor.}
+\caption{Frozen system mechanisms. Unverified search is exploratory only.}
 \label{tab:systems}
-\begin{tabularx}{\linewidth}{@{}l c c Y@{}}
+\begin{tabularx}{\linewidth}{@{}lY@{}}
 \toprule
-System & Calls & Monitoring access & Mechanism \\
+System & Frozen mechanism \\
 \midrule
-Monolith & 1 & Full & One worker sees all evidence. \\
-Plan-and-retrieve & 2 & Selected & A planner requests at most three evidence documents. \\
-Committee & 4 & Segregated & Three parallel specialists report to a chair. \\
-Guardrail & 3 & Audit only & A blind financial draft is audited, then revised. \\
-Adaptive & 1 or 3 & Audit only & Only uncertain, non-approve, invalid, or missing-data drafts escalate. \\
+Monolith & Direct question query, tier-limited retrieval, and exactly one answer
+call capped at 256 output tokens. It never checks or revises. \\
+Verified search & Mandatory planner capped at 128 tokens; deterministic query
+union; sequential candidates capped at 256; label-blind checking; first passing
+candidate; at most one middle/high repair using checker findings only. \\
+Unverified search & Same planner, retrieval, and candidate opportunity as
+verified search, but no checker feedback. It generates every affordable
+candidate and selects normalized plurality with stable candidate-order ties. \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-The retrieval workflow follows the tool-selection idea behind reasoning-and-
-acting systems \citep{yao2023react}. The committee resolves reports by policy
-precedence, not majority vote. The guardrail separates financial underwriting
-from demographic monitoring. Adaptive routing accepts only a valid approve
-decision with confidence at least 0.90 and no missing-data marker; all other
-drafts receive the same audit and revision as the fixed guardrail. A secondary
-routing ablation separately compares always-primary, always-supervisor, and
-selective-supervisor policies; its model effects are not attributed to
-architecture.
+The checker verifies citation existence, operand provenance, safe arithmetic,
+candidate-expression agreement, units, scale, entity, period, and division
+safety. It cannot see correctness or a gold value. Every cell records planned
+and actual queries, query hashes, retrieval IDs before and after truncation,
+candidates, checks, repair, accepted index, answer changes, authoritative usage,
+realized tokens, and a frozen exit reason. Invalid output, refusal,
+architecture-caused tool failure, budget exhaustion, and abstention score
+incorrect under intention-to-treat. Infrastructure failures are unscored and
+trigger whole matched-block handling.
+
+\subsection{Action-Backed Resource Intervention}
+
+The hard budget is the sum of authoritative prompt and completion usage over all
+calls in a cell:
+\begin{equation}
+T_{isb}=\sum_k(P_{isk}+C_{isk})\le B_b.
+\label{eq:budget}
+\end{equation}
+Before each call, the ledger obtains an exact chat-tokenizer prompt count and
+reserves the maximum output. It refuses an unaffordable call, releases unused
+reservation after the authoritative usage arrives, and treats prompt mismatch,
+output-reservation overrun, or hard-cap overrun as a protocol violation.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Action-backed budget tiers.}
+\label{tab:budgets}
+\begin{tabular}{lrrrrr}
+\toprule
+Tier & Token cap & Retrieval & Queries & Candidates & Repairs \\
+\midrule
+Low & 4,096 & 2 & 1 & 1 & 0 \\
+Middle & 12,288 & 6 & 2 & 2 & 1 \\
+High & 32,768 & 12 & 4 & 4 & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Outcome-free development may advance a ceiling only through 8,192, 16,384,
+24,576, 32,768, 49,152, and 65,536 when more than 1\% of development cases
+cannot fit mandatory prompts and actions. Accuracy and architecture differences
+are unavailable during calibration. The selected ceilings freeze before pilot.

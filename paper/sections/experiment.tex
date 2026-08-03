@@ -1,93 +1,103 @@
-\section{Experimental Protocol}
+\section{Preregistered Execution and Inference}
 
-\subsection{Budget Intervention and Gateway}
+\subsection{Immutable Workflow and Gates}
 
-For case $i$, system $s$, and nominal budget $B$, the workflow consumes
-\begin{equation}
-T_{isb}=\sum_{k=1}^{K_{is}}\left(P_{isk}+C_{isk}\right),
-\qquad T_{isb}\leq B,
-\label{eq:budget}
-\end{equation}
-where $P$ and $C$ are gateway-reported prompt and completion tokens for internal
-call $k$. A high-budget calibration run recommends pooled realized-cost
-quantiles subject to a common feasibility floor. The frozen candidate set is
-$B\in\{4096,6144,8192,12288\}$. Before issuing a call, the controller
-estimates its prompt as $\lceil\text{characters}/2.5\rceil+64$ and reserves at
-least 64 completion tokens. Parallel specialists launch only when the remaining
-budget can fund all three minimum allocations. Reported usage replaces the
-estimate after each response. An overrun is retained and excluded from the
-budget-feasible frontier; budget exhaustion receives no special retry.
+The linear workflow is \texttt{prepare},
+\texttt{diagnose-finance-complex}, \texttt{preflight}, \texttt{develop},
+\texttt{pilot}, \texttt{gate}, \texttt{run}, \texttt{validate},
+\texttt{analyze}, and \texttt{build-paper}. The immutable main manifest binds
+resolved configuration; source, artifact, code, prompt, checker, retriever,
+system, dependency, preflight, and pilot-gate hashes; exact case, document, and
+stratum inventories; exact expected cell keys; exact model, deployment, and
+tokenizer identity; retry and failure policy; secret-free credential patterns;
+and a clean Git commit. Mutable progress appears only in
+\texttt{run\_state.json}. Every downstream stage verifies upstream hashes before
+parsing artifacts.
 
-The internal gateway supplies \texttt{prompt\_tokens},
-\texttt{completion\_tokens}, and \texttt{total\_tokens} for each call. Two OAuth
-credential pairs share GPT traffic, while only pair 1 accepts the Claude model
-IDs. Each credential has its own CUBIC-inspired concurrency window. Successful
-requests grow the window; 429 and overload responses reduce it
-multiplicatively. The environment variable
-\texttt{LLM\_GATEWAY\_CONCURRENCY\_PER\_KEY} sets the ceiling, and the runner
-uses a bounded worker pool to reach both ceilings. Three equivalent permanent
-request failures open a circuit before the remaining grid is launched. This
-preserves throughput without treating the configured ceiling as a promise that
-the service can sustain it.
+Preflight requires the requested and response-resolved model to equal exactly
+\texttt{gpt-5.4-mini}. It also requires strict JSON, authoritative prompt and
+completion usage, the frozen tokenizer identity and hash, and equality between
+the exact pre-call prompt count and gateway usage. Missing tokenizer support or
+any model substitution stops the workflow.
 
-\begin{figure}[H]
+The operational pilot gate is non-overridable. It requires a complete unique
+paired grid; authoritative usage; zero leakage and budget overruns; at least
+99\% schema validity; at most 1\% unresolved external matched blocks; exact
+mechanism counts; low-tier feasibility; at least 20\% median verified-search
+token growth between adjacent tiers; easy monolith accuracy at least 90\%; hard
+monolith accuracy between 30\% and 85\%; checker specificity at least 95\% and
+sensitivity at least 60\%; correct-to-wrong repair at most 5\%; and correction
+of at least 20\% of checker-detected wrong first drafts. A failed component
+blocks the main run.
+
+\subsection{Power and Confirmatory Inference}
+
+Internal-pilot sizing uses only low/high paired discordance with architecture
+identity and direction masked. Exact one-sided McNemar power targets 90\% for a
+five-point alternative. If required hard $N\le900$, the allocation is 900 hard
+plus 100 easy. For $901\le N\le1000$, hard receives the required $N$ and easy is
+reduced to keep 1,000 total. If $N>1000$, the study stops as underpowered without
+unblinding. Repeated generations never increase the independent sample size.
+
+For each independent document, architecture failures are incorrect and
+unresolved external infrastructure blocks are excluded as complete matched
+blocks. The two one-sided exact McNemar tests use $\alpha=.05$ each because the
+claim is an intersection-union test. We report ordinary paired differences,
+one-sided bounds, two-sided cluster-bootstrap intervals, and five-point SESOI
+interpretations. A crossover is confirmed only if the low difference is
+strictly negative, the high difference strictly positive, and both directional
+tests reject. A high-only result is labeled \texttt{threshold\_benefit\_only}.
+
+The cluster bootstrap resamples documents and carries all systems and tiers
+together. Non-crossing replicates are retained. A transition is estimated only
+after observed endpoint reversal; the report includes crossing support, a
+conditional numeric interval, and a confidence set that includes no crossing
+when applicable. Exploratory families use Holm adjustment or simultaneous
+cluster bands. Pareto probabilities are separate for accuracy against realized
+tokens, cost, and latency.
+
+\subsection{FinanceComplexQA Diagnostic Boundary}
+
+FinanceComplexQA is restricted to the pinned Pro, English,
+Numerical-Comparison subset, deduplicated by canonical question/document
+identity, with an expected count of 113. Count discrepancy aborts. Its four
+boundaries are: scorer gold round-trip plus adversarial perturbations; reference
+lineage and zero leakage; model behavior with oracle evidence; and reference,
+planned-query, and production retrieval ladders with pre/post truncation recall.
+Exploratory system execution requires 100\% scorer correctness, 100\% reference
+linkage, zero leakage, and at least 95\% high-tier reference-document recall.
+This domain is never pooled into confirmation.
+
+\subsection{Frozen Reporting Interfaces}
+
+The following interfaces exist before outcomes are observed. Each generated
+table must include denominators and preserve failed or unavailable cells.
+
+\begin{table}[H]
 \centering
-\begin{tikzpicture}[
-  box/.style={draw=navy, rounded corners=2pt, fill=lightblue, align=center,
-              minimum width=2.35cm, minimum height=0.70cm, font=\scriptsize},
-  small/.style={draw=teal, rounded corners=2pt, align=center,
-                minimum width=2.55cm, minimum height=0.58cm, font=\scriptsize},
-  arrow/.style={-{Latex[length=1.8mm]}, thick, draw=teal}
-]
-\node[box] (case) at (0,0) {Case + budget};
-\node[small] (mono) at (3.25,1.05) {Monolith};
-\node[small] (ret) at (3.25,0.35) {Plan $\rightarrow$ retrieve};
-\node[small] (comm) at (3.25,-0.35) {3 specialists $\rightarrow$ chair};
-\node[small] (guard) at (3.25,-1.05) {Underwrite $\rightarrow$ audit};
-\node[box] (ledger) at (7.0,0) {Shared token ledger\\prompt + completion};
-\node[box] (out) at (10.4,0) {Decision, reasons,\\calls, latency};
-\foreach \x in {mono,ret,comm,guard} {
-  \draw[arrow] (case.east) -- (\x.west);
-  \draw[arrow] (\x.east) -- (ledger.west);
-}
-\draw[arrow] (ledger) -- (out);
-\end{tikzpicture}
-\caption{Architectures differ in information flow, but every internal call
-debits the same case-level token ledger. Adaptive shares the guardrail path only
-when it escalates.}
-\label{fig:architectures}
-\end{figure}
-
-\subsection{Outcomes and Inference}
-
-The primary unit is the source application, not either counterfactual row. Let
-$c_{is0}$ and $c_{is1}$ indicate a correct decision on the observed and changed
-variants. Primary success is $S_{is}=c_{is0}c_{is1}$. Secondary outcomes include
-intention-to-treat and completed-decision accuracy, exact
-decision-plus-reason accuracy, schema validity, counterfactual flip rate, token
-use, call count, wall time, summed API
-latency, escalation rate, and accuracy by routine, threshold, and exception
-cases. Approved internal prices may support a secondary dollar estimate, but
-token and latency measures do not depend on a confidential price schedule.
-Flip rate is conditional on pair-repetitions with two valid decisions and is
-reported with pair-decision coverage; abstentions are not called flips.
-
-The confirmatory comparison is adaptive routing against the base monolith within
-each budget. We report the paired difference in $S$, an application-cluster
-bootstrap 95\% interval, and an exact McNemar test. The four budget-level
-$p$-values receive Holm correction \citep{holm1979}. Support requires a gain of
-at least five percentage points, an interval excluding zero, adjusted
-$p<0.05$, an overrun rate no greater than 1\%, and a non-dominated
-accuracy-token operating point. A sign change between adjacent tested budgets is
-called a crossover only when the paired uncertainty supports that description.
-Otherwise, we report four discrete comparisons.
-
-The pilot includes $48\times5\times4=960$ cells; the main grid includes
-$384\times5\times4\times2=15{,}360$. The main run is blocked unless preflight
-passes, the unique pilot grid is complete, every high-budget system reaches
-95\% schema validity, no operating point exceeds 1\% overrun, and at least one
-budget shows accuracy disagreement. A run manifest freezes the expanded
-configuration, case hash, HMDA checksum, prompt revision, source hash, resolved
-model deployments, dependency-lock hash, non-secret gateway protocol, seed, Git
-commit, and dirty-worktree state. Checkpointed JSONL makes network failures
-resumable.
+\scriptsize
+\caption{Preregistered reporting interfaces.}
+\label{tab:interfaces}
+\begin{tabularx}{\linewidth}{@{}p{0.23\linewidth}Y@{}}
+\toprule
+Interface & Required contents \\
+\midrule
+Lineage and rejections & Source snapshot, eligible and selected counts,
+document uniqueness, stratum, rejection reasons, and artifact hashes. \\
+Diagnostic boundaries & Scorer, lineage, leakage, oracle-evidence model,
+retrieval ladder, orchestration, failure attribution, and exploratory-only role. \\
+Resource manipulation & Tier ceiling, realized prompt/completion/total tokens,
+calls, retrieval, candidates, repair, cost, and latency by system. \\
+Mechanisms & Planned and actual queries, evidence IDs, checks, accepted index,
+answer change, exit reason, and protocol violations. \\
+Paired effects & Low/high paired difference, discordance cells, exact one-sided
+$p$-value, one-sided bound, two-sided interval, and SESOI interpretation. \\
+Failures & Invalid schema, refusal, tool failure, budget exhaustion, abstention,
+infrastructure blocks, and matched-block disposition. \\
+Domain estimates & FinQA and TAT-QA estimates separately and pooled, with
+FinanceComplexQA reported only as exploratory diagnostics. \\
+Pareto status & Resource-specific dominance probability for accuracy against
+tokens, cost, and latency, including unavailable-resource status. \\
+\bottomrule
+\end{tabularx}
+\end{table}

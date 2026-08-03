@@ -8,15 +8,134 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from dotenv import load_dotenv
 
-from .models import GatewayResponse, Usage
+from .models import FrozenModel, GatewayResponse, Usage
 
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 CONGESTION_STATUS_CODES = {408, 425, 429, 502, 503, 504}
+
+
+class PromptTokenCount(FrozenModel):
+    model: str
+    prompt_tokens: int
+    tokenizer_id: str
+    tokenizer_sha256: str
+
+
+class ExactPromptTokenizer(Protocol):
+    tokenizer_id: str
+    tokenizer_sha256: str
+
+    async def count(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+    ) -> PromptTokenCount: ...
+
+
+class GatewayCompletionClient:
+    """Task 2 completion adapter with exact prompt counts and no model fallback."""
+
+    def __init__(
+        self,
+        *,
+        gateway: Any,
+        tokenizer: ExactPromptTokenizer,
+        model: str,
+        tokenizer_id: str,
+        tokenizer_sha256: str,
+    ) -> None:
+        if model != "gpt-5.4-mini":
+            raise ValueError("the canonical adapter requires exactly gpt-5.4-mini")
+        if tokenizer.tokenizer_id != tokenizer_id:
+            raise ValueError("configured tokenizer ID does not match the exact tokenizer")
+        if tokenizer.tokenizer_sha256 != tokenizer_sha256:
+            raise ValueError("configured tokenizer hash does not match the exact tokenizer")
+        self.gateway = gateway
+        self.tokenizer = tokenizer
+        self.model = model
+        self.tokenizer_id = tokenizer_id
+        self.tokenizer_sha256 = tokenizer_sha256
+
+    async def count_prompt_tokens(self, *, model: str, system: str, user: str) -> int:
+        self._require_model(model)
+        count = await self.tokenizer.count(model=model, system=system, user=user)
+        if count.model != self.model:
+            raise RuntimeError("tokenizer model substitution is forbidden")
+        if count.tokenizer_id != self.tokenizer_id:
+            raise RuntimeError("tokenizer identity changed after configuration freeze")
+        if count.tokenizer_sha256 != self.tokenizer_sha256:
+            raise RuntimeError("tokenizer hash changed after configuration freeze")
+        return count.prompt_tokens
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        max_tokens: int,
+        stage: str,
+    ) -> GatewayResponse:
+        self._require_model(model)
+        response = await self.gateway.complete(
+            model=model,
+            system=system,
+            user=user,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            stage=stage,
+        )
+        if response.model != self.model:
+            raise RuntimeError(
+                f"gateway resolved model {response.model!r}; exact resolved model "
+                f"{self.model!r} is required"
+            )
+        if response.usage.prompt_tokens is None or response.usage.completion_tokens is None:
+            raise RuntimeError("gateway response lacks authoritative prompt/completion usage")
+        return response
+
+    def _require_model(self, model: str) -> None:
+        if model != self.model:
+            raise RuntimeError(
+                f"model substitution is forbidden: requested {model!r}, frozen {self.model!r}"
+            )
+
+
+class GatewayPromptTokenizer:
+    """Exact chat-tokenizer endpoint backed by the configured gateway."""
+
+    def __init__(
+        self,
+        gateway: GatewayClient,
+        *,
+        tokenizer_id: str,
+        tokenizer_sha256: str,
+    ) -> None:
+        self.gateway = gateway
+        self.tokenizer_id = tokenizer_id
+        self.tokenizer_sha256 = tokenizer_sha256
+
+    async def count(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+    ) -> PromptTokenCount:
+        return await self.gateway.tokenize_prompt(
+            model=model,
+            system=system,
+            user=user,
+            expected_tokenizer_id=self.tokenizer_id,
+            expected_tokenizer_sha256=self.tokenizer_sha256,
+        )
 
 
 class GatewayRequestError(RuntimeError):
@@ -201,6 +320,7 @@ class GatewayClient:
         self.token_url = os.getenv("LLM_GATEWAY_TOKEN_URL", "")
         self.scope = os.getenv("LLM_GATEWAY_SCOPE", "")
         self.chat_path = os.getenv("LLM_GATEWAY_CHAT_PATH", "/chat/completions")
+        self.tokenizer_path = os.getenv("LLM_GATEWAY_TOKENIZER_PATH", "")
         self.max_tokens_field = os.getenv("LLM_GATEWAY_MAX_TOKENS_FIELD", "max_tokens")
         self.api_key_header = os.getenv("LLM_GATEWAY_API_KEY_HEADER", "Authorization")
         self.api_key_prefix = os.getenv("LLM_GATEWAY_API_KEY_PREFIX", "Bearer ")
@@ -209,8 +329,8 @@ class GatewayClient:
         per_key = int(os.getenv("LLM_GATEWAY_CONCURRENCY_PER_KEY", "4"))
         self.slots: list[CredentialSlot] = []
         default_models = {
-            1: ("gpt-5.4,gpt-5.4-mini,gpt-5.4-nano,claude-opus-4-6,claude-sonnet-4-6"),
-            2: "gpt-5.4,gpt-5.4-mini,gpt-5.4-nano",
+            1: "gpt-5.4-mini",
+            2: "gpt-5.4-mini",
         }
         for index in (1, 2):
             api_key = os.getenv(f"LLM_GATEWAY_API_KEY_{index}") or None
@@ -369,6 +489,65 @@ class GatewayClient:
             "slots": slots,
         }
 
+    async def tokenize_prompt(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        expected_tokenizer_id: str,
+        expected_tokenizer_sha256: str,
+    ) -> PromptTokenCount:
+        """Request an exact chat prompt count from the gateway tokenizer endpoint."""
+        if not self.configured:
+            raise RuntimeError("gateway endpoint/credentials are not configured")
+        if not self.tokenizer_path.startswith("/"):
+            raise RuntimeError(
+                "LLM_GATEWAY_TOKENIZER_PATH must name the exact gateway tokenizer endpoint"
+            )
+        slot = await self._slot(model)
+        await slot.limiter.acquire()
+        try:
+            response = await self.client.post(
+                f"{self.base_url}{self.tokenizer_path}",
+                headers=await self._headers(slot),
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result = PromptTokenCount(
+                model=str(payload["model"]),
+                prompt_tokens=int(payload["prompt_tokens"]),
+                tokenizer_id=str(payload["tokenizer_id"]),
+                tokenizer_sha256=str(payload["tokenizer_sha256"]),
+            )
+            if result.model != model:
+                raise RuntimeError("tokenizer endpoint substituted the requested model")
+            if result.tokenizer_id != expected_tokenizer_id:
+                raise RuntimeError("tokenizer endpoint returned an unexpected tokenizer ID")
+            if result.tokenizer_sha256 != expected_tokenizer_sha256:
+                raise RuntimeError("tokenizer endpoint returned an unexpected tokenizer hash")
+        except httpx.HTTPStatusError as error:
+            await slot.limiter.release(
+                congestion=error.response.status_code in CONGESTION_STATUS_CODES
+            )
+            raise
+        except httpx.HTTPError:
+            await slot.limiter.release(congestion=True)
+            raise
+        except Exception:
+            await slot.limiter.release()
+            raise
+        else:
+            await slot.limiter.release(successful=True)
+            return result
+
     async def complete(
         self,
         *,
@@ -409,17 +588,20 @@ class GatewayClient:
                 body = response.json()
                 choice = body["choices"][0]
                 usage_raw = body.get("usage", {})
-                usage = Usage(
-                    prompt_tokens=usage_raw.get("prompt_tokens", usage_raw.get("input_tokens")),
-                    completion_tokens=usage_raw.get(
-                        "completion_tokens", usage_raw.get("output_tokens")
-                    ),
-                    total_tokens=usage_raw.get("total_tokens"),
+                prompt_tokens = usage_raw.get("prompt_tokens", usage_raw.get("input_tokens"))
+                completion_tokens = usage_raw.get(
+                    "completion_tokens", usage_raw.get("output_tokens")
                 )
-                if usage.total_tokens is None and (
-                    usage.prompt_tokens is not None and usage.completion_tokens is not None
+                total_tokens = usage_raw.get("total_tokens")
+                if total_tokens is None and (
+                    prompt_tokens is not None and completion_tokens is not None
                 ):
-                    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+                    total_tokens = prompt_tokens + completion_tokens
+                usage = Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
                 result = GatewayResponse(
                     text=_content_text(choice.get("message", {}).get("content", "")),
                     model=str(body.get("model", model)),

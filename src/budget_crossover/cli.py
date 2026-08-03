@@ -1,206 +1,105 @@
 from __future__ import annotations
 
-import asyncio
 import json
-from datetime import UTC, datetime
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
-from .analysis import analyze_run
-from .calibration import calibrate_run
-from .config import ExperimentConfig, load_experiment_config
-from .dataset import build_case_set, case_set_profile
-from .io import write_jsonl
-from .preflight import run_preflight
-from .records import Case
-from .runner import execute_generation
-from .status import summarize_run
-from .validation import assert_pilot_gate, validate_cases, validate_run
+from .config import load_experiment_config
+from .workflow import (
+    analyze_stage,
+    build_paper_stage,
+    develop_stage,
+    diagnose_finance_complex_stage,
+    gate_stage,
+    pilot_stage,
+    preflight_stage,
+    prepare_stage,
+    run_stage,
+    validate_stage,
+)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 REPO = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG = REPO / "configs" / "main.yaml"
+ConfigOption = Annotated[Path, typer.Option(exists=True, readable=True)]
 
 
-def _cases_for_config(
+def _execute(
+    operation: Callable[..., dict[str, Any]],
     config_path: Path,
-) -> tuple[ExperimentConfig, list[Case]]:
-    config = load_experiment_config(config_path)
-    cases = build_case_set(REPO, config)
-    selected_path = REPO / "data" / "processed" / f"cases_{config.experiment_name}.jsonl"
-    write_jsonl(selected_path, cases)
-    return config, cases
-
-
-@app.command()
-def prepare(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
+    *,
+    require_pass: bool = False,
 ) -> None:
-    """Build and validate frozen HMDA policy-sandbox cases."""
-    loaded, cases = _cases_for_config(config)
-    validation = validate_cases(repo=REPO, config=loaded, cases=cases)
-    result = {
-        "experiment": loaded.experiment_name,
-        **case_set_profile(cases),
-        "source_sha256": loaded.hmda_source_sha256,
-        "historical_action_used_as_gold": False,
-        "post_decision_fields_supplied_to_models": False,
-        "validation_pass": validation["pass"],
-        "validation_issues": validation["issues"],
-    }
-    typer.echo(json.dumps(result, indent=2))
-    if not validation["pass"]:
+    config = load_experiment_config(config_path)
+    try:
+        result = operation(repo=REPO, config=config)
+    except (RuntimeError, ValueError, OSError) as error:
+        typer.echo(json.dumps({"pass": False, "error": str(error)}, indent=2))
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
+    verdict = result.get("pass", result.get("passed", True))
+    if require_pass and verdict is not True:
         raise typer.Exit(code=1)
 
 
-def _execute(config_path: Path) -> None:
-    loaded, cases = _cases_for_config(config_path)
-    result = asyncio.run(execute_generation(repo=REPO, config=loaded, cases=cases))
-    typer.echo(json.dumps(result, indent=2))
+@app.command()
+def prepare(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Prepare pinned FinQA and TAT-QA artifacts without network access."""
+    _execute(prepare_stage, config)
+
+
+@app.command(name="diagnose-finance-complex")
+def diagnose_finance_complex(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Run the exploratory FinanceComplexQA boundary diagnostics."""
+    _execute(diagnose_finance_complex_stage, config)
 
 
 @app.command()
-def pilot(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "pilot.yaml"
-    ),
-) -> None:
-    """Run the resumable architecture-by-budget pilot."""
-    _execute(config)
+def preflight(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Require exact gpt-5.4-mini, strict JSON, usage, and tokenizer agreement."""
+    _execute(preflight_stage, config, require_pass=True)
+
+
+@app.command()
+def develop(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Freeze outcome-blind mandatory-action calibration before pilot."""
+    _execute(develop_stage, config)
+
+
+@app.command()
+def pilot(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Execute the immutable operational pilot grid."""
+    _execute(pilot_stage, config, require_pass=True)
+
+
+@app.command()
+def gate(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Evaluate the non-overridable operational pilot gate."""
+    _execute(gate_stage, config, require_pass=True)
 
 
 @app.command(name="run")
-def run_main(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
-    force: Annotated[
-        bool,
-        typer.Option(help="Override the pilot gate with an audited reason."),
-    ] = False,
-    force_reason: Annotated[
-        str | None,
-        typer.Option(help="Required audit note when --force is used."),
-    ] = None,
-) -> None:
-    """Run the gated main study."""
-    loaded = load_experiment_config(config)
-    if force:
-        if not force_reason or not force_reason.strip():
-            raise typer.BadParameter("--force requires --force-reason")
-        override = (
-            REPO / "experiments" / "runs" / loaded.experiment_name / "pilot_gate_override.json"
-        )
-        override.parent.mkdir(parents=True, exist_ok=True)
-        override.write_text(
-            json.dumps(
-                {
-                    "experiment": loaded.experiment_name,
-                    "reason": force_reason.strip(),
-                    "recorded_at": datetime.now(UTC).isoformat(),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-    else:
-        assert_pilot_gate(REPO, loaded)
-    _execute(config)
+def run_main(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Execute the main grid only after exact upstream hash verification."""
+    _execute(run_stage, config, require_pass=True)
 
 
 @app.command()
-def analyze(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
-    diagnostic: Annotated[
-        bool,
-        typer.Option(help="Allow incomplete input and watermark all outputs as diagnostic."),
-    ] = False,
-) -> None:
-    """Generate validated statistical tables and figures."""
-    loaded, cases = _cases_for_config(config)
-    typer.echo(
-        json.dumps(
-            analyze_run(
-                repo=REPO,
-                config=loaded,
-                cases=cases,
-                diagnostic=diagnostic,
-            ),
-            indent=2,
-        )
-    )
+def validate(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Validate manifest identity, grid completeness, usage, and protocol."""
+    _execute(validate_stage, config, require_pass=True)
 
 
 @app.command()
-def validate(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "main.yaml"
-    ),
-    require_generations: Annotated[
-        bool,
-        typer.Option("--require-generations/--no-require-generations"),
-    ] = True,
-    require_pilot_gate: Annotated[
-        bool,
-        typer.Option("--require-pilot-gate/--no-require-pilot-gate"),
-    ] = True,
-) -> None:
-    """Validate source, cases, grid completeness, and token accounting."""
-    loaded, cases = _cases_for_config(config)
-    report = validate_run(
-        repo=REPO,
-        config=loaded,
-        cases=cases,
-        require_generations=require_generations,
-        require_pilot_gate=require_pilot_gate,
-    )
-    typer.echo(json.dumps(report, indent=2))
-    if not report["pass"]:
-        raise typer.Exit(code=1)
+def analyze(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Generate confirmatory and exploratory tables from a validated grid."""
+    _execute(analyze_stage, config)
 
 
-@app.command()
-def preflight(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "pilot.yaml"
-    ),
-) -> None:
-    """Verify real completions for every configured model and credential."""
-    loaded = load_experiment_config(config)
-    report = asyncio.run(run_preflight(repo=REPO, config=loaded))
-    typer.echo(json.dumps(report, indent=2))
-    if not report["pass"]:
-        raise typer.Exit(code=1)
-
-
-@app.command()
-def calibrate(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "calibration.yaml"
-    ),
-) -> None:
-    """Recommend four feasible budgets from calibration trajectories."""
-    loaded = load_experiment_config(config)
-    typer.echo(json.dumps(calibrate_run(repo=REPO, config=loaded), indent=2))
-
-
-@app.command()
-def status(
-    config: Annotated[Path, typer.Option(exists=True, readable=True)] = (
-        REPO / "configs" / "pilot.yaml"
-    ),
-) -> None:
-    """Summarize coverage and operational failures."""
-    loaded, cases = _cases_for_config(config)
-    expected = len(cases) * len(loaded.systems) * len(loaded.token_budgets) * loaded.repetitions
-    typer.echo(
-        json.dumps(
-            summarize_run(repo=REPO, config=loaded, expected_cells=expected),
-            indent=2,
-        )
-    )
+@app.command(name="build-paper")
+def build_paper(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Generate paper prose through the shared empirical-claim gate."""
+    _execute(build_paper_stage, config)

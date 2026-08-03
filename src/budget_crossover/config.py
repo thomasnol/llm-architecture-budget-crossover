@@ -2,27 +2,28 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .budget import BUDGET_TIERS
+from .models import SystemName, TierName
 
 ENV_DEFAULT_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}")
-
-ARCHITECTURE_SYSTEMS = {
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+CANONICAL_SYSTEMS: tuple[SystemName, ...] = (
     "monolith",
-    "retrieval",
-    "committee",
-    "guardrail",
-    "adaptive",
-}
-ROUTING_SYSTEMS = {
-    "always_primary",
-    "always_supervisor",
-    "selective_supervisor",
-}
+    "verified_search",
+    "unverified_search",
+)
+CONFIRMATORY_SYSTEMS: tuple[SystemName, ...] = ("monolith", "verified_search")
+CANONICAL_TIERS: tuple[TierName, ...] = ("low", "middle", "high")
+EXACT_MODEL = "gpt-5.4-mini"
+STRICT_TOLERANCE = Decimal("0.000001")
 
 
 def _expand_string(value: str) -> str:
@@ -33,7 +34,7 @@ def _expand_string(value: str) -> str:
     return os.path.expandvars(ENV_DEFAULT_PATTERN.sub(replace, value))
 
 
-def _expand(value: Any) -> Any:
+def _expand(value: object) -> object:
     if isinstance(value, str):
         return _expand_string(value)
     if isinstance(value, list):
@@ -43,108 +44,131 @@ def _expand(value: Any) -> Any:
     return value
 
 
-class ExperimentConfig(BaseModel):
-    experiment_name: str
-    study_kind: Literal["architecture", "routing"] = "architecture"
-    execution_mode: Literal["gateway", "offline_smoke"] = "gateway"
-    seed: int = 20260729
-    hmda_year: int = 2024
-    hmda_states: list[str] = Field(default_factory=lambda: ["DC", "ND", "VT", "WY"])
-    hmda_raw_filename: str = "hmda_2024_dc_nd_vt_wy.csv"
-    hmda_source_sha256: str
-    base_application_count: int = 96
-    exclude_pilot_applications: bool = True
-    pilot_base_application_count: int = 24
-    pilot_experiment_name: str = "pilot"
-    token_budgets: list[int] = Field(default_factory=lambda: [4096, 6144, 8192, 12288])
-    systems: list[str] = Field(
-        default_factory=lambda: [
-            "monolith",
-            "retrieval",
-            "committee",
-            "guardrail",
-            "adaptive",
-        ]
-    )
-    generator_model: str = "gpt-5.4-mini"
-    supervisor_model: str = "claude-sonnet-4-6"
-    stage_max_output_tokens: int = 256
-    minimum_call_output_tokens: int = 64
-    prompt_chars_per_token: float = 2.5
-    prompt_token_overhead: int = 64
-    direct_temperature: float = 0.0
-    specialist_temperature: float = 0.2
-    adaptive_confidence_threshold: float = 0.90
-    request_timeout_seconds: int = 180
-    runtime_hours: float = 6.0
-    bootstrap_replicates: int = 5000
-    minimum_high_budget_schema_validity: float = 0.95
-    maximum_budget_overrun_rate: float = 0.01
-    sesoi_accuracy_difference: float = 0.05
-    model_prices_per_million: dict[str, dict[str, float]] = Field(default_factory=dict)
-    repetitions: int = 1
-    require_preflight: bool = True
-    permanent_error_threshold: int = 3
+class FrozenConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class SourceSnapshotConfig(FrozenConfigModel):
+    path: Path
+    sha256: str
 
     @model_validator(mode="after")
-    def validate_design(self) -> ExperimentConfig:
-        supported = ARCHITECTURE_SYSTEMS if self.study_kind == "architecture" else ROUTING_SYSTEMS
-        unknown = set(self.systems) - supported
-        if unknown:
-            raise ValueError(f"unsupported systems: {sorted(unknown)}")
-        if self.study_kind == "architecture" and (
-            "monolith" not in self.systems or "adaptive" not in self.systems
-        ):
-            raise ValueError("architecture study requires monolith and adaptive")
-        if self.study_kind == "routing" and set(self.systems) != ROUTING_SYSTEMS:
-            raise ValueError(
-                "routing study requires always_primary, always_supervisor, and selective_supervisor"
-            )
-        if len(self.systems) != len(set(self.systems)):
-            raise ValueError("systems must not contain duplicates")
-        if not self.hmda_states or any(
-            not re.fullmatch(r"[A-Z]{2}", value) for value in self.hmda_states
-        ):
-            raise ValueError("hmda_states must contain two-letter uppercase codes")
-        if len(self.hmda_states) != len(set(self.hmda_states)):
-            raise ValueError("hmda_states must not contain duplicates")
-        if not re.fullmatch(r"[0-9a-f]{64}", self.hmda_source_sha256):
-            raise ValueError("hmda_source_sha256 must be a lowercase SHA-256 digest")
-        if not self.token_budgets or self.token_budgets != sorted(set(self.token_budgets)):
-            raise ValueError("token_budgets must be unique and strictly increasing")
-        if self.token_budgets[0] < 512:
-            raise ValueError("the smallest token budget must be at least 512")
-        if self.base_application_count < 1 or self.pilot_base_application_count < 1:
-            raise ValueError("application counts must be positive")
-        if self.exclude_pilot_applications and self.experiment_name == self.pilot_experiment_name:
-            raise ValueError("the pilot cannot exclude itself")
-        if not self.generator_model.strip() or not self.supervisor_model.strip():
-            raise ValueError("generator and supervisor model IDs must be non-empty")
-        if not 0 < self.minimum_call_output_tokens <= self.stage_max_output_tokens:
-            raise ValueError("call output limits are inconsistent")
-        if self.prompt_chars_per_token <= 0 or self.prompt_token_overhead < 0:
-            raise ValueError("prompt estimation parameters must be positive")
-        if self.runtime_hours <= 0 or self.runtime_hours > 8:
-            raise ValueError("runtime_hours must be in (0, 8]")
-        if self.permanent_error_threshold < 1:
-            raise ValueError("permanent_error_threshold must be positive")
-        if self.repetitions < 1:
-            raise ValueError("repetitions must be positive")
-        for value, name in [
-            (self.adaptive_confidence_threshold, "adaptive_confidence_threshold"),
-            (
-                self.minimum_high_budget_schema_validity,
-                "minimum_high_budget_schema_validity",
-            ),
-            (self.maximum_budget_overrun_rate, "maximum_budget_overrun_rate"),
-            (self.sesoi_accuracy_difference, "sesoi_accuracy_difference"),
-        ]:
-            if not 0 <= value <= 1:
-                raise ValueError(f"{name} must be between 0 and 1")
+    def validate_sha256(self) -> SourceSnapshotConfig:
+        if SHA256_PATTERN.fullmatch(self.sha256) is None:
+            raise ValueError("snapshot sha256 must be a lowercase SHA-256 digest")
         return self
+
+
+class FailureSemantics(FrozenConfigModel):
+    invalid_output: Literal["score_incorrect"] = "score_incorrect"
+    refusal: Literal["score_incorrect"] = "score_incorrect"
+    architecture_tool_failure: Literal["score_incorrect"] = "score_incorrect"
+    budget_exhaustion: Literal["score_incorrect"] = "score_incorrect"
+    abstention: Literal["score_incorrect"] = "score_incorrect"
+    architecture_failure: Literal["score_incorrect"] = "score_incorrect"
+    infrastructure_failure: Literal["matched_block"] = "matched_block"
+    equality_is_crossover: Literal[False] = False
+
+
+class RetryPolicy(FrozenConfigModel):
+    max_attempts: int = Field(default=5, ge=1, le=10)
+    initial_backoff_seconds: float = Field(default=0.75, gt=0)
+    maximum_backoff_seconds: float = Field(default=20.0, gt=0)
+    permanent_error_circuit_breaker: int = Field(default=3, ge=1)
+
+
+class ExperimentConfig(FrozenConfigModel):
+    experiment_name: str = "canonical-main"
+    execution_mode: Literal["gateway", "offline_fixture"] = "gateway"
+    seed: int = 20260803
+    finqa_snapshot: SourceSnapshotConfig = Field(
+        default_factory=lambda: SourceSnapshotConfig(
+            path=Path("data/raw/finqa.json"), sha256="0" * 64
+        )
+    )
+    tatqa_snapshot: SourceSnapshotConfig = Field(
+        default_factory=lambda: SourceSnapshotConfig(
+            path=Path("data/raw/tatqa.json"), sha256="0" * 64
+        )
+    )
+    finance_complex_snapshot: SourceSnapshotConfig | None = Field(
+        default_factory=lambda: SourceSnapshotConfig(
+            path=Path("data/raw/financecomplexqa.json"), sha256="0" * 64
+        )
+    )
+    prepared_data_dir: Path = Path("data/processed/canonical")
+    run_root: Path = Path("experiments/runs")
+    development_fit_path: Path = Path("experiments/inputs/development_fit.jsonl")
+    pilot_gate_metrics_path: Path = Path("experiments/inputs/pilot_gate_metrics.json")
+    systems: tuple[SystemName, ...] = CANONICAL_SYSTEMS
+    confirmatory_systems: tuple[SystemName, ...] = CONFIRMATORY_SYSTEMS
+    tiers: tuple[TierName, ...] = CANONICAL_TIERS
+    model: str = EXACT_MODEL
+    deployment: str = EXACT_MODEL
+    tokenizer_id: str = "gateway:gpt-5.4-mini:chat"
+    tokenizer_sha256: str = "0" * 64
+    default_sample_cap: int = Field(default=1000, ge=1)
+    development_cases: int = Field(default=100, ge=2)
+    operational_pilot_cases: int = Field(default=60, ge=2)
+    main_cases: int = Field(default=1000, ge=2)
+    easy_reserve_cases: int = Field(default=100, ge=2)
+    repetitions: int = Field(default=1, ge=1)
+    scoring_absolute_tolerance: Decimal = Field(default=STRICT_TOLERANCE, ge=0)
+    scoring_relative_tolerance: Decimal = Field(default=STRICT_TOLERANCE, ge=0)
+    failure_semantics: FailureSemantics = Field(default_factory=FailureSemantics)
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    request_timeout_seconds: float = Field(default=180.0, gt=0)
+    max_concurrency: int = Field(default=4, ge=1)
+    expected_finance_complex_cases: int = Field(default=113, ge=1)
+    bootstrap_replicates: int = Field(default=5000, ge=1)
+
+    @model_validator(mode="after")
+    def validate_protocol(self) -> ExperimentConfig:
+        if self.systems != CANONICAL_SYSTEMS:
+            raise ValueError(f"systems must be exactly {CANONICAL_SYSTEMS!r}")
+        if self.confirmatory_systems != CONFIRMATORY_SYSTEMS:
+            raise ValueError(
+                f"confirmatory systems must be exactly {CONFIRMATORY_SYSTEMS!r}"
+            )
+        if self.tiers != CANONICAL_TIERS:
+            raise ValueError(f"tiers must be exactly {CANONICAL_TIERS!r}")
+        if self.model != EXACT_MODEL or self.deployment != EXACT_MODEL:
+            raise ValueError("model and deployment must resolve exactly gpt-5.4-mini")
+        if SHA256_PATTERN.fullmatch(self.tokenizer_sha256) is None:
+            raise ValueError("tokenizer_sha256 must be a lowercase SHA-256 digest")
+        if not self.tokenizer_id.strip():
+            raise ValueError("tokenizer_id must be non-empty")
+        if self.default_sample_cap > 1000:
+            raise ValueError("default sample cap must be at most 1000")
+        if self.main_cases > self.default_sample_cap:
+            raise ValueError("main cases cannot exceed the default sample cap")
+        if any(
+            value % 2
+            for value in (
+                self.development_cases,
+                self.operational_pilot_cases,
+                self.main_cases,
+                self.easy_reserve_cases,
+            )
+        ):
+            raise ValueError("balanced split sizes must be even")
+        if (
+            self.scoring_absolute_tolerance > STRICT_TOLERANCE
+            or self.scoring_relative_tolerance > STRICT_TOLERANCE
+        ):
+            raise ValueError("strict scoring tolerances cannot exceed 0.000001")
+        if self.retry_policy.maximum_backoff_seconds < self.retry_policy.initial_backoff_seconds:
+            raise ValueError("maximum retry backoff cannot be below the initial backoff")
+        return self
+
+    @property
+    def tier_token_limits(self) -> dict[str, int]:
+        return {name: BUDGET_TIERS[name].token_limit for name in self.tiers}
 
 
 def load_experiment_config(path: Path) -> ExperimentConfig:
     load_dotenv(path.resolve().parent.parent / ".env", override=False)
-    payload = yaml.safe_load(path.read_text())
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("experiment configuration must be a YAML mapping")
     return ExperimentConfig.model_validate(_expand(payload))
