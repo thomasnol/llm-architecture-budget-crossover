@@ -60,10 +60,29 @@ class InfrastructureAttempt(FrozenModel):
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
+class ResultKeyMismatch(RuntimeError):
+    def __init__(self, expected: CellKey, actual: CellResult) -> None:
+        self.expected = _cell_tuple(expected)
+        self.actual = _cell_tuple(actual)
+        super().__init__(f"returned cell key {self.actual!r} does not match {self.expected!r}")
+
+
 def _cell_tuple(
     value: CellKey | CellResult | InfrastructureAttempt,
 ) -> tuple[str, str, str, int]:
     return (value.case_id, value.system, value.tier, value.repetition)
+
+
+def _permanent_equivalence_key(
+    attempt: InfrastructureAttempt,
+) -> tuple[int | None, str, str, str, str]:
+    return (
+        attempt.status_code,
+        attempt.model,
+        attempt.stage,
+        attempt.error_type,
+        attempt.detail,
+    )
 
 
 def _infrastructure_attempt(
@@ -73,6 +92,18 @@ def _infrastructure_attempt(
     error: Exception,
     attempt_number: int,
 ) -> InfrastructureAttempt:
+    if isinstance(error, ResultKeyMismatch):
+        detail = str(error)
+        return InfrastructureAttempt(
+            **key.model_dump(),
+            model=model,
+            stage="result_protocol",
+            retryable=False,
+            error_type=type(error).__name__,
+            detail=detail,
+            signature=f"result_protocol:{detail}",
+            attempt_number=attempt_number,
+        )
     if isinstance(error, GatewayRequestError):
         return InfrastructureAttempt(
             **key.model_dump(),
@@ -167,11 +198,13 @@ async def execute_cells(
     completed = 0
     infrastructure_attempts = 0
     attempt_counts = Counter(_cell_tuple(attempt) for attempt in previous_attempts)
-    permanent_signatures = Counter(
-        attempt.signature for attempt in previous_attempts if not attempt.retryable
+    permanent_errors = Counter(
+        _permanent_equivalence_key(attempt)
+        for attempt in previous_attempts
+        if not attempt.retryable
     )
     circuit_open = asyncio.Event()
-    if any(count >= 3 for count in permanent_signatures.values()):
+    if any(count >= 3 for count in permanent_errors.values()):
         circuit_open.set()
     append_lock = asyncio.Lock()
 
@@ -192,6 +225,8 @@ async def execute_cells(
                         model=model,
                         repetition=key.repetition,
                     )
+                    if _cell_tuple(result) != _cell_tuple(key):
+                        raise ResultKeyMismatch(key, result)
                 except Exception as error:  # noqa: BLE001 - cell infrastructure boundary
                     cell = _cell_tuple(key)
                     attempt_counts[cell] += 1
@@ -205,8 +240,9 @@ async def execute_cells(
                         append_jsonl(attempts_path, attempt)
                         infrastructure_attempts += 1
                         if not attempt.retryable:
-                            permanent_signatures[attempt.signature] += 1
-                            if permanent_signatures[attempt.signature] >= 3:
+                            equivalence_key = _permanent_equivalence_key(attempt)
+                            permanent_errors[equivalence_key] += 1
+                            if permanent_errors[equivalence_key] >= 3:
                                 circuit_open.set()
                 else:
                     async with append_lock:

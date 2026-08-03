@@ -167,6 +167,33 @@ async def test_verified_search_always_plans_at_low_budget_and_accepts_first_pass
     assert result.trace.exit_reason == "accepted"
 
 
+async def test_planner_system_instructions_do_not_conflict_with_its_plan_schema():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find the metric"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("10")),
+        ]
+    )
+
+    await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["low"],
+        model="gpt-test",
+    )
+
+    planner, candidate = client.calls
+    assert planner["stage"] == "planner"
+    assert planner["system"] == CORE_INSTRUCTIONS
+    assert "candidate schema" not in planner["system"].casefold()
+    assert '"citations"' not in planner["system"]
+    assert '"steps"' in planner["user"]
+    assert '"queries"' in planner["user"]
+    assert '"citations"' not in planner["user"]
+    assert '"citations"' in candidate["user"]
+
+
 async def test_verified_search_checks_sequentially_and_accepts_a_later_candidate():
     client = ScriptedClient(
         [
@@ -234,6 +261,33 @@ async def test_verified_search_repairs_once_from_checker_findings_and_rechecks()
     assert len(result.trace.call_events) == 4
     assert all(event.usage is not None for event in result.trace.call_events)
     assert result.trace.realized_tokens == 480
+    assert result.trace.exit_reason == "repair_accepted"
+
+
+async def test_repair_uses_only_the_selected_rejected_candidates_findings():
+    client = ScriptedClient(
+        [
+            json.dumps({"steps": ["Find value"], "queries": ["Metric 1 2024"]}),
+            json.dumps(_candidate("10", citation="fabricated")),
+            json.dumps(_candidate("20")),
+            json.dumps(_candidate("10")),
+        ]
+    )
+
+    result = await run_system(
+        client,
+        case=_case(),
+        system="verified_search",
+        tier=BUDGET_TIERS["middle"],
+        model="gpt-test",
+    )
+
+    repair_user = client.calls[-1]["user"]
+    assert client.calls[-1]["stage"] == "repair"
+    assert '"value":"20"' in repair_user
+    assert "expression_mismatch" in repair_user
+    assert "fabricated_citation" not in repair_user
+    assert "unsupported_operand" not in repair_user
     assert result.trace.exit_reason == "repair_accepted"
 
 

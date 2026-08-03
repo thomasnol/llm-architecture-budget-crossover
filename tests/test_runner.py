@@ -215,6 +215,50 @@ async def test_infrastructure_errors_are_unscored_attempts_but_architecture_fail
     assert summary.remaining == 1
 
 
+async def test_mismatched_returned_cell_key_is_a_protocol_attempt_not_a_result(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def return_wrong_key(client, *, case, system, tier, model, repetition):
+        del client, case, system, model
+        return CellResult(
+            case_id="different-case",
+            system="verified_search",
+            tier=tier.name,
+            repetition=repetition,
+            status="ok",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="completed"),
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", return_wrong_key)
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
+
+    summary = await execute_cells(
+        cases=[_case("a")],
+        systems=("monolith",),
+        tiers=("low",),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=results_path,
+        attempts_path=attempts_path,
+        max_concurrency=1,
+    )
+
+    assert read_jsonl(results_path, CellResult) == []
+    attempts = read_jsonl(attempts_path, InfrastructureAttempt)
+    assert len(attempts) == 1
+    assert attempts[0].stage == "result_protocol"
+    assert attempts[0].retryable is False
+    assert attempts[0].error_type == "ResultKeyMismatch"
+    assert "different-case" in attempts[0].detail
+    assert summary.completed == 0
+    assert summary.infrastructure_attempts == 1
+    assert summary.remaining == 1
+
+
 async def test_three_equivalent_permanent_errors_open_and_resume_the_circuit(
     monkeypatch,
     tmp_path: Path,
@@ -264,3 +308,46 @@ async def test_three_equivalent_permanent_errors_open_and_resume_the_circuit(
     assert resumed.circuit_open is True
     assert resumed.infrastructure_attempts == 0
     assert len(read_jsonl(attempts_path, InfrastructureAttempt)) == 3
+
+
+async def test_permanent_error_equivalence_ignores_credential_provenance(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launches = 0
+
+    async def permanently_fail(client, *, case, system, tier, model, repetition):
+        del client, case, system, tier, model, repetition
+        nonlocal launches
+        launches += 1
+        raise GatewayRequestError(
+            status_code=400,
+            detail="unsupported parameter",
+            model="gpt-test",
+            stage="planner",
+            credential_slot=1 if launches % 2 else 2,
+            request_id=f"request-{launches}",
+            retryable=False,
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", permanently_fail)
+    attempts_path = tmp_path / "attempts.jsonl"
+
+    summary = await execute_cells(
+        cases=[_case("a")],
+        systems=("monolith", "verified_search"),
+        tiers=("low", "middle", "high"),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=tmp_path / "results.jsonl",
+        attempts_path=attempts_path,
+        max_concurrency=1,
+    )
+
+    attempts = read_jsonl(attempts_path, InfrastructureAttempt)
+    assert launches == 3
+    assert summary.circuit_open is True
+    assert {attempt.status_code for attempt in attempts} == {400}
+    assert {attempt.stage for attempt in attempts} == {"planner"}
+    assert {attempt.model for attempt in attempts} == {"gpt-test"}

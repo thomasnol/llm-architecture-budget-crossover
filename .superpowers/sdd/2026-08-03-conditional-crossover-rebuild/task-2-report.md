@@ -176,3 +176,87 @@ $ git diff --check
 - With concurrency greater than one, calls already in flight when the third permanent signature is
   observed cannot be unlaunched. The engine stops dequeuing new cells immediately; the exact-three
   test uses one worker to establish the circuit threshold deterministically.
+
+## Fix round 1: blocking review findings
+
+Commit base: `263378841df358b3981f208b4392c73dc53993ff`.
+
+### Changes
+
+- Made `CORE_INSTRUCTIONS` stage-neutral. Planner and answer/repair output schemas now live only in
+  their respective user prompts, eliminating the higher-priority candidate-versus-plan conflict.
+- Added a normalized permanent-error equivalence key based on status code, model, stage, error
+  type, and sanitized detail. Credential slot and request ID remain telemetry and no longer split
+  otherwise equivalent circuit-breaker failures.
+- Preserved rejected candidate/check pairing during repair. The selected last candidate receives
+  only its own `CheckResult.findings`; findings from earlier candidates are not flattened into the
+  repair request.
+- Added exact returned-result identity validation before persistence. A mismatched result becomes a
+  non-retryable `result_protocol` infrastructure attempt and is never appended to scored results.
+
+### RED/GREEN evidence
+
+1. Planner/system compatibility
+
+   ```text
+   $ .venv/bin/pytest -q tests/test_systems.py::test_planner_system_instructions_do_not_conflict_with_its_plan_schema
+   RED: assertion failed because CORE_INSTRUCTIONS contained "candidate schema".
+   GREEN: 1 passed in 0.10s
+   ```
+
+2. Cross-credential permanent error equivalence
+
+   ```text
+   $ .venv/bin/pytest -q tests/test_runner.py::test_permanent_error_equivalence_ignores_credential_provenance
+   RED: expected 3 launches, observed 5 because credential slots produced separate signatures.
+   GREEN (including existing resume circuit regression): 2 passed in 0.15s
+   ```
+
+3. Candidate/check repair pairing
+
+   ```text
+   $ .venv/bin/pytest -q tests/test_systems.py::test_repair_uses_only_the_selected_rejected_candidates_findings
+   RED: repair prompt for candidate value 20 also contained fabricated_citation and
+   unsupported_operand findings from the prior candidate.
+   GREEN (including existing repair regression): 2 passed in 0.10s
+   ```
+
+4. Returned cell-key validation
+
+   ```text
+   $ .venv/bin/pytest -q tests/test_runner.py::test_mismatched_returned_cell_key_is_a_protocol_attempt_not_a_result
+   RED: mismatched case/system result was appended to results.jsonl.
+   GREEN: 1 passed in 0.11s
+   ```
+
+### Fix-round verification
+
+```text
+$ .venv/bin/pytest -q tests/test_systems.py tests/test_runner.py
+.........................                                                [100%]
+25 passed in 0.25s
+
+$ .venv/bin/pytest -q
+........................................................................ [ 61%]
+.............................................                            [100%]
+117 passed in 9.13s
+
+$ .venv/bin/ruff check .
+All checks passed!
+
+$ git diff --check
+# no output; exit 0
+```
+
+### Fix-round self-review
+
+- Planner and candidate requests still share the configured model and common safety/evidence
+  boundary, while their mutually exclusive schemas are stage-local.
+- Permanent error equivalence excludes only incidental credential/request provenance and retains
+  the semantic request/error fields needed to keep distinct failures separate.
+- `candidates` and `checks` remain parallel for every parsed checked candidate; repair selects the
+  final pair.
+- Result identity is validated before the append lock. Protocol mismatches use the dequeued key in
+  the attempt log, remain unscored, and participate in permanent-error circuit breaking.
+
+No new concerns were identified in this fix round.

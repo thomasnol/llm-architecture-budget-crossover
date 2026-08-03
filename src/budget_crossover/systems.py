@@ -25,9 +25,9 @@ from .models import (
 from .retrieval import RetrievalResult, retrieve
 from .scoring import normalized_candidate_value
 
-CORE_INSTRUCTIONS = """Answer the financial question using only the supplied evidence.
-Return structured JSON matching the candidate schema. Do not report confidence, inspect hidden
-labels, or invent evidence. Cite stable evidence IDs and provide a safe arithmetic expression."""
+CORE_INSTRUCTIONS = """Follow the stage-specific instructions exactly using only supplied public
+case information and evidence. Do not report confidence, inspect hidden labels, or invent facts.
+Return only the structured JSON requested by the current stage, without chain-of-thought."""
 PROMPT_REVISION = "conditional-crossover-2026-08-03"
 
 CANDIDATE_SCHEMA = """{
@@ -113,12 +113,10 @@ def _repair_prompt(
     case: PublicCase,
     evidence: Sequence[EvidenceItem],
     candidate: Candidate,
-    checks: Sequence[CheckResult],
+    check: CheckResult,
 ) -> str:
     findings = [
-        finding.model_dump(mode="json")
-        for check in checks
-        for finding in check.findings
+        finding.model_dump(mode="json") for finding in check.findings
     ]
     return f"""QUESTION
 {case.question}
@@ -555,7 +553,7 @@ async def run_system(
                 ledger=ledger,
                 model=model,
                 stage="repair",
-                user=_repair_prompt(case, retrieval.items, candidates[-1], checks),
+                user=_repair_prompt(case, retrieval.items, candidates[-1], checks[-1]),
                 max_tokens=256,
             )
         except BudgetExceeded:
