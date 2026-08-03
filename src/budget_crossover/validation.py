@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
-from .models import FrozenModel
+from .models import FrozenDict, FrozenModel
+from .runner import CellKey
+
+
+def _freeze_gate_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return FrozenDict(
+            {key: _freeze_gate_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_gate_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_gate_value(item) for item in value)
+    return value
 
 
 class OperationalGateInputs(FrozenModel):
-    expected_cells: int = Field(gt=0)
-    observed_cells: int = Field(ge=0)
+    expected_cell_keys: tuple[CellKey, ...]
+    observed_cell_keys: tuple[CellKey, ...]
     authoritative_usage_cells: int = Field(ge=0)
-    expected_paired_cells: int = Field(gt=0)
-    observed_paired_cells: int = Field(ge=0)
-    unique_paired_cells: int = Field(ge=0)
     label_leakage_count: int = Field(ge=0)
     budget_overrun_count: int = Field(ge=0)
     schema_valid_cells: int = Field(ge=0)
@@ -41,12 +51,26 @@ class OperationalGateInputs(FrozenModel):
     checker_detected_wrong_first_drafts: int = Field(ge=0)
     wrong_first_drafts_corrected: int = Field(ge=0)
 
+    @field_validator(
+        "expected_mechanism_counts",
+        "observed_mechanism_counts",
+        "verified_search_median_tokens",
+        mode="after",
+    )
+    @classmethod
+    def freeze_mappings(cls, value: dict[str, Any]) -> FrozenDict:
+        return _freeze_gate_value(value)
+
     @model_validator(mode="after")
     def validate_counts(self) -> OperationalGateInputs:
+        if not self.expected_cell_keys:
+            raise ValueError("expected cell keys must be nonempty")
+        if len(set(self.expected_cell_keys)) != len(self.expected_cell_keys):
+            raise ValueError("expected cell keys must be unique")
+        observed_cells = len(self.observed_cell_keys)
         bounded = (
-            (self.authoritative_usage_cells, self.observed_cells),
-            (self.unique_paired_cells, self.observed_paired_cells),
-            (self.schema_valid_cells, self.observed_cells),
+            (self.authoritative_usage_cells, observed_cells),
+            (self.schema_valid_cells, observed_cells),
             (self.unresolved_external_matched_blocks, self.matched_blocks_total),
             (self.low_tier_feasible_cases, self.low_tier_cases),
             (self.easy_monolith_correct, self.easy_monolith_total),
@@ -72,6 +96,20 @@ class OperationalGateInputs(FrozenModel):
         return self
 
 
+def _cell_key_text(key: CellKey) -> str:
+    return f"{key.case_id}:{key.system}:{key.tier}:{key.repetition}"
+
+
+def _sorted_cell_key_text(keys: set[CellKey]) -> tuple[str, ...]:
+    return tuple(
+        _cell_key_text(key)
+        for key in sorted(
+            keys,
+            key=lambda key: (key.case_id, key.system, key.tier, key.repetition),
+        )
+    )
+
+
 class GateComponent(FrozenModel):
     name: str
     passed: bool
@@ -82,24 +120,65 @@ class GateComponent(FrozenModel):
     denominator: int | None = None
     zero_denominator_rule: str | None = None
 
+    @field_validator("value", "threshold", mode="after")
+    @classmethod
+    def freeze_nested_values(cls, value: Any) -> Any:
+        return _freeze_gate_value(value)
+
 
 class OperationalGateArtifact(FrozenModel):
-    schema_version: int = 1
+    schema_version: Literal[1] = 1
     passed: bool
-    override_allowed: bool = False
+    override_allowed: Literal[False] = False
     failed_components: tuple[str, ...]
     inputs: OperationalGateInputs
     components: tuple[GateComponent, ...]
 
+    @classmethod
+    def model_construct(
+        cls,
+        _fields_set: set[str] | None = None,
+        **values: Any,
+    ) -> OperationalGateArtifact:
+        """Retain Pydantic's API without exposing its validation bypass."""
+        del _fields_set
+        return cls.model_validate(values)
 
-def evaluate_operational_gates(
+    @model_validator(mode="after")
+    def validate_derived_verdict(self) -> OperationalGateArtifact:
+        inputs = OperationalGateInputs.model_validate(
+            self.inputs.model_dump(mode="python", round_trip=True)
+        )
+        canonical_components = _evaluate_gate_components(inputs)
+        if self.components != canonical_components:
+            raise ValueError("gate components must be derived from the typed input snapshot")
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "components", canonical_components)
+        names = tuple(component.name for component in canonical_components)
+        if len(names) != len(set(names)):
+            raise ValueError("operational gate component names must be unique")
+        derived_failures = tuple(
+            component.name for component in canonical_components if not component.passed
+        )
+        if self.failed_components != derived_failures:
+            raise ValueError("failed components must be derived from component verdicts")
+        if self.passed is not (not derived_failures):
+            raise ValueError("gate pass must be derived from component verdicts")
+        return self
+
+
+def _evaluate_gate_components(
     inputs: OperationalGateInputs,
-    *,
-    output_path: Path | None = None,
-) -> OperationalGateArtifact:
-    """Evaluate every preregistered component without an override path."""
+) -> tuple[GateComponent, ...]:
     medians = inputs.verified_search_median_tokens
-    observed_rate_denominator = inputs.observed_cells or 1
+    expected_keys = set(inputs.expected_cell_keys)
+    observed_keys = set(inputs.observed_cell_keys)
+    missing_keys = expected_keys - observed_keys
+    unexpected_keys = observed_keys - expected_keys
+    expected_cells = len(inputs.expected_cell_keys)
+    observed_cells = len(inputs.observed_cell_keys)
+    unique_cells = len(observed_keys)
+    observed_rate_denominator = observed_cells or 1
 
     def rate(numerator: int, denominator: int) -> float:
         return numerator / denominator if denominator else 0.0
@@ -107,36 +186,36 @@ def evaluate_operational_gates(
     components = (
         GateComponent(
             name="complete_grid",
-            passed=inputs.observed_cells == inputs.expected_cells,
-            value=inputs.observed_cells,
+            passed=not missing_keys and not unexpected_keys,
+            value={
+                "missing_cell_keys": _sorted_cell_key_text(missing_keys),
+                "unexpected_cell_keys": _sorted_cell_key_text(unexpected_keys),
+            },
             comparison="==",
-            threshold=inputs.expected_cells,
-            numerator=inputs.observed_cells,
-            denominator=inputs.expected_cells,
+            threshold={"missing_cell_keys": (), "unexpected_cell_keys": ()},
+            numerator=len(expected_keys & observed_keys),
+            denominator=expected_cells,
         ),
         GateComponent(
             name="unique_paired_cells",
-            passed=(
-                inputs.observed_paired_cells == inputs.expected_paired_cells
-                and inputs.unique_paired_cells == inputs.observed_paired_cells
-            ),
-            value=inputs.unique_paired_cells,
+            passed=unique_cells == observed_cells,
+            value=unique_cells,
             comparison="==",
-            threshold=inputs.expected_paired_cells,
-            numerator=inputs.unique_paired_cells,
-            denominator=inputs.expected_paired_cells,
+            threshold=observed_cells,
+            numerator=unique_cells,
+            denominator=observed_cells,
         ),
         GateComponent(
             name="authoritative_usage",
             passed=(
-                inputs.observed_cells > 0
-                and inputs.authoritative_usage_cells == inputs.observed_cells
+                observed_cells > 0
+                and inputs.authoritative_usage_cells == observed_cells
             ),
             value=inputs.authoritative_usage_cells / observed_rate_denominator,
             comparison="==",
             threshold=1.0,
             numerator=inputs.authoritative_usage_cells,
-            denominator=inputs.observed_cells,
+            denominator=observed_cells,
         ),
         GateComponent(
             name="label_leakage",
@@ -155,14 +234,14 @@ def evaluate_operational_gates(
         GateComponent(
             name="schema_validity",
             passed=(
-                inputs.observed_cells > 0
-                and inputs.schema_valid_cells * 100 >= inputs.observed_cells * 99
+                observed_cells > 0
+                and inputs.schema_valid_cells * 100 >= observed_cells * 99
             ),
             value=inputs.schema_valid_cells / observed_rate_denominator,
             comparison=">=",
             threshold=0.99,
             numerator=inputs.schema_valid_cells,
-            denominator=inputs.observed_cells,
+            denominator=observed_cells,
         ),
         GateComponent(
             name="unresolved_external_matched_blocks",
@@ -316,6 +395,16 @@ def evaluate_operational_gates(
             denominator=inputs.checker_detected_wrong_first_drafts,
         ),
     )
+    return components
+
+
+def evaluate_operational_gates(
+    inputs: OperationalGateInputs,
+    *,
+    output_path: Path | None = None,
+) -> OperationalGateArtifact:
+    """Evaluate every preregistered component without an override path."""
+    components = _evaluate_gate_components(inputs)
     failed_components = tuple(
         component.name for component in components if not component.passed
     )

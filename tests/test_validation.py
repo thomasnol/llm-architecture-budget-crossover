@@ -2,8 +2,12 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from budget_crossover.runner import CellKey
 from budget_crossover.validation import (
+    GateComponent,
+    OperationalGateArtifact,
     OperationalGateInputs,
     assert_pilot_gate,
     evaluate_operational_gates,
@@ -12,14 +16,24 @@ from budget_crossover.validation import (
 )
 
 
+def _cell_grid() -> tuple[CellKey, ...]:
+    return tuple(
+        CellKey(
+            case_id=f"case-{index}",
+            system="monolith",
+            tier="low",
+            repetition=0,
+        )
+        for index in range(100)
+    )
+
+
 def _passing_inputs() -> OperationalGateInputs:
+    grid = _cell_grid()
     return OperationalGateInputs(
-        expected_cells=100,
-        observed_cells=100,
+        expected_cell_keys=grid,
+        observed_cell_keys=grid,
         authoritative_usage_cells=100,
-        expected_paired_cells=100,
-        observed_paired_cells=100,
-        unique_paired_cells=100,
         label_leakage_count=0,
         budget_overrun_count=0,
         schema_valid_cells=99,
@@ -90,13 +104,20 @@ def test_operational_gate_emits_every_component_and_is_non_overridable(tmp_path:
     [
         (
             {
-                "observed_cells": 99,
+                "observed_cell_keys": _cell_grid()[:-1],
                 "authoritative_usage_cells": 99,
                 "schema_valid_cells": 99,
             },
             "complete_grid",
         ),
-        ({"unique_paired_cells": 99}, "unique_paired_cells"),
+        (
+            {
+                "observed_cell_keys": _cell_grid() + (_cell_grid()[0],),
+                "authoritative_usage_cells": 101,
+                "schema_valid_cells": 100,
+            },
+            "unique_paired_cells",
+        ),
         ({"authoritative_usage_cells": 99}, "authoritative_usage"),
         ({"label_leakage_count": 1}, "label_leakage"),
         ({"budget_overrun_count": 1}, "budget_overruns"),
@@ -145,6 +166,27 @@ def test_operational_gate_threshold_boundaries_are_inclusive():
     assert upper_hard.passed is True
 
 
+def test_complete_grid_compares_exact_cell_keys_not_only_counts():
+    expected = _cell_grid()
+    replacement = expected[0].model_copy(update={"repetition": 1})
+    observed = (replacement, *expected[1:])
+
+    artifact = evaluate_operational_gates(
+        _passing_inputs().model_copy(update={"observed_cell_keys": observed})
+    )
+
+    components = {component.name: component for component in artifact.components}
+    assert artifact.passed is False
+    assert artifact.failed_components == ("complete_grid",)
+    assert components["complete_grid"].value["missing_cell_keys"] == (
+        "case-0:monolith:low:0",
+    )
+    assert components["complete_grid"].value["unexpected_cell_keys"] == (
+        "case-0:monolith:low:1",
+    )
+    assert components["unique_paired_cells"].passed is True
+
+
 def test_zero_checker_and_repair_opportunities_emit_failed_components():
     artifact = evaluate_operational_gates(
         _passing_inputs().model_copy(
@@ -168,6 +210,85 @@ def test_zero_checker_and_repair_opportunities_emit_failed_components():
         "wrong_first_draft_correction",
     }
     assert len(artifact.components) == 18
+
+
+def test_gate_artifact_constructor_and_copy_cannot_forge_a_failed_verdict():
+    failed = evaluate_operational_gates(
+        _passing_inputs().model_copy(update={"label_leakage_count": 1})
+    )
+    forged_payload = failed.model_dump(mode="python", round_trip=True)
+    forged_payload.update(
+        passed=True,
+        override_allowed=True,
+        failed_components=(),
+    )
+
+    with pytest.raises(ValidationError):
+        OperationalGateArtifact.model_validate(forged_payload)
+    with pytest.raises(ValidationError):
+        failed.model_copy(
+            update={
+                "passed": True,
+                "override_allowed": True,
+                "failed_components": (),
+            }
+        )
+
+
+def test_gate_artifact_model_construct_cannot_bypass_summary_validation():
+    failed = evaluate_operational_gates(
+        _passing_inputs().model_copy(update={"label_leakage_count": 1})
+    )
+    forged_payload = failed.model_dump(mode="python", round_trip=True)
+    forged_payload.update(passed=True, failed_components=())
+
+    with pytest.raises(ValidationError):
+        OperationalGateArtifact.model_construct(**forged_payload)
+
+
+def test_gate_artifact_recomputes_nested_components_from_typed_inputs():
+    passing = evaluate_operational_gates(_passing_inputs())
+    forged_components = tuple(
+        GateComponent.model_construct(
+            **(
+                component.model_dump(mode="python", round_trip=True)
+                | ({"passed": False, "value": 1} if component.name == "label_leakage" else {})
+            )
+        )
+        for component in passing.components
+    )
+    forged_payload = passing.model_dump(mode="python", round_trip=True)
+    forged_payload.update(
+        passed=False,
+        failed_components=("label_leakage",),
+        components=forged_components,
+    )
+
+    with pytest.raises(ValidationError):
+        OperationalGateArtifact.model_validate(forged_payload)
+
+
+def test_gate_input_nested_maps_are_deeply_immutable():
+    inputs = _passing_inputs()
+
+    with pytest.raises(TypeError, match="frozen mapping"):
+        inputs.expected_mechanism_counts["planner_calls"] = 99
+    with pytest.raises(TypeError, match="frozen mapping"):
+        inputs.verified_search_median_tokens["middle"] = 1
+
+
+def test_gate_component_nested_maps_are_deeply_immutable():
+    artifact = evaluate_operational_gates(_passing_inputs())
+    mechanism = next(
+        component
+        for component in artifact.components
+        if component.name == "exact_mechanism_counts"
+    )
+
+    with pytest.raises(TypeError, match="frozen mapping"):
+        mechanism.value["planner_calls"] = 99
+    with pytest.raises(TypeError, match="frozen mapping"):
+        mechanism.threshold["planner_calls"] = 99
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from budget_crossover.models import (
     MechanismTrace,
     PublicCase,
 )
+from budget_crossover.runner import CellKey
 
 
 def test_exact_one_sided_mcnemar_uses_the_conditional_binomial_tail():
@@ -172,8 +173,24 @@ def test_itt_exact_scoring_excludes_whole_unresolved_external_blocks_and_not_rep
             resolved=False,
         ),
     )
+    expected_primary_keys = tuple(
+        CellKey(
+            case_id=case.case_id,
+            system=system,
+            tier="low",
+            repetition=0,
+        )
+        for case in cases
+        for system in ("monolith", "verified_search")
+    )
 
-    scored = score_itt_results(cases, labels, results, matched_blocks=blocks)
+    scored = score_itt_results(
+        cases,
+        labels,
+        results,
+        expected_primary_keys=expected_primary_keys,
+        matched_blocks=blocks,
+    )
 
     assert scored.excluded_case_ids == ("external-a", "external-b")
     assert scored.excluded_matched_blocks == ("external-block",)
@@ -188,6 +205,36 @@ def test_itt_exact_scoring_excludes_whole_unresolved_external_blocks_and_not_rep
         ("verified_search", 0): True,
         ("verified_search", 1): True,
     }
+
+
+def test_itt_materializes_missing_retained_primary_architecture_cells_as_incorrect():
+    cases = (_public("kept", "doc-kept"),)
+    labels = (_label("kept"),)
+    results = (_cell("kept", "monolith", 0, value="10"),)
+    expected_primary_keys = tuple(
+        CellKey(
+            case_id="kept",
+            system=system,
+            tier="low",
+            repetition=0,
+        )
+        for system in ("monolith", "verified_search")
+    )
+
+    scored = score_itt_results(
+        cases,
+        labels,
+        results,
+        expected_primary_keys=expected_primary_keys,
+    )
+
+    assert scored.scored_cells == 2
+    assert scored.primary_cells == 2
+    outcomes = {outcome.system: outcome for outcome in scored.outcomes}
+    assert outcomes["monolith"].correct is True
+    assert outcomes["verified_search"].correct is False
+    assert outcomes["verified_search"].primary is True
+    assert outcomes["verified_search"].status == "missing_architecture_cell"
 
 
 def _endpoint_fixture(*, low_pattern: str) -> tuple[PairedCaseOutcome, ...]:
@@ -247,6 +294,56 @@ def test_primary_confirmation_requires_both_directional_exact_endpoint_tests():
     assert threshold.low.difference == 0.0
     assert threshold.low.exact.reject is False
     assert threshold.high.exact.reject is True
+
+
+def test_confirmatory_alpha_is_immutable_at_five_percent():
+    four_documents = tuple(
+        row
+        for row in _endpoint_fixture(low_pattern="verified_worse")
+        if row.document_id in {"doc-0", "doc-1", "doc-2", "doc-3"}
+    )
+
+    canonical = confirm_crossover(four_documents, bootstrap_replicates=200, seed=17)
+
+    assert canonical.low.exact.p_value == pytest.approx(0.0625)
+    assert canonical.high.exact.p_value == pytest.approx(0.0625)
+    assert canonical.confirmed is False
+    assert canonical.alpha == 0.05
+    with pytest.raises(TypeError):
+        confirm_crossover(
+            four_documents,
+            alpha=0.10,
+            bootstrap_replicates=200,
+            seed=17,
+        )
+
+
+def test_confirmatory_sesoi_is_immutable_at_five_points():
+    outcomes = tuple(
+        PairedCaseOutcome(
+            document_id=f"doc-{index}",
+            tier=tier,
+            monolith_correct=(tier == "low" or index >= 2),
+            verified_search_correct=(tier == "high"),
+        )
+        for index in range(20)
+        for tier in ("low", "high")
+    )
+
+    canonical = confirm_crossover(outcomes, bootstrap_replicates=1000, seed=23)
+
+    assert canonical.sesoi == 0.05
+    assert (
+        canonical.high.sesoi_interpretation
+        == "point_meets_five_point_sesoi_margin_not_proven"
+    )
+    with pytest.raises(TypeError):
+        confirm_crossover(
+            outcomes,
+            sesoi=0.20,
+            bootstrap_replicates=1000,
+            seed=23,
+        )
 
 
 def test_five_point_design_alternative_is_not_automatically_a_proven_margin():

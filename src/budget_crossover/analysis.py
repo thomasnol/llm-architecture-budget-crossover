@@ -11,9 +11,12 @@ from pydantic import Field, model_validator
 from scipy.stats import binom
 
 from .models import CellResult, FrozenModel, HiddenLabel, PublicCase, SystemName, TierName
+from .runner import CellKey
 from .scoring import score_candidate
 
 Alternative = Literal["less", "greater"]
+CONFIRMATORY_ALPHA = 0.05
+CONFIRMATORY_SESOI = 0.05
 
 
 class McNemarResult(FrozenModel):
@@ -127,13 +130,13 @@ class EndpointEffect(FrozenModel):
     one_sided_bound: float
     one_sided_bound_type: Literal["upper", "lower"]
     two_sided_interval: tuple[float, float]
-    sesoi: float
+    sesoi: Literal[0.05]
     sesoi_interpretation: str
 
 
 class CrossoverConfirmation(FrozenModel):
-    alpha: float
-    sesoi: float
+    alpha: Literal[0.05]
+    sesoi: Literal[0.05]
     low: EndpointEffect
     high: EndpointEffect
     endpoint_reversal: bool
@@ -340,6 +343,7 @@ def score_itt_results(
     labels: Sequence[HiddenLabel],
     results: Sequence[CellResult],
     *,
+    expected_primary_keys: tuple[CellKey, ...],
     matched_blocks: Sequence[MatchedBlock] = (),
 ) -> ITTScoringResult:
     """Score every retained cell exactly; architecture failures are incorrect."""
@@ -349,6 +353,20 @@ def score_itt_results(
         raise ValueError("public case IDs must be unique")
     if len(label_by_id) != len(labels) or set(label_by_id) != set(case_by_id):
         raise ValueError("hidden labels must join one-to-one with public cases")
+    if not isinstance(expected_primary_keys, tuple):
+        raise TypeError("expected primary keys must be a frozen tuple")
+    if not expected_primary_keys:
+        raise ValueError("expected primary keys must be nonempty")
+    expected_primary_tuples = {
+        (key.case_id, key.system, key.tier, key.repetition)
+        for key in expected_primary_keys
+    }
+    if len(expected_primary_tuples) != len(expected_primary_keys):
+        raise ValueError("expected primary keys must be unique")
+    if any(key.repetition != 0 for key in expected_primary_keys):
+        raise ValueError("expected primary keys must all use repetition zero")
+    if not {key.case_id for key in expected_primary_keys} <= set(case_by_id):
+        raise ValueError("expected primary keys contain unknown case IDs")
     block_case_ids = [case_id for block in matched_blocks for case_id in block.case_ids]
     if len(block_case_ids) != len(set(block_case_ids)):
         raise ValueError("a case cannot belong to more than one matched block")
@@ -367,6 +385,7 @@ def score_itt_results(
     )
     excluded_set = set(excluded_cases)
     observed_keys: set[tuple[str, str, str, int]] = set()
+    observed_primary_keys: set[tuple[str, str, str, int]] = set()
     outcomes: list[ITTOutcome] = []
     for result in results:
         if result.case_id not in case_by_id:
@@ -375,6 +394,10 @@ def score_itt_results(
         if key in observed_keys:
             raise ValueError("result cells must be unique before ITT scoring")
         observed_keys.add(key)
+        if result.repetition == 0:
+            if key not in expected_primary_tuples:
+                raise ValueError("primary result cell is absent from the expected grid")
+            observed_primary_keys.add(key)
         if result.case_id in excluded_set:
             continue
         correct = (
@@ -394,6 +417,29 @@ def score_itt_results(
                 status=result.status,
             )
         )
+    missing_primary_keys = sorted(
+        (
+            key
+            for key in expected_primary_keys
+            if key.case_id not in excluded_set
+            and (key.case_id, key.system, key.tier, key.repetition)
+            not in observed_primary_keys
+        ),
+        key=lambda key: (key.case_id, key.system, key.tier, key.repetition),
+    )
+    outcomes.extend(
+        ITTOutcome(
+            case_id=key.case_id,
+            document_id=case_by_id[key.case_id].document_id,
+            system=key.system,
+            tier=key.tier,
+            repetition=key.repetition,
+            primary=True,
+            correct=False,
+            status="missing_architecture_cell",
+        )
+        for key in missing_primary_keys
+    )
     included_documents = {
         case.document_id for case in cases if case.case_id not in excluded_set
     }
@@ -433,16 +479,14 @@ def _sesoi_interpretation(
 def confirm_crossover(
     outcomes: Sequence[PairedCaseOutcome],
     *,
-    alpha: float = 0.05,
-    sesoi: float = 0.05,
     bootstrap_replicates: int = 5000,
     seed: int = 20260803,
 ) -> CrossoverConfirmation:
     """Apply the prespecified intersection-union endpoint confirmation."""
+    alpha = CONFIRMATORY_ALPHA
+    sesoi = CONFIRMATORY_SESOI
     if type(bootstrap_replicates) is not int or bootstrap_replicates < 1:
         raise ValueError("bootstrap_replicates must be a positive integer")
-    if not 0 < sesoi < 1:
-        raise ValueError("sesoi must be between zero and one")
     keyed: dict[tuple[str, str], PairedCaseOutcome] = {}
     for outcome in outcomes:
         if outcome.tier not in {"low", "high"}:
@@ -478,8 +522,8 @@ def confirm_crossover(
     endpoint_effects: dict[str, EndpointEffect] = {}
     for column, (tier, alternative, bound_quantile, bound_type) in enumerate(
         (
-            ("low", "less", 0.95, "upper"),
-            ("high", "greater", 0.05, "lower"),
+            ("low", "less", 1 - alpha, "upper"),
+            ("high", "greater", alpha, "lower"),
         )
     ):
         values = difference_matrix[:, column]
@@ -493,7 +537,10 @@ def confirm_crossover(
         )
         two_sided_interval = tuple(
             float(value)
-            for value in np.quantile(bootstrap_means[:, column], [0.025, 0.975])
+            for value in np.quantile(
+                bootstrap_means[:, column],
+                [alpha / 2, 1 - alpha / 2],
+            )
         )
         one_sided_bound = float(
             np.quantile(bootstrap_means[:, column], bound_quantile)

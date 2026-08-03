@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from budget_crossover.calibration import (
+    CalibrationSelection,
     DevelopmentFitObservation,
     calibrate_run,
     freeze_calibration,
@@ -107,6 +108,54 @@ def test_calibration_freeze_requires_low_middle_and_high_tiers(tmp_path: Path):
         freeze_calibration(
             (low,),
             output_path=tmp_path / "partial.json",
+            pilot_started=False,
+        )
+
+
+def test_calibration_selection_rejects_forged_copy_and_constructor():
+    valid = select_calibration_ceiling(
+        "high",
+        (DevelopmentFitObservation(case_id="case-1", mandatory_tokens=8_000),),
+    )
+
+    with pytest.raises(ValidationError):
+        valid.model_copy(
+            update={
+                "selected_ceiling": 1,
+                "feasibility_pass": True,
+                "progression": (),
+            }
+        )
+    with pytest.raises(ValidationError):
+        CalibrationSelection(
+            tier="high",
+            selected_ceiling=1,
+            feasibility_pass=True,
+            progression=(),
+        )
+
+
+def test_freeze_revalidates_constructed_selections_instead_of_trusting_boolean(
+    tmp_path: Path,
+):
+    observations = (
+        DevelopmentFitObservation(case_id="case-1", mandatory_tokens=8_000),
+    )
+    valid = {
+        tier: select_calibration_ceiling(tier, observations)
+        for tier in ("low", "middle", "high")
+    }
+    valid["low"] = CalibrationSelection.model_construct(
+        tier="low",
+        selected_ceiling=1,
+        feasibility_pass=True,
+        progression=(),
+    )
+
+    with pytest.raises(ValidationError):
+        freeze_calibration(
+            tuple(valid.values()),
+            output_path=tmp_path / "forged.json",
             pilot_started=False,
         )
 

@@ -150,3 +150,52 @@ Fresh final verification commands and outputs:
   clamped or unblinded.
 - Crossing intervals are intentionally conditional and must always be presented
   beside support and the no-crossing member of the confidence set.
+
+## Fix round 1: canonical-invariant hardening
+
+The first review round identified four ways a caller or incomplete run could
+change the confirmatory claim after the protocol was frozen. All four are now
+closed:
+
+- `confirm_crossover` no longer accepts caller-controlled alpha or SESOI values.
+  The confirmatory contract and its endpoint artifacts use literal `.05` values,
+  while interval quantiles are derived from the frozen alpha.
+- Calibration selections now carry the exact development observations used to
+  derive them. Their examined ceiling prefix, terminal selected ceiling, recorded
+  rates, and feasibility verdict are recomputed during validation. Freeze rebuilds
+  each selection from its serialized data before accepting it.
+- Operational-gate input maps, component values, and thresholds are recursively
+  immutable. Artifact summaries and all 18 components are recomputed from a
+  revalidated typed input snapshot. `model_copy`, direct construction, nested
+  forged components, and `model_construct` cannot substitute contradictory cached
+  pass summaries.
+- The complete-grid gate compares exact expected and observed `CellKey` identities
+  and reports deterministic missing/unexpected keys. Duplicate identities remain a
+  separate failure. ITT scoring accepts a frozen expected-primary grid and
+  materializes absent retained repetition-zero cells as incorrect architecture
+  outcomes; unresolved external blocks remain excluded atomically.
+
+### Fix-round RED/GREEN ledger
+
+| Review regression | Observed RED | GREEN evidence |
+|---|---|---|
+| Frozen confirmatory alpha | caller override at `.10` did not raise | override is rejected and the `.0625` endpoint fixture remains unconfirmed at `.05` |
+| Frozen five-point SESOI | caller override at `.20` did not raise | override is rejected and artifacts carry literal `.05` |
+| Derived calibration selection | forged copy/direct constructor did not raise | progression, selected ceiling, rates, and feasibility are rederived from observations |
+| Calibration freeze revalidation | a `model_construct` selection with a cached `True` verdict did not raise | freeze reconstructs and rejects the forged selection |
+| Gate summary integrity | contradictory constructor/copy payloads did not raise | summary fields are derived from freshly evaluated canonical components |
+| Gate deep immutability | nested input/component mapping mutation did not raise | all nested maps reject mutation with `TypeError` |
+| Gate construct bypass | direct `model_construct` did not raise | artifact `model_construct` routes through full validation |
+| Nested forged gate component | an internally consistent cached failure unrelated to the input snapshot validated | all components are recomputed from revalidated typed inputs and the forgery is rejected |
+| Exact grid identity | equal cell counts hid one missing and one unexpected cell | `complete_grid` reports both exact keys and fails while uniqueness passes |
+| Missing primary ITT cell | `expected_primary_keys` was not accepted and the missing architecture vanished from the denominator | the absent retained primary cell is emitted as incorrect with `missing_architecture_cell` status |
+
+### Fix-round verification
+
+Fresh verification of the fix-round tree:
+
+- `.venv/bin/pytest tests/test_analysis.py tests/test_calibration.py tests/test_validation.py -q`:
+  `54 passed in 2.94s`;
+- `.venv/bin/pytest -q`: `197 passed in 3.64s`;
+- `.venv/bin/ruff check .`: `All checks passed!`;
+- `git diff --check`: exit 0 with no output.
