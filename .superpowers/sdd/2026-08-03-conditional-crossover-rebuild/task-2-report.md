@@ -260,3 +260,54 @@ $ git diff --check
   the attempt log, remain unscored, and participate in permanent-error circuit breaking.
 
 No new concerns were identified in this fix round.
+
+## Fix round 2: protocol mismatch circuit equivalence
+
+Commit base: `ac2f3a6d8bc69af75f541e0b76cf6a8403c4135e`.
+
+### Change
+
+`ResultKeyMismatch` attempts now use the stable semantic detail class
+`returned_cell_identity_mismatch` only when constructing the permanent-error equivalence key.
+The append-only attempt continues to preserve its complete expected/actual key detail and signature
+as telemetry. Status code, model, stage, and error type remain part of equivalence, and all other
+permanent error types continue to use their sanitized detail, so genuinely different failures are
+not collapsed.
+
+### RED/GREEN evidence
+
+```text
+$ .venv/bin/pytest -q tests/test_runner.py::test_three_result_key_mismatches_across_cells_open_the_circuit
+RED: expected 3 launches, observed 8 because every mismatch detail embedded a different scheduled
+cell key and therefore formed a separate permanent-error equivalence class.
+
+$ .venv/bin/pytest -q \
+    tests/test_runner.py::test_three_result_key_mismatches_across_cells_open_the_circuit \
+    tests/test_runner.py::test_mismatched_returned_cell_key_is_a_protocol_attempt_not_a_result \
+    tests/test_runner.py::test_permanent_error_equivalence_ignores_credential_provenance
+GREEN: 3 passed in 0.16s
+```
+
+The regression confirms that the three stored attempts retain three distinct full detail strings
+while the circuit opens after the third semantic `ResultKeyMismatch` and no result is persisted.
+
+### Fix-round verification
+
+```text
+$ .venv/bin/pytest -q tests/test_systems.py tests/test_runner.py
+..........................                                               [100%]
+26 passed in 0.27s
+
+$ .venv/bin/pytest -q
+........................................................................ [ 61%]
+..............................................                           [100%]
+118 passed in 9.22s
+
+$ .venv/bin/ruff check .
+All checks passed!
+
+$ git diff --check
+# no output; exit 0
+```
+
+No new concerns were identified in fix round 2.

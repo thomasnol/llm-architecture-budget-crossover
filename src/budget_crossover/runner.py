@@ -76,12 +76,17 @@ def _cell_tuple(
 def _permanent_equivalence_key(
     attempt: InfrastructureAttempt,
 ) -> tuple[int | None, str, str, str, str]:
+    semantic_detail = (
+        "returned_cell_identity_mismatch"
+        if attempt.error_type == "ResultKeyMismatch"
+        else attempt.detail
+    )
     return (
         attempt.status_code,
         attempt.model,
         attempt.stage,
         attempt.error_type,
-        attempt.detail,
+        semantic_detail,
     )
 
 

@@ -259,6 +259,52 @@ async def test_mismatched_returned_cell_key_is_a_protocol_attempt_not_a_result(
     assert summary.remaining == 1
 
 
+async def test_three_result_key_mismatches_across_cells_open_the_circuit(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launches = 0
+
+    async def return_wrong_key(client, *, case, system, tier, model, repetition):
+        del client, system, model
+        nonlocal launches
+        launches += 1
+        return CellResult(
+            case_id=f"wrong-{case.case_id}",
+            system="unverified_search",
+            tier=tier.name,
+            repetition=repetition,
+            status="ok",
+            candidate=None,
+            trace=MechanismTrace(exit_reason="completed"),
+        )
+
+    monkeypatch.setattr("budget_crossover.runner.run_system", return_wrong_key)
+    results_path = tmp_path / "results.jsonl"
+    attempts_path = tmp_path / "attempts.jsonl"
+
+    summary = await execute_cells(
+        cases=[_case("a"), _case("b")],
+        systems=("monolith", "verified_search"),
+        tiers=("low", "middle"),
+        repetitions=1,
+        model="gpt-test",
+        client=object(),
+        results_path=results_path,
+        attempts_path=attempts_path,
+        max_concurrency=1,
+    )
+
+    attempts = read_jsonl(attempts_path, InfrastructureAttempt)
+    assert launches == 3
+    assert summary.circuit_open is True
+    assert summary.infrastructure_attempts == 3
+    assert read_jsonl(results_path, CellResult) == []
+    assert len(attempts) == 3
+    assert len({attempt.detail for attempt in attempts}) == 3
+    assert {attempt.error_type for attempt in attempts} == {"ResultKeyMismatch"}
+
+
 async def test_three_equivalent_permanent_errors_open_and_resume_the_circuit(
     monkeypatch,
     tmp_path: Path,
