@@ -54,6 +54,16 @@ class OperationalGateInputs(FrozenModel):
     checker_detected_wrong_first_drafts: int = Field(ge=0)
     wrong_first_drafts_corrected: int = Field(ge=0)
 
+    @classmethod
+    def model_construct(
+        cls,
+        _fields_set: set[str] | None = None,
+        **values: Any,
+    ) -> OperationalGateInputs:
+        """Retain Pydantic's API without exposing its validation bypass."""
+        del _fields_set
+        return cls.model_validate(values)
+
     @field_validator(
         "expected_mechanism_counts",
         "observed_mechanism_counts",

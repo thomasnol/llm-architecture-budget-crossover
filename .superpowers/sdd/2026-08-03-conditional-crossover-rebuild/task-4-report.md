@@ -232,3 +232,28 @@ Fresh verification of the fix-round 2 tree:
 - `.venv/bin/pytest -q`: `207 passed in 3.61s`;
 - `.venv/bin/ruff check .`: `All checks passed!`;
 - `git diff --check`: exit 0 with no output.
+
+## Fix round 3: typed gate-input construction
+
+`OperationalGateInputs.model_construct` now routes through the same canonical
+Pydantic validation as normal construction and `model_copy`. It can no longer
+bypass finite-telemetry checks or leave nested cell keys and maps in unvalidated
+raw forms.
+
+### Fix-round 3 RED/GREEN ledger
+
+| Regression | Observed RED | GREEN evidence |
+|---|---|---|
+| Constructed non-finite medians | `model_construct` accepted NaN, `+inf`, and `-inf` median telemetry | all three values raise finite-telemetry validation errors |
+| Constructed non-finite rate counts | `model_construct` accepted NaN, `+inf`, and `-inf` in `schema_valid_cells` | all three values fail canonical integer/finite validation |
+| Valid finite constructed snapshot | raw dictionaries remained in `expected_cell_keys`, causing `TypeError: unhashable type: 'dict'` in gate evaluation | canonical validation reconstructs typed `CellKey` values and the passing artifact evaluates normally |
+
+### Fix-round 3 verification
+
+Fresh verification of the fix-round 3 tree:
+
+- `.venv/bin/pytest tests/test_analysis.py tests/test_calibration.py tests/test_validation.py -q`:
+  `71 passed in 2.94s`;
+- `.venv/bin/pytest -q`: `214 passed in 3.65s`;
+- `.venv/bin/ruff check .`: `All checks passed!`;
+- `git diff --check`: exit 0 with no output.

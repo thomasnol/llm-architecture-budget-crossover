@@ -189,6 +189,50 @@ def test_gate_inputs_reject_non_finite_verified_search_medians(non_finite: float
     [float("nan"), float("inf"), float("-inf")],
     ids=("nan", "positive-infinity", "negative-infinity"),
 )
+def test_gate_input_model_construct_rejects_non_finite_medians(non_finite: float):
+    payload = _passing_inputs().model_dump(mode="python", round_trip=True)
+    payload["verified_search_median_tokens"] = {
+        "low": 100.0,
+        "middle": non_finite,
+        "high": 144.0,
+    }
+
+    with pytest.raises(ValidationError, match="finite"):
+        OperationalGateInputs.model_construct(**payload)
+
+
+@pytest.mark.parametrize(
+    "non_finite",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=("nan", "positive-infinity", "negative-infinity"),
+)
+def test_gate_input_model_construct_rejects_non_finite_rate_counts(
+    non_finite: float,
+):
+    payload = _passing_inputs().model_dump(mode="python", round_trip=True)
+    payload["schema_valid_cells"] = non_finite
+
+    with pytest.raises(ValidationError, match="finite"):
+        OperationalGateInputs.model_construct(**payload)
+
+
+def test_gate_input_model_construct_accepts_a_valid_finite_snapshot():
+    passing = _passing_inputs()
+
+    constructed = OperationalGateInputs.model_construct(
+        **passing.model_dump(mode="python", round_trip=True)
+    )
+    artifact = evaluate_operational_gates(constructed)
+
+    assert constructed == passing
+    assert artifact.passed is True
+
+
+@pytest.mark.parametrize(
+    "non_finite",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=("nan", "positive-infinity", "negative-infinity"),
+)
 @pytest.mark.parametrize("field", ["value", "threshold"])
 def test_gate_components_reject_non_finite_numeric_telemetry(
     field: str,
