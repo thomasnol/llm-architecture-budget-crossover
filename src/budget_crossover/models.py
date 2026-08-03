@@ -1,9 +1,199 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+Scale = Literal["ones", "thousand", "million", "billion", "percent"]
+
+
+class FrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class FrozenDict(dict[str, Any]):
+    def _immutable(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("frozen mapping does not support mutation")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _contains_hidden_label_key(value: Any) -> bool:
+    forbidden = {
+        "answer",
+        "gold_answer",
+        "gold_derivation",
+        "gold_support_ids",
+        "hidden_label",
+        "label",
+        "source_lineage",
+    }
+    if isinstance(value, dict):
+        return any(
+            str(key).casefold() in forbidden or _contains_hidden_label_key(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_hidden_label_key(item) for item in value)
+    return False
+
+
+class EvidenceItem(FrozenModel):
+    evidence_id: str
+    document_id: str
+    kind: str
+    text: str
+    table_id: str | None = None
+    headers: tuple[str, ...] = ()
+    row_label: str | None = None
+    unit: str | None = None
+    scale: Scale | None = None
+    entity: str | None = None
+    period: str | None = None
+    ordinal: int = Field(ge=0)
+
+
+class PublicCase(FrozenModel):
+    case_id: str
+    dataset: str
+    document_id: str
+    question: str
+    evidence: tuple[EvidenceItem, ...]
+    stratum: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def freeze_metadata(cls, value: dict[str, Any]) -> FrozenDict:
+        return _freeze(value)
+
+    @model_validator(mode="after")
+    def validate_public_boundary(self) -> PublicCase:
+        if _contains_hidden_label_key(self.metadata):
+            raise ValueError("public metadata contains a hidden-label field")
+        evidence_ids = [item.evidence_id for item in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("evidence_id values must be unique within a public case")
+        if any(item.document_id != self.document_id for item in self.evidence):
+            raise ValueError("evidence document_id must match the public case document_id")
+        return self
+
+
+class AnswerSpec(FrozenModel):
+    value: Decimal
+    unit: str | None
+    scale: Scale = "ones"
+    entity: str | None
+    period: str | None
+    absolute_tolerance: Decimal = Field(default=Decimal(0), ge=0)
+    relative_tolerance: Decimal = Field(default=Decimal(0), ge=0)
+
+
+class HiddenLabel(FrozenModel):
+    case_id: str
+    answer: AnswerSpec
+    gold_derivation: str
+    gold_support_ids: tuple[str, ...]
+    source_lineage: tuple[str, ...]
+
+
+class Candidate(FrozenModel):
+    value: str
+    unit: str | None
+    scale: Scale = "ones"
+    entity: str | None
+    period: str | None
+    expression: str | None
+    citations: tuple[str, ...]
+
+
+class CheckFinding(FrozenModel):
+    code: str
+    message: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+class CheckResult(FrozenModel):
+    passed: bool
+    findings: tuple[CheckFinding, ...] = ()
+    evaluated_expression: Decimal | None = None
+
+
+class Reservation(FrozenModel):
+    reservation_id: str
+    prompt_tokens: int = Field(ge=0)
+    max_output_tokens: int = Field(ge=0)
+
+    @property
+    def reserved_tokens(self) -> int:
+        return self.prompt_tokens + self.max_output_tokens
+
+
+class CallEvent(FrozenModel):
+    stage: str
+    reservation: Reservation
+    usage: Usage | None = None
+    model: str | None = None
+    request_id: str | None = None
+    protocol_violation: bool = False
+
+
+class MechanismTrace(FrozenModel):
+    planned_queries: tuple[str, ...] = ()
+    actual_queries: tuple[str, ...] = ()
+    query_hashes: tuple[str, ...] = ()
+    retrieval_pre_truncation_ids: tuple[str, ...] = ()
+    retrieval_post_truncation_ids: tuple[str, ...] = ()
+    candidate_token_cap: int = Field(default=0, ge=0)
+    candidate_count: int = Field(default=0, ge=0)
+    checks: tuple[CheckResult, ...] = ()
+    repair_attempted: bool = False
+    accepted_candidate_index: int | None = Field(default=None, ge=0)
+    answer_changed: bool | None = None
+    call_events: tuple[CallEvent, ...] = ()
+    realized_tokens: int = Field(default=0, ge=0)
+    exit_reason: str
+
+
+class CellResult(FrozenModel):
+    case_id: str
+    system: str
+    tier: str
+    repetition: int = Field(ge=0)
+    status: str
+    candidate: Candidate | None
+    trace: MechanismTrace
+
+
+class RunManifest(FrozenModel):
+    run_id: str
+    resolved_config: dict[str, Any]
+    artifact_hashes: dict[str, str]
+    expected_cell_keys: tuple[str, ...]
+
+    @field_validator("resolved_config", "artifact_hashes", mode="after")
+    @classmethod
+    def freeze_mappings(cls, value: dict[str, Any]) -> FrozenDict:
+        return _freeze(value)
 
 
 class Case(BaseModel):
@@ -21,10 +211,27 @@ class Case(BaseModel):
     source_model: str
 
 
-class Usage(BaseModel):
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
+class Usage(FrozenModel):
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_total(self) -> Usage:
+        if (
+            self.prompt_tokens is not None
+            and self.completion_tokens is not None
+            and self.total_tokens is not None
+            and self.total_tokens != self.prompt_tokens + self.completion_tokens
+        ):
+            raise ValueError("total_tokens must equal prompt_tokens plus completion_tokens")
+        return self
+
+    @property
+    def authoritative_total(self) -> int | None:
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
+        return self.prompt_tokens + self.completion_tokens
 
 
 class GatewayResponse(BaseModel):

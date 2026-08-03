@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import ast
+import re
+from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
+
+from .models import Candidate, CheckFinding, CheckResult, EvidenceItem
+from .scoring import normalize_unit, normalized_candidate_value
+
+_EXPRESSION_NUMBER = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
+_EVIDENCE_NUMBER = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?")
+_SCALE_FACTORS = {
+    "ones": Decimal(1),
+    "thousand": Decimal(1000),
+    "million": Decimal(1000000),
+    "billion": Decimal(1000000000),
+    "percent": Decimal("0.01"),
+}
+
+
+class _UnsafeExpression(ValueError):
+    pass
+
+
+class _DivisionByZero(ValueError):
+    pass
+
+
+def _evaluate(expression: str) -> tuple[Decimal, tuple[Decimal, ...]]:
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise _UnsafeExpression from error
+    operands: list[Decimal] = []
+
+    def visit(node: ast.AST) -> Decimal:
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant):
+            source = ast.get_source_segment(expression, node)
+            if isinstance(node.value, bool) or source is None or not _EXPRESSION_NUMBER.fullmatch(source):
+                raise _UnsafeExpression
+            try:
+                value = Decimal(source)
+            except InvalidOperation as error:
+                raise _UnsafeExpression from error
+            operands.append(value)
+            return value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if right == 0:
+                raise _DivisionByZero
+            return left / right
+        raise _UnsafeExpression
+
+    return visit(tree), tuple(operands)
+
+
+def _evidence_numbers(items: Sequence[EvidenceItem]) -> frozenset[Decimal]:
+    values: set[Decimal] = set()
+    for item in items:
+        for match in _EVIDENCE_NUMBER.finditer(item.text):
+            try:
+                values.add(Decimal(match.group(0).replace(",", "")))
+            except InvalidOperation:
+                continue
+    return frozenset(values)
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _mismatches(
+    expected: str | None,
+    items: Sequence[EvidenceItem],
+    field: str,
+    *,
+    normalizer=_normalized_text,
+) -> bool:
+    if expected is None:
+        return False
+    observed = [getattr(item, field) for item in items if getattr(item, field) is not None]
+    if not observed:
+        return False
+    normalized_expected = normalizer(expected)
+    return any(normalizer(value) != normalized_expected for value in observed)
+
+
+def _finding(code: str, message: str, evidence_ids: tuple[str, ...] = ()) -> CheckFinding:
+    return CheckFinding(code=code, message=message, evidence_ids=evidence_ids)
+
+
+def check_candidate(
+    candidate: Candidate,
+    evidence: Sequence[EvidenceItem],
+) -> CheckResult:
+    findings: list[CheckFinding] = []
+    by_id = {item.evidence_id: item for item in evidence}
+    if not candidate.citations:
+        findings.append(_finding("missing_citations", "Candidate has no evidence citations."))
+    missing = tuple(citation for citation in candidate.citations if citation not in by_id)
+    if missing:
+        findings.append(
+            _finding("fabricated_citation", "Candidate cites evidence that does not exist.", missing)
+        )
+    cited = tuple(by_id[citation] for citation in candidate.citations if citation in by_id)
+
+    evaluated: Decimal | None = None
+    operands: tuple[Decimal, ...] = ()
+    if candidate.expression is None or not candidate.expression.strip():
+        findings.append(_finding("missing_expression", "Candidate has no arithmetic expression."))
+    else:
+        try:
+            evaluated, operands = _evaluate(candidate.expression)
+        except _DivisionByZero:
+            findings.append(_finding("division_by_zero", "Expression divides by zero."))
+        except _UnsafeExpression:
+            findings.append(_finding("unsafe_expression", "Expression contains unsafe syntax."))
+
+    if evaluated is not None:
+        supported = _evidence_numbers(cited)
+        unsupported = tuple(str(value) for value in operands if abs(value) not in supported)
+        if unsupported:
+            findings.append(
+                _finding(
+                    "unsupported_operand",
+                    f"Expression operands lack evidence provenance: {', '.join(unsupported)}.",
+                    candidate.citations,
+                )
+            )
+
+        normalized = normalized_candidate_value(candidate)
+        if normalized is None:
+            findings.append(_finding("invalid_candidate_value", "Candidate value is not strict numeric data."))
+        else:
+            candidate_value, _ = normalized
+            effective_scale = (
+                "percent" if candidate.value.strip().endswith("%") else candidate.scale
+            )
+            if evaluated * _SCALE_FACTORS[effective_scale] != candidate_value:
+                findings.append(
+                    _finding(
+                        "expression_mismatch",
+                        "Expression result does not equal the candidate value.",
+                    )
+                )
+
+    normalized = normalized_candidate_value(candidate)
+    candidate_unit = normalized[1] if normalized is not None else normalize_unit(candidate.unit)
+    effective_scale = "percent" if candidate.value.strip().endswith("%") else candidate.scale
+    metadata_checks = (
+        ("unit", candidate_unit, "unit", normalize_unit),
+        ("scale", effective_scale, "scale", _normalized_text),
+        ("entity", candidate.entity, "entity", _normalized_text),
+        ("period", candidate.period, "period", _normalized_text),
+    )
+    for code, expected, field, normalizer in metadata_checks:
+        if _mismatches(expected, cited, field, normalizer=normalizer):
+            findings.append(
+                _finding(
+                    f"{code}_mismatch",
+                    f"Candidate {code} conflicts with cited evidence metadata.",
+                    candidate.citations,
+                )
+            )
+
+    return CheckResult(
+        passed=not findings,
+        findings=tuple(findings),
+        evaluated_expression=evaluated,
+    )
