@@ -518,3 +518,98 @@ $ git diff --check
 Production retrieval diagnostics must now supply the exact per-tier query list alongside each
 result so provenance can be recomputed. This is an intentional fail-closed API change; stale or
 missing query capture is rejected instead of allowing an unverified high-tier gate.
+
+## Fix round 3: exact queries and deterministic replay
+
+### Findings
+
+The round-2 query hash described a sorted, deduplicated set of token sets rather than the exact
+input. Reordered queries, removed duplicates, and reordered tokens within a query therefore shared
+provenance. Separately, the boundary validated tier/k/query/input metadata but not the complete
+retrieval output, so a one-item low-k result could be reconstructed with valid high-tier metadata
+and retain 100% reference-document recall.
+
+### RED evidence
+
+Exact query order collided under the former semantic-set hash:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_retrieval.py::test_query_hash_binds_exact_order_duplicates_and_token_order
+F                                                                        [100%]
+E AssertionError: assert '50774c...71167' != '50774c...71167'
+1 failed in 0.13s
+```
+
+The reconstructed low-k result was accepted despite containing only one of the configured high
+tier's two retrieved IDs and already covering the sole reference document:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_diagnostics.py::test_retrieval_ladders_reject_forged_low_k_output_with_high_provenance
+F                                                                        [100%]
+E Failed: DID NOT RAISE <class 'ValueError'>
+1 failed in 0.16s
+```
+
+The gate also accepted the pre-replay round-2 validation marker until its contract was versioned:
+
+```text
+$ .venv/bin/pytest -q \
+  tests/test_diagnostics.py::test_boundary_run_gate_rejects_high_recall_without_replay_validated_provenance
+F                                                                        [100%]
+E assert True is False
+1 failed in 0.15s
+```
+
+### Implementation and GREEN evidence
+
+`retrieval_query_hash()` now hashes canonical compact JSON of the exact sequence of complete query
+strings. It preserves query order, duplicates, token order, punctuation, case, Unicode, and
+whitespace. Retrieval ranking remains semantic and order-insensitive, but its provenance now binds
+the exact input that produced it.
+
+For every production tier/case pair, `retrieval_ladder_boundary()` now reruns `retrieve()` with the
+exact public case, exact ordered query list, configured k, character limit, and tier, then requires
+full frozen `RetrievalResult` equality. This binds items (including truncation), pre/post ID lists,
+tier, k, and both hashes. Only successful replay emits
+`provenance_validation: deterministic_replay_v1`, and the high gate requires that version.
+
+```text
+$ .venv/bin/pytest -q tests/test_retrieval.py
+.......                                                                  [100%]
+7 passed in 0.13s
+
+$ .venv/bin/pytest -q tests/test_diagnostics.py
+................                                                         [100%]
+16 passed in 0.16s
+
+$ .venv/bin/pytest -q tests/test_retrieval.py tests/test_dataset.py \
+  tests/test_diagnostics.py tests/test_systems.py tests/test_checking.py
+........................................................................ [ 90%]
+........                                                                 [100%]
+80 passed in 0.24s
+```
+
+### Fix-round 3 final verification
+
+```text
+$ .venv/bin/pytest -q
+........................................................................ [ 46%]
+........................................................................ [ 93%]
+..........                                                               [100%]
+154 passed in 4.29s
+
+$ .venv/bin/ruff check .
+All checks passed!
+
+$ git diff --check
+# no output; exit 0
+```
+
+### Fix-round 3 concern
+
+Exact query provenance intentionally treats whitespace, punctuation, and case changes as different
+inputs even where retrieval ranking treats them as semantically equivalent. Production query
+capture must therefore preserve the strings passed to `retrieve()` byte-for-byte at the Unicode
+string level; any stale or normalized capture fails closed during replay.

@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from budget_crossover.models import EvidenceItem, PublicCase
-from budget_crossover.retrieval import retrieve
+from budget_crossover.retrieval import retrieval_query_hash, retrieve
 
 
 def _case() -> PublicCase:
@@ -65,10 +65,25 @@ def test_query_union_ranking_is_deterministic_with_stable_ties_and_explicit_ids(
     first = retrieve(_case(), ("profit", "revenue"), limit=3, max_chars_per_item=200)
     reordered = retrieve(_case(), ("revenue", "profit"), limit=3, max_chars_per_item=200)
 
-    assert first == reordered
+    assert first.items == reordered.items
+    assert first.pre_truncation_ids == reordered.pre_truncation_ids
+    assert first.post_truncation_ids == reordered.post_truncation_ids
+    assert first.query_hash != reordered.query_hash
     assert first.pre_truncation_ids == ("row-a", "profit", "row-b", "unmatched")
     assert first.post_truncation_ids == ("row-a", "profit", "row-b")
     assert tuple(item.evidence_id for item in first.items) == first.post_truncation_ids
+
+
+def test_query_hash_binds_exact_order_duplicates_and_token_order():
+    assert retrieval_query_hash(("revenue", "expense")) != retrieval_query_hash(
+        ("expense", "revenue")
+    )
+    assert retrieval_query_hash(("revenue", "revenue")) != retrieval_query_hash(
+        ("revenue",)
+    )
+    assert retrieval_query_hash(("revenue expense",)) != retrieval_query_hash(
+        ("expense revenue",)
+    )
 
 
 def test_per_item_truncation_preserves_table_header_unit_period_and_identity_metadata():

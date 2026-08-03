@@ -276,6 +276,7 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
             "tier_id": tier,
             "requested_k": 1,
             "provenance_validated": True,
+            "provenance_validation": "deterministic_replay_v1",
             "pre_truncation_recall": 1.0,
             "post_truncation_recall": 1.0,
         }
@@ -286,6 +287,7 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
             "tier_id": tier,
             "requested_k": 1,
             "provenance_validated": True,
+            "provenance_validation": "deterministic_replay_v1",
             "pre_truncation_recall": 1.0,
             "post_truncation_recall": 0.0,
         }
@@ -296,6 +298,7 @@ def test_retrieval_ladders_report_pre_and_post_reference_document_recall(tmp_pat
             "tier_id": tier,
             "requested_k": 1,
             "provenance_validated": True,
+            "provenance_validation": "deterministic_replay_v1",
             "pre_truncation_recall": 1.0,
             "post_truncation_recall": 1.0,
         }
@@ -492,6 +495,68 @@ def test_retrieval_ladders_reject_relabelled_tiers_and_requested_k_mismatch(
     assert high.tier_id == "high"
 
 
+def test_retrieval_ladders_reject_forged_low_k_output_with_high_provenance(
+    tmp_path: Path,
+):
+    adapted = adapt_financecomplex_snapshot(
+        _snapshot(tmp_path, [_record("case-1")]),
+        output_dir=tmp_path / "diagnostic",
+        expected_count=1,
+    )
+    case = adapted.cases[0]
+    case_id = case.public.case_id
+    queries = {case_id: ("revenue",)}
+    production_queries = {tier: queries for tier in ("low", "middle", "high")}
+    limits = {"low": 1, "middle": 2, "high": 2}
+    low = retrieve(
+        case.public,
+        queries[case_id],
+        limit=limits["low"],
+        max_chars_per_item=1000,
+        tier_id="low",
+    )
+    middle = retrieve(
+        case.public,
+        queries[case_id],
+        limit=limits["middle"],
+        max_chars_per_item=1000,
+        tier_id="middle",
+    )
+    high = retrieve(
+        case.public,
+        queries[case_id],
+        limit=limits["high"],
+        max_chars_per_item=1000,
+        tier_id="high",
+    )
+    forged_high = low.model_copy(
+        update={
+            "tier_id": "high",
+            "requested_k": limits["high"],
+            "query_hash": high.query_hash,
+            "input_hash": high.input_hash,
+        }
+    )
+
+    assert case.lineage.reference_document_ids[0] == forged_high.items[0].table_id
+    assert len(forged_high.post_truncation_ids) == 1
+    assert len(high.post_truncation_ids) == 2
+    with pytest.raises(ValueError, match="high retrieval provenance"):
+        retrieval_ladder_boundary(
+            adapted.cases,
+            reference_queries=queries,
+            planned_queries=queries,
+            production_queries=production_queries,
+            production_results={
+                "low": {case_id: low},
+                "middle": {case_id: middle},
+                "high": {case_id: forged_high},
+            },
+            tier_limits=limits,
+            max_chars_per_item=1000,
+        )
+
+
 @pytest.mark.parametrize(
     ("override", "expected_failure"),
     [
@@ -515,6 +580,7 @@ def test_retrieval_ladders_reject_relabelled_tiers_and_requested_k_mismatch(
                             "tier_id": "high",
                             "requested_k": 1,
                             "provenance_validated": True,
+                            "provenance_validation": "deterministic_replay_v1",
                             "pre_truncation_recall": 1.0,
                             "post_truncation_recall": 0.94,
                         }
@@ -545,6 +611,7 @@ def test_boundary_report_attributes_each_failure_without_confirmation_pooling(
                     "tier_id": "high",
                     "requested_k": 1,
                     "provenance_validated": True,
+                    "provenance_validation": "deterministic_replay_v1",
                     "pre_truncation_recall": 1.0,
                     "post_truncation_recall": 0.95,
                 }
@@ -592,6 +659,7 @@ def test_boundary_run_gate_uses_the_preregistered_thresholds():
                     "tier_id": "high",
                     "requested_k": 1,
                     "provenance_validated": True,
+                    "provenance_validation": "deterministic_replay_v1",
                     "pre_truncation_recall": 1.0,
                     "post_truncation_recall": 0.95,
                 },
@@ -606,7 +674,7 @@ def test_boundary_run_gate_uses_the_preregistered_thresholds():
     assert report["domain_role"] == "exploratory_only"
 
 
-def test_boundary_run_gate_rejects_high_recall_without_validated_high_provenance():
+def test_boundary_run_gate_rejects_high_recall_without_replay_validated_provenance():
     report = build_financecomplex_boundary_report(
         scorer={"gold_correct_rate": 1.0, "pass": True},
         lineage_leakage={
@@ -618,6 +686,9 @@ def test_boundary_run_gate_rejects_high_recall_without_validated_high_provenance
         retrieval={
             "production": {
                 "high": {
+                    "tier_id": "high",
+                    "requested_k": 1,
+                    "provenance_validated": True,
                     "pre_truncation_recall": 1.0,
                     "post_truncation_recall": 1.0,
                 }

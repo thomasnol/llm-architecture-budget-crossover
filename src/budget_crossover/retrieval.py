@@ -42,8 +42,7 @@ def _tokens(value: str) -> frozenset[str]:
 
 
 def retrieval_query_hash(queries: Sequence[str]) -> str:
-    semantic_queries = sorted({tuple(sorted(_tokens(query))) for query in queries if _tokens(query)})
-    payload = json.dumps(semantic_queries, separators=(",", ":"))
+    payload = json.dumps(tuple(queries), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

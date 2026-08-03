@@ -20,12 +20,7 @@ from .dataset import (
     sha256_file,
 )
 from .models import EvidenceItem, HiddenLabel, PublicCase
-from .retrieval import (
-    RetrievalResult,
-    retrieval_input_hash,
-    retrieval_query_hash,
-    retrieve,
-)
+from .retrieval import RetrievalResult, retrieve
 from .scoring import score_candidate, serialize_gold_oracle
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -531,14 +526,16 @@ def retrieval_ladder_boundary(
     for tier in sorted(tiers):
         expected_k = tier_limits[tier]
         for case_id, result in production_results[tier].items():
-            if (
-                result.tier_id != tier
-                or result.requested_k != expected_k
-                or result.query_hash != retrieval_query_hash(production_queries[tier][case_id])
-                or result.input_hash != retrieval_input_hash(cases_by_id[case_id].public)
-            ):
+            expected = retrieve(
+                cases_by_id[case_id].public,
+                production_queries[tier][case_id],
+                limit=expected_k,
+                max_chars_per_item=max_chars_per_item,
+                tier_id=tier,
+            )
+            if result != expected:
                 raise ValueError(
-                    f"{tier} retrieval provenance must match its case, tier, and requested_k"
+                    f"{tier} retrieval provenance must match deterministic retrieval replay"
                 )
 
     query_ladders: dict[str, dict[str, dict[str, RetrievalResult]]] = {
@@ -570,6 +567,7 @@ def retrieval_ladder_boundary(
                 "tier_id": tier,
                 "requested_k": tier_limits[tier],
                 "provenance_validated": True,
+                "provenance_validation": "deterministic_replay_v1",
                 "pre_truncation_recall": _reference_recall(
                     cases, results, "pre_truncation_ids"
                 ),
@@ -595,6 +593,7 @@ def build_financecomplex_boundary_report(
     high_retrieval = retrieval.get("production", {}).get("high", {})
     high_provenance_validated = (
         high_retrieval.get("provenance_validated") is True
+        and high_retrieval.get("provenance_validation") == "deterministic_replay_v1"
         and high_retrieval.get("tier_id") == "high"
         and type(high_retrieval.get("requested_k")) is int
         and high_retrieval["requested_k"] > 0
